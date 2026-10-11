@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Cleanup**: `SUSHI_SSD_WRITE_THROUGH` is removed; the prefill write-through to the SSD prefix cache is always on when its gates pass, and behaviour is unchanged.
 - **Cleanup**: `SUSHI_FUSED_256` is removed; the fused head-dim-256 prefill attention is always on, and output is unchanged.
 - **Cleanup**: `SUSHI_NO_UPDATE_CHECK` is removed; use `--no-update-check`.
 - **Cleanup**: `SUSHI_CACHE_LIMIT`, `SUSHI_WIRED` and `SUSHI_WIRED_SLACK_MB` are removed; the MLX buffer-pool cap is always RAM/16 clamped to 2..8 GB and the wired limit is always the recommended working set.

@@ -6705,38 +6705,10 @@ fn writeThroughSpanReached(new_span: usize, chunk_tokens: u32) bool {
 }
 
 var write_through_span_declined_logged = std.atomic.Value(bool).init(false);
-var write_through_off_logged = std.atomic.Value(bool).init(false);
-var write_through_env_cached: ?bool = null;
-
-/// `SUSHI_SSD_WRITE_THROUGH=0` takes the write-through out of the prefill loop; the
-/// end-of-request commit then persists the whole turn. A real two-arm tradeoff (crash-safe
-/// prefix vs TTFT) and the only way to A/B its cost.
-pub fn writeThroughEnabledFromEnv(raw: ?[]const u8) bool {
-    const v = raw orelse return true;
-    return !std.mem.eql(u8, v, "0");
-}
-
-/// Read on the inference thread only.
-fn writeThroughEnabled() bool {
-    if (write_through_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_SSD_WRITE_THROUGH") orelse break :blk writeThroughEnabledFromEnv(null);
-        break :blk writeThroughEnabledFromEnv(std.mem.sliceTo(raw, 0));
-    };
-    write_through_env_cached = v;
-    return v;
-}
-
 /// The one gate for the write-through: SSD-first + a live writer + a disk tier + a new span
 /// worth at least one chunk.
 fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return false;
-    if (!writeThroughEnabled()) {
-        if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {
-            log.info("  [disk-cache] prefill write-through disabled by SUSHI_SSD_WRITE_THROUGH=0 — the end-of-request commit persists every turn\n", .{});
-        }
-        return false;
-    }
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     const writer_up = d.writer != null;
@@ -10793,14 +10765,6 @@ test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
     const boot = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingBootLoad;
     const cold = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, req)") orelse return error.MissingColdLoad;
     try testing.expect(boot != cold);
-}
-
-test "SUSHI_SSD_WRITE_THROUGH=0 takes mechanism 3 out of the prefill, and only that" {
-    try testing.expect(writeThroughEnabledFromEnv(null));
-    try testing.expect(writeThroughEnabledFromEnv(""));
-    try testing.expect(writeThroughEnabledFromEnv("1"));
-    try testing.expect(writeThroughEnabledFromEnv("true"));
-    try testing.expect(!writeThroughEnabledFromEnv("0"));
 }
 
 test "writeThroughSpanReached: a sub-chunk warm turn never persists inside the prefill" {
