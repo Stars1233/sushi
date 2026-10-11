@@ -181,7 +181,8 @@ owner-approved card; the README pack line follows once the repo is live.
   the code.
 - **One story per gotcha, one line per rule**, in the matching doc. CHANGELOG: one user-facing sentence per change,
   no provisional numbers.
-- Squash commits, one per PR. No Co-Authored-By attribution.
+- One squash commit per PR, rebased onto main when needed. Its author is the human who takes responsibility for it
+  (an outside PR: the contributor's GitHub identity); no AI author or Co-Authored-By trailer.
 
 ## Engine invariants (never break; the doc has the why)
 
