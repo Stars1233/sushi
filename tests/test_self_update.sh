@@ -192,9 +192,6 @@ echo "[3/7] the daily check's switches"
 if boot --no-update-check; then
     check "--no-update-check turns it off by name" "$(has "$WORK/server.log" "\[update\] daily check off (--no-update-check)")"
 fi
-if SUSHI_NO_UPDATE_CHECK=1 boot; then
-    check "SUSHI_NO_UPDATE_CHECK=1 turns it off by name" "$(has "$WORK/server.log" "\[update\] daily check off (SUSHI_NO_UPDATE_CHECK)")"
-fi
 stop_server
 "$BINARY" serve --model-dir "$EMPTY" --port "$PORT" --log-file off > "$WORK/src-serve.log" 2>&1 &
 SPID=$!

@@ -352,9 +352,8 @@ fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
 /// Live resolver for the qwen4_exp head: validates the runtime fingerprint
 /// the G17 surface was measured on — uniform affine-4/gs-64 config and both
 /// head fc packs at that width (K derived from the scales, so no input-dim
-/// formula is assumed). Revoked by SUSHI_VERIFY_QMM_NAX=0 like the
-/// sidecar profiles: auto depth never assumes a lane the environment
-/// disabled.
+/// formula is assumed). Revoked without matrix units like the
+/// sidecar profiles: auto depth never assumes a lane the hardware lacks.
 pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
     return qwen4G17CostProfileForKv(target, target.cache.config);
 }
@@ -380,7 +379,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
         .head_kv_group = head.cache.config.group_size,
     };
     const rerank_ready = if (head.rerank) |r| r.bits == 3 and r.group_size == 64 and r.rows == 248320 else false;
-    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable());
+    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and transformer_mod.verifyQmmNaxAvailable());
     if (mixed != .generic) {
         if (!qwen4_mixed_profile_logged) {
             qwen4_mixed_profile_logged = true;
@@ -397,12 +396,12 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
         cfg.quant_bits,
         cfg.quant_group_size,
         packs,
-        transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable(),
+        transformer_mod.verifyQmmNaxAvailable(),
         cfg.expert_layout,
     );
     if (profile != .generic and !qwen4_g17_profile_logged) {
         qwen4_g17_profile_logged = true;
-        log.info("[mtp] cost profile g17-nax-qwen4-q4-gs64 engaged (SUSHI_VERIFY_QMM_NAX=0 restores generic)\n", .{});
+        log.info("[mtp] cost profile g17-nax-qwen4-q4-gs64 engaged (SUSHI_FORCE_GPU_FAMILY_FALLBACK=1 restores generic)\n", .{});
     }
     return profile;
 }

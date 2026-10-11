@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HTTP correctness and engagement guard; point at a disposable server with cache off.
 
-SUSHI_QSA_NAX=1 SUSHI_PREFILL_CHUNK=4096 zig-out/bin/sushi serve \
+SUSHI_QSA_NAX=1 zig-out/bin/sushi serve --prefill-chunk 4096 \
   --port 18765 --ctx-size 131072 --prefix-cache-entries 0 > /tmp/qsa-server.log 2>&1
 python3 tests/test_qsa_nax_prefill.py --log /tmp/qsa-server.log --nax on
 Repeat with SUSHI_QSA_NAX=0 and --nax off for the stock arm.

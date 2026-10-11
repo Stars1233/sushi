@@ -305,22 +305,14 @@ else
     bad "tool call parses with dflash engaged" "$(echo "$TOOLS" | head -c 400)"
 fi
 
-# [9] Weight-precision levers ENGAGED, read off the boot log — both are
-# load-time decisions, so there is no same-boot A/B for them; the numeric
+# [9] Weight precision ENGAGED, read off the boot log — it is a
+# load-time decision, so there is no same-boot A/B for it; the numeric
 # guard is the hermetic greedy-equivalence test, which runs default-on.
 WLINE=$(grep -o "weights=[^ ]*-bit/gs[0-9]*" "$LOG" | head -1)
 if [ -n "$WLINE" ]; then
     ok "assistant quantized at load ($WLINE)"
 else
     bad "assistant quantized at load" "$(grep '\[dflash\] loaded' "$LOG" | head -1)"
-fi
-# The draft head defaults OFF: a narrower head buys bytes the round barely
-# notices and costs acceptance (see DEFAULT_DRAFT_HEAD_BITS). The build path
-# itself is covered hermetically (draft-head geometry + build policy).
-if grep -q "draft lm_head: trunk head" "$LOG"; then
-    ok "drafts route through the trunk lm_head by default"
-else
-    bad "drafts route through the trunk lm_head by default" "$(grep -i 'draft.*lm_head' "$LOG" | head -2)"
 fi
 
 # [10] The block is capped to what this machine's verify lanes serve. The

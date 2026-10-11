@@ -4475,7 +4475,6 @@ test "the quantized streaming loader drops the nine routed banks and keeps every
 
 test "qwen4 streaming loader materializes only transformed resident tensors" {
     const t = std.testing;
-    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
     const io = t.io;
     const allocator = t.allocator;
     var tmp = t.tmpDir(.{});
@@ -4509,7 +4508,6 @@ test "qwen4 streaming loader materializes only transformed resident tensors" {
 
 test "a streamed load that fails mid-transform frees the tensor it was holding" {
     const t = std.testing;
-    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
     const io = t.io;
     const allocator = t.allocator;
     var tmp = t.tmpDir(.{});
@@ -4549,7 +4547,6 @@ test "a streamed load that fails mid-transform frees the tensor it was holding" 
 
 test "the streamed load drops the MTP head the ledger bills at zero" {
     const t = std.testing;
-    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
     const io = t.io;
     const allocator = t.allocator;
     var tmp = t.tmpDir(.{});

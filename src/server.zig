@@ -3169,18 +3169,6 @@ pub fn mlxCacheLimitBytes(total_ram: u64) u64 {
     return @max(2 * GB, @min(8 * GB, total_ram / 16));
 }
 
-/// PURE: resolve the cap from `SUSHI_CACHE_LIMIT` (bytes) over the
-/// RAM-proportional default. `0` means "leave MLX's default alone" — the
-/// same-boot A/B off-switch. Anything unparseable falls through to the default
-/// rather than silently disabling the cap.
-pub fn mlxCacheLimitFromEnv(raw: ?[]const u8, total_ram: u64) u64 {
-    if (raw) |v| {
-        const trimmed = std.mem.trim(u8, v, " \t\r\n");
-        if (std.fmt.parseInt(u64, trimmed, 10) catch null) |n| return n;
-    }
-    return mlxCacheLimitBytes(total_ram);
-}
-
 /// Impure wrapper: apply the cap to the live MLX allocator. Called ONCE from
 /// `main()`, above every subcommand branch — not per serve path, because a
 /// hand-rolled per-path config is exactly how `runHeadlessServe` (the mode the
@@ -3188,11 +3176,7 @@ pub fn mlxCacheLimitFromEnv(raw: ?[]const u8, total_ram: u64) u64 {
 ///
 /// Never RAISES a tighter existing cap.
 pub fn applyMlxCacheLimit() void {
-    const env: ?[]const u8 = if (std.c.getenv("SUSHI_CACHE_LIMIT")) |p|
-        std.mem.span(p)
-    else
-        null;
-    const cap = mlxCacheLimitFromEnv(env, metrics.getTotalMemBytes());
+    const cap = mlxCacheLimitBytes(metrics.getTotalMemBytes());
     if (cap == 0) return;
     var prev: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev, @intCast(cap));
@@ -3621,10 +3605,6 @@ fn glmAdvertisedContextAt(config: *const model_mod.ModelConfig, kv_bits: u64, ce
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
 /// forward does: `--prefill-chunk 4096` used to run against a 512-token reserve.
 pub fn explicitPrefillChunk() u32 {
-    // `SUSHI_PREFILL_CHUNK` outranks everything in `generate.effectivePrefillChunk`, so the
-    // bill must see it too. Clamped: the env value is unbounded at its source.
-    const env_w: usize = @min(generate_mod.envPrefillChunk(), @as(usize, std.math.maxInt(u32)));
-    if (env_w > 0) return @intCast(env_w);
     if (!generate_mod.prefill_chunk_explicit) return 0;
     const raw: usize = @min(generate_mod.prefill_chunk_override, @as(usize, std.math.maxInt(u32)));
     return @intCast(raw);
@@ -3871,7 +3851,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
 /// The load line for the frozen width, null when there is nothing to say. On a per-request arch every
 /// request prices its own rung against live memory, so the pin is only the fallback.
 pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pinned: u32, launch: usize) ?[]const u8 {
-    if (perRequestPrefillChunkEnabled(config) and generate_mod.envPrefillChunk() == 0) {
+    if (perRequestPrefillChunkEnabled(config)) {
         const widest = rungWidth(config, 1, cappedRung(PREFILL_CHUNK_LADDER[0], ladderTop(config, explicitPrefillChunk())), config.longCtxGated());
         return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d}\n", .{ widest, pinned }) catch null;
     }
@@ -3925,9 +3905,9 @@ pub fn clampReserveWidth(config: *const model_mod.ModelConfig, pinned_width: u32
 }
 
 /// The narrowest width a request can step down to on the per-request ladder: its floor, or a
-/// narrower `--prefill-chunk`. Null where the width is pinned (no ladder, or `SUSHI_PREFILL_CHUNK`).
+/// narrower `--prefill-chunk`. Null where the width is pinned (no ladder).
 fn perRequestFloorWidth(config: *const model_mod.ModelConfig) ?u32 {
-    if (!perRequestPrefillChunkEnabled(config) or generate_mod.envPrefillChunk() > 0) return null;
+    if (!perRequestPrefillChunkEnabled(config)) return null;
     return cappedRung(PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1], explicitPrefillChunk());
 }
 
@@ -6848,8 +6828,6 @@ pub fn chooseRequestPrefillChunk(
 ) u32 {
     // The arch gate first: an ungated arch's answer is the load-time pin, as before.
     if (!perRequestPrefillChunkEnabled(config)) return load_time_pin;
-    // `SUSHI_PREFILL_CHUNK` is a tuning pin, forwarded verbatim.
-    if (generate_mod.envPrefillChunk() > 0) return explicitPrefillChunk();
     const top = ladderTop(config, chunk_override);
     // GLM's checkpoints yield to the width: a request keeps those the chosen width leaves room for.
     var rung_warm = warm;
@@ -6879,7 +6857,7 @@ fn ladderTop(config: *const model_mod.ModelConfig, chunk_override: u32) u32 {
 /// The width one ladder rung forwards at. `long_ctx_gated = false` asks what the rung would be
 /// without the long-context gate, i.e. the width the load-time machine cap still bounds.
 fn rungWidth(config: *const model_mod.ModelConfig, seq: u64, rung: u32, long_ctx_gated: bool) u64 {
-    // `effectivePrefillChunk` can return `SUSHI_PREFILL_CHUNK` verbatim; clamp before narrowing.
+    // `--prefill-chunk` is unbounded at its source; clamp before narrowing.
     return @min(
         @as(u64, generate_mod.requestPrefillChunk(
             config.prefillScoreHeadDim(),
@@ -6942,7 +6920,6 @@ pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
     // Arch first: the cheapest and most selective, and this runs once per chunk boundary.
     if (!config.perRequestPrefillChunk()) return false;
     if (explicitPrefillChunk() > 0) return false;
-    if (generate_mod.envPrefillChunk() > 0) return false;
     if (!perRequestPrefillChunkEnabled(config)) return false;
     return adaptive_chunk_override orelse true;
 }
@@ -21246,18 +21223,6 @@ test "mlxCacheLimitBytes: RAM-proportional cap, 2 GB floor, 8 GB ceiling" {
     try testing.expectEqual(@as(u64, 0), mlxCacheLimitBytes(0));
 }
 
-test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls through" {
-    const GB: u64 = 1 << 30;
-    // The A/B off-switch: SUSHI_CACHE_LIMIT=0 leaves MLX's default in
-    // place so the pre-#110 behavior stays reachable in a same-boot A/B.
-    try testing.expectEqual(@as(u64, 0), mlxCacheLimitFromEnv("0", 128 * GB));
-    try testing.expectEqual(@as(u64, 3 * GB), mlxCacheLimitFromEnv("3221225472", 128 * GB));
-    // Unset or unparseable → the RAM-proportional default.
-    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv(null, 128 * GB));
-    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("lots", 128 * GB));
-    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("", 128 * GB));
-}
-
 /// Pins the cache tiers a bill test is about. The defaults (no RAM tier, an SSD tier) bill differently:
 /// SSD-first stages the writer's flush and a ringed arch bills its restore's coexistence.
 const TierGuard = struct {
@@ -24042,7 +24007,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     defer per_request_chunk_override = null;
     adaptive_chunk_override = true;
     defer adaptive_chunk_override = null;
-    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    const unpinned = explicitPrefillChunk() == 0;
     try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
     if (unpinned) {
         try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
@@ -24075,7 +24040,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     defer per_request_chunk_override = null;
     adaptive_chunk_override = true;
     defer adaptive_chunk_override = null;
-    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    const unpinned = explicitPrefillChunk() == 0;
     try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
     try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
     try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true));
@@ -25289,7 +25254,7 @@ test "mimo_v2 prefills at the widest width its request bill admits, not at the l
 
     // The forward starts at 2048 and steps down per chunk only where a chunk stops fitting.
     try t.expectEqual(@as(usize, 2048), generate_mod.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, seq, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), 0));
-    try t.expectEqual(explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0, adaptivePrefillChunkEnabled(&cfg));
+    try t.expectEqual(explicitPrefillChunk() == 0, adaptivePrefillChunkEnabled(&cfg));
 
     // 2048 is a default: an explicit `--prefill-chunk 4096` raises the ladder's top rung, billed at that width.
     const saved_explicit = generate_mod.prefill_chunk_explicit;
@@ -26504,7 +26469,7 @@ test "GLM requests prefill at 2048 and step down a rung only where a chunk stops
     const kv_bits: u64 = 8;
     try t.expect(cfg.perRequestPrefillChunk());
     try t.expectEqual(@as(u32, 2048), chooseRequestPrefillChunk(&cfg, 4096, 256, kv_bits, 1 << 40, 2048, 0, .{}));
-    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    const unpinned = explicitPrefillChunk() == 0;
     try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
 
     // Release defaults: a 1M request is admitted with a 2048-row tail, and 2048 still fits there. The SSD-first

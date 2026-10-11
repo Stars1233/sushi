@@ -6,6 +6,15 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Cleanup**: `SUSHI_NO_UPDATE_CHECK` is removed; use `--no-update-check`.
+- **Cleanup**: `SUSHI_CACHE_LIMIT`, `SUSHI_WIRED` and `SUSHI_WIRED_SLACK_MB` are removed; the MLX buffer-pool cap is always RAM/16 clamped to 2..8 GB and the wired limit is always the recommended working set.
+- **Cleanup**: opt-in experiments that never shipped are removed with their environment switches: the DFlash width chooser and draft-only head, sampled DFlash drafts, periodic MTP re-entry, batched Qwen4 MTP rounds, fused QKV, the pruned lm_head, batched MoE decode, the paired gate/up and crossrow verify kernels, the fused add+RMSNorm lever and the compiled whole-forward.
+- **Cleanup**: `--decode-attn-quant` side copies are always INT8 group-32; the NVFP4 tail and `SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM` are removed.
+- **Cleanup**: the `--dspark` flag is removed; it only set an environment variable that nothing read.
+- **Cleanup**: the launch flags now are the only control for settings that also had an environment twin:
+  `SUSHI_DFLASH` (use `--no-drafter`), `SUSHI_MTP_TYPICAL` and `SUSHI_MTP_TOKENV3` (`--mtp-typical`,
+  `--mtp-tokenv3`), `SUSHI_PREFILL_CHUNK` (`--prefill-chunk`, which now also keeps the memory safety cap),
+  `SUSHI_PREFILL_DECODE_SHARE`, `SUSHI_PREFILL_TRACE` and `SUSHI_DECODE_ATTN_QUANT` no longer read the environment.
 - **Cleanup**: code for architectures sushi does not serve is removed, including the dormant ANE prefill path and its
   `--ane-prefill` flag, the `sushi:ane_*` metrics and the `ane` object in `/props`; unsupported models are still
   refused by name.

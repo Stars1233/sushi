@@ -200,18 +200,13 @@ fn printUsage(io: std.Io) void {
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
-        \\                      INT8 group-32 for most layers, NVFP4 for the
-        \\                      last 20% (late layers amplify quantization
-        \\                      error far less). Cuts their per-token weight
-        \\                      read by half or more on models that ship dense
+        \\                      INT8 group-32. Cuts their per-token weight
+        \\                      read by half on models that ship dense
         \\                      attention.
         \\                      LOSSY: a real requantization, applied to
         \\                      decode/verify steps only; prefill keeps the
         \\                      dense weights. Default ON; --no-… restores
-        \\                      exact dense decode. Env tuning:
-        \\                      SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM=<layer>
-        \\                      moves the 4-bit boundary, =off keeps the whole
-        \\                      stack INT8.
+        \\                      exact dense decode.
         \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
         \\                        (default 1). Every depth the planner picks
         \\                        stays inside --mtp-min-depth..--mtp-max-depth;
@@ -284,7 +279,7 @@ fn printUsage(io: std.Io) void {
         \\  --prefill-decode-share <s>
         \\                      Target decode wall-time share during another
         \\                        request's prefill (0..0.9); narrows chunks too.
-        \\                        Default 0; env SUSHI_PREFILL_DECODE_SHARE.
+        \\                        Default 0.
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
@@ -397,8 +392,7 @@ fn printUsage(io: std.Io) void {
         \\  --parent-pid <pid>  Shut down when process <pid> exits (for a host
         \\                        that runs sushi as its engine).
         \\  --no-update-check   Never ask GitHub for a newer release (a server
-        \\                        otherwise checks at most once a day; also
-        \\                        SUSHI_NO_UPDATE_CHECK=1)
+        \\                        otherwise checks at most once a day)
         \\  --version           Print version and exit
         \\  --guest-manifest    Print the JSON a host checks before running this
         \\                        build as its engine (guest.json), and exit
@@ -551,8 +545,8 @@ pub fn main(init: std.process.Init) !void {
     // Either flag given: it outranks the per-model `mtp` (the last one wins).
     var mtp_explicit = false;
     var mtp_head_kv_quant = false;
-    var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_TYPICAL")) |v| std.mem.span(v) else null;
-    var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("SUSHI_MTP_TOKENV3")) |v| std.mem.span(v) else null;
+    var mtp_typical_raw: ?[]const u8 = null;
+    var mtp_tokenv3_raw: ?[]const u8 = null;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
@@ -767,11 +761,6 @@ pub fn main(init: std.process.Init) !void {
             mtp_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
-        } else if (std.mem.eql(u8, args[i], "--dspark")) {
-            // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
-            // ~11 GB resident, so the default leaves them lazy and serves
-            // serial. deepseek_v4.initModel reads the env at model load.
-            _ = setenv("SUSHI_DSV4_DSPARK", "1", 1);
         } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
             transformer_mod.decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
@@ -1036,16 +1025,13 @@ pub fn main(init: std.process.Init) !void {
     const host = bind.host;
     const port = bind.port;
 
-    const decode_share_env: ?[]const u8 = if (std.c.getenv("SUSHI_PREFILL_DECODE_SHARE")) |r| std.mem.span(r) else null;
-    scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
-        log.err("--prefill-decode-share / SUSHI_PREFILL_DECODE_SHARE: expected a number >= 0 (above 0.9 clamps), got '{s}'\n", .{decode_share_flag orelse decode_share_env.?});
-        std.process.exit(1);
-    };
-    const effective_decode_share = scheduler_mod.prefillDecodeShare();
-    if (decode_share_flag != null or decode_share_env != null) {
-        log.info("[prefill] decode share: configured={d}, effective={d} ({s})\n", .{
-            scheduler_mod.prefill_decode_share, effective_decode_share,
-            if (decode_share_flag != null) "--prefill-decode-share" else "SUSHI_PREFILL_DECODE_SHARE",
+    if (decode_share_flag) |text| {
+        scheduler_mod.prefill_decode_share = scheduler_mod.parseDecodeShare(text) catch {
+            log.err("--prefill-decode-share: expected a number >= 0 (above 0.9 clamps), got '{s}'\n", .{text});
+            std.process.exit(1);
+        };
+        log.info("[prefill] decode share: configured={d}, effective={d} (--prefill-decode-share)\n", .{
+            scheduler_mod.prefill_decode_share, scheduler_mod.prefillDecodeShare(),
         });
     }
 
@@ -1127,7 +1113,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
-    if (serve_mode and prompt == null) update_mod.startDailyCheck(io, no_update_check, transformer_mod.diagEnvOn("SUSHI_NO_UPDATE_CHECK"));
+    if (serve_mode and prompt == null) update_mod.startDailyCheck(io, no_update_check);
 
     if (parent_pid) |pid| {
         parent_watch.start(pid) catch |err| {
@@ -1587,8 +1573,7 @@ pub fn main(init: std.process.Init) !void {
 
         // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
         {
-            const wired = mlx.applyWiredPolicy();
-            if (wired.target) |t| log.debug("[wired] mode={s} limit={d} MB\n", .{ @tagName(wired.mode), t / (1024 * 1024) });
+            if (mlx.applyWiredPolicy()) |limit| log.debug("[wired] limit={d} MB\n", .{limit / (1024 * 1024)});
         }
         if (config.hidden_act == .gelu_approx) {
             xfm.compileGelu();

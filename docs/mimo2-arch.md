@@ -148,8 +148,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **A packed-cache global-layer DECODE reads in place** (`mimoGlobalDecodeArm`): with matrix units (M5) the matmul2d
   `sushi_qkv_mpp` (`qkvMppDecodeServes`, from `QKV_MPP_DECODE_MIN_TK` = 4096 keys); without them (M4) the QSA split-K
   body over the whole causal range (`qkvAttnSplitKKernel`, from `QKV_SPLITK_DECODE_MIN_TK` = 4096 keys; 512 keys per
-  split, 64-128 splits, split count a runtime value); else the dense rebuild. `SUSHI_KVQ_FORCE_SPLITK=1` takes
-  the split-K arm on an M5 for A/B.
+  split, 64-128 splits, split count a runtime value); else the dense rebuild. `SUSHI_FORCE_GPU_FAMILY_FALLBACK=1`
+  takes the split-K arm on an M5 for A/B.
 - **The arm is chosen per decode STEP from the cache's current key count**, never from the request's admission-time
   `kv_attn_fused` (`auto` resolves that from the PROMPT, so a short prompt that grew long stayed on the rebuild,
   unbilled, and at 256k drove wired memory to the limit). `--kv-attn-mode` and the per-request field no longer reach

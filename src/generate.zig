@@ -57,7 +57,7 @@ pub var prefill_trace_force: bool = false;
 /// Set once by the serve CLI before request construction. Direct callers may
 /// override it through InitOptions; exact remains the library default.
 pub var mtp_acceptance_default: mtp_acceptance.Mode = .exact;
-/// `--mtp-typical` / `--mtp-tokenv3` (or their env twins) chose the default above.
+/// `--mtp-typical` / `--mtp-tokenv3` chose the default above.
 pub var mtp_acceptance_explicit: bool = false;
 
 /// THIS model's acceptance mode: the launch flag > `--fast` > its `mtp_acceptance` > exact.
@@ -74,11 +74,6 @@ pub var mtp_lookup_disabled: bool = false;
 /// THIS model's greedy tail: the launch flag > `--fast` > its `mtp_greedy_tail` > off.
 pub fn mtpGreedyTailFor(setting: ?bool) model_settings.Pick(bool) {
     return model_settings.pickLaunch(bool, .mtp_greedy_tail, model_settings.launchFlag(bool, true, mtp_greedy_tail_explicit), setting, false);
-}
-
-/// The width `SUSHI_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.
-pub fn envPrefillChunk() usize {
-    return readEnvUsize("SUSHI_PREFILL_CHUNK", 0);
 }
 
 pub fn tickUbenchN(raw: ?[*:0]const u8) u32 {
@@ -303,14 +298,10 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
 }
 
 /// The prefill chunk `initWithOptions` will actually use for a request:
-/// SUSHI_PREFILL_CHUNK env (explicit tuning knob — honored verbatim,
-/// never safety-capped) > --prefill-chunk / default, capped by
-/// boundedPrefillChunk. Exported so server.zig's admission guard
+/// --prefill-chunk / default, capped by boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
 pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_chunk: usize) usize {
-    const env_chunk = readEnvUsize("SUSHI_PREFILL_CHUNK", 0);
-    if (env_chunk > 0) return env_chunk;
     // `pinned_chunk` is the machine-sized cap frozen at load
     // (`ModelConfig.pinned_prefill_chunk`, from `server.resolvePrefillChunk`):
     // the widest chunk whose one-off transient reserve still leaves this box a
@@ -1780,9 +1771,6 @@ pub const Generator = struct {
     /// effective draft width. Thinking requests use the lower calibration
     /// because their less-predictable reasoning preamble pays back later.
     dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
-    /// Per-round width chooser over the model's round-cost table (null =
-    /// SUSHI_DFLASH_CHOOSER=0, the fixed block + sticky yield gate).
-    dflash_chooser: ?round_cost.WidthChooser = null,
     /// Drafts this round ran (0 = serial), read by the table feed.
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
@@ -2077,17 +2065,6 @@ pub const Generator = struct {
     /// break-even acceptance is several times a dense trunk's.
     pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 
-    /// Width chooser — OPT-IN (SUSHI_DFLASH_CHOOSER=1) until measured on
-    /// the five peer cells; default is the fixed block + sticky yield gate.
-    var dflash_chooser_cache: ?bool = null;
-    fn dflashChooserEnabled() bool {
-        if (dflash_chooser_cache) |v| return v;
-        const raw = std.c.getenv("SUSHI_DFLASH_CHOOSER");
-        const on = raw != null and std.mem.eql(u8, std.mem.span(raw.?), "1");
-        dflash_chooser_cache = on;
-        return on;
-    }
-
     pub fn dflashGateShouldDisable(attempted: u64, accepted: u64, min_avg: f32) bool {
         if (attempted < DFLASH_GATE_WARMUP) return false;
         const avg = @as(f32, @floatFromInt(accepted)) /
@@ -2181,7 +2158,6 @@ pub const Generator = struct {
 
     pub fn logSpecStats(self: *const Generator) void {
         var table_buf: [256]u8 = undefined;
-        var hist_buf: [256]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) {
@@ -2249,23 +2225,21 @@ pub const Generator = struct {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.dflash_attempted));
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
-            // Under the chooser the width varies per round: drafts proposed
-            // is the histogram's sum, not attempts x a fixed block.
-            const drafts_proposed: u64 = if (self.glm_dflash_native) self.glm_round.drafted else if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
+            const drafts_proposed: u64 = if (self.glm_dflash_native) self.glm_round.drafted else self.dflash_attempted * @as(u64, drafts_per_round);
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
             else
                 0.0;
             log.info(
-                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d} block_avg={d:.2} block_hist={s} chooser_trials={d}\n",
+                "  [spec-stats] mode=dflash attempts={d} accepts={d} avg_per_round={d:.2} gate_min={d:.2} per_draft_pct={d:.1}% block_size={d} partial_rounds={d} runtime_disabled={s} table={s}:{s} table_drops=t{d}/c{d}/b{d}/i{d}\n",
                 .{
                     self.dflash_attempted,
                     self.dflash_accepted_tokens,
                     avg_per_round,
                     self.dflash_min_accepted_per_round,
                     per_draft_pct,
-                    if (self.dflash_chooser) |ch| ch.current + 1 else self.dflash_block_size,
+                    self.dflash_block_size,
                     self.partial_rounds,
                     if (self.spec_disabled_runtime) "true" else "false",
                     round_cost.bucketName(self.xfm.round_cost.layout, table_bucket),
@@ -2274,9 +2248,6 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
                     self.xfm.round_cost.dropped_implausible,
-                    if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
-                    if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
-                    if (self.dflash_chooser) |ch| ch.trial.trials else 0,
                 },
             );
             if (self.glm_dflash_native) {
@@ -2625,10 +2596,8 @@ pub const Generator = struct {
         // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
         // Vision requests skip chunking since image token positions must be visible
         // in a single forward pass for spliceVisionEmbeddings to work correctly.
-        // PREFILL_CHUNK overridable via env SUSHI_PREFILL_CHUNK for tuning,
-        // or via the module-level `prefill_chunk_override` (set by --prefill-chunk
-        // CLI flag in main.zig). Env var wins if both are set (and skips the
-        // safety cap below — it's the explicit escape hatch).
+        // PREFILL_CHUNK comes from the module-level `prefill_chunk_override`
+        // (set by --prefill-chunk in main.zig).
         //
         // Safety cap: on unfused head dims (>128 — every Gemma-4/Qwen3.5/3.6)
         // the composed SDPA materializes [heads, chunk, total_kv] scores per
@@ -2647,10 +2616,10 @@ pub const Generator = struct {
             options.pinned_prefill_chunk,
         ), options.decode_share_width_cap);
         // Phase-level prefill instrumentation. Enabled at debug level OR via
-        // SUSHI_PREFILL_TRACE=1 (which forces the trace line at info).
+        // --prefill-trace (which forces the trace line at info).
         // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
         // time goes (chunked-forward vs eval vs last-token-forward).
-        const trace_force: bool = prefill_trace_force or readEnvBool("SUSHI_PREFILL_TRACE");
+        const trace_force: bool = prefill_trace_force;
         const trace_enabled = log.isDebug() or trace_force;
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
@@ -2908,27 +2877,7 @@ pub const Generator = struct {
                 defer _ = mlx.mlx_array_free(chunk_input);
 
                 const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
-                // Phase 2 experiment: when SUSHI_COMPILE_FORWARD=1 wired a
-                // compiled closure at load time, route this chunk through it.
-                // The compiled closure uses xfm.defaultCtx (xfm.cache + xfm.ssm_entries),
-                // which matches the prefill `ctx` when the scheduler has swapped
-                // the slot's cache onto the Transformer (the single-slot legacy
-                // and Phase-2-swapped path both satisfy this). Hidden-capture
-                // and vision splice paths don't pass through this chunk loop
-                // (they take the last_input branch), so they're already safe.
-                // Optional-slice equality: same-ness here means both null or
-                // both point at the same backing memory. We accept ssm_entries
-                // null↔null too because plain-attn models legitimately have
-                // both ctx and xfm carry null.
-                const ssm_match = blk: {
-                    if (ctx.ssm_entries == null and xfm.ssm_entries == null) break :blk true;
-                    if (ctx.ssm_entries == null or xfm.ssm_entries == null) break :blk false;
-                    break :blk ctx.ssm_entries.?.ptr == xfm.ssm_entries.?.ptr and
-                        ctx.ssm_entries.?.len == xfm.ssm_entries.?.len;
-                };
-                // History windowing: a chunk before the window needs no
-                // capture, which ALSO re-qualifies it for the compiled
-                // trunk forward (capture is what disqualifies MTP chunks).
+                // History windowing: a chunk before the window needs no capture.
                 const mtp_capture = mtp_active and chunkNeedsMtpHistory(pos, end, prefix_len, mtp_hist_window);
                 var chunk_hidden_all = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(chunk_hidden_all);
@@ -2939,15 +2888,7 @@ pub const Generator = struct {
                 errdefer if (dflash_active) {
                     for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                 };
-                const chunk_logits = if (xfm.compiled_forward != null and
-                    !mtp_capture and
-                    !dflash_active and
-                    ctx.cache == &xfm.cache and
-                    ssm_match and
-                    ctx.capture_hidden == null and
-                    ctx.vision_embeddings == null)
-                    try xfm.forwardCompiled(chunk_input)
-                else if (mtp_capture) blk: {
+                const chunk_logits = if (mtp_capture) blk: {
                     var last_unused = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(last_unused);
                     break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
@@ -3463,10 +3404,6 @@ pub const Generator = struct {
                 .glm_dflash_native = glm_dflash_native,
                 .glm_prefill_window = glm_window,
                 .dflash_block_size = dflash_bs,
-                .dflash_chooser = if (dflash_active and !glm_dflash_native and dflashChooserEnabled())
-                    round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
-                else
-                    null,
                 .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_accept_graph = accept_route.graph,
@@ -4858,18 +4795,16 @@ pub const Generator = struct {
         // it is the ONLY source.
         const dflash_kv_watch = io_util.Stopwatch.init(self.timer.io);
         // The round-cost table sees the same round: drafts = block - 1, or
-        // 0 when the runtime gate fell back to serial (a serial sample is
-        // the "no spec" candidate a width chooser needs).
+        // 0 when the runtime gate fell back to serial.
         const dflash_gen_before = self.generated_ids.items.len;
         self.dflash_round_width = 0;
-        const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted;
+        const dflash_rounds_before: u64 = self.dflash_attempted;
         defer {
             const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
             const emitted = self.generated_ids.items.len - dflash_gen_before;
             const post_warmup = dflash_rounds_before >= DFLASH_GATE_WARMUP;
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
             self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
-            if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
@@ -4890,39 +4825,8 @@ pub const Generator = struct {
             return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
         }
 
-        // Per-round width: the chooser's argmax over measured tokens/ms
-        // (serial = width 0 is a candidate, so "serial wins" is the gate),
-        // the fixed block until it has data.
-        var round_width: u32 = @max(self.dflash_block_size, 2) - 1;
-        if (self.dflash_chooser) |*ch| {
-            if (ch.rounds >= DFLASH_GATE_WARMUP) {
-                const d = ch.choose(&self.xfm.round_cost, self.mtpKvLen(), ch.rounds);
-                round_width = d.width;
-                // Serial is sticky: a plain decode round does not extend the
-                // assistant context, so there is no way back this request.
-                if (round_width == 0) self.spec_disabled_runtime = true;
-                if (ch.logged != ch.current) {
-                    if (self.xfm.round_cost.bucketToRead(self.mtpKvLen())) |b| {
-                        ch.logged = ch.current;
-                        var buf: [256]u8 = undefined;
-                        log.info("[dflash] width chooser: standing w{d} ({s}) from {s} {s} (ms/tok)\n", .{
-                            ch.current,
-                            if (ch.current == 0) "serial" else "block",
-                            round_cost.bucketName(self.xfm.round_cost.layout, b),
-                            self.xfm.round_cost.formatBucket(b, &buf),
-                        });
-                    }
-                }
-            }
-        }
+        const round_width: u32 = @max(self.dflash_block_size, 2) - 1;
         self.dflash_round_width = round_width;
-        if (round_width == 0) {
-            const tok_opt = try self.next(allocator);
-            if (tok_opt == null) return null;
-            const tokens = try allocator.alloc(u32, 1);
-            tokens[0] = tok_opt.?;
-            return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
-        }
 
         if (try self.checkStop()) return null; // t1 is this block's first emit: stop before drafting
 
@@ -5007,8 +4911,7 @@ pub const Generator = struct {
         // drafted at the previous one (the Markov bigram bias). Chaining it
         // is what the head is for — dropping it drafts every position from
         // an uncorrected distribution the sidecar was never trained to emit.
-        const use_markov = model.markov != null and dflashMarkovEnabled();
-        const sample_drafts = stochastic and !use_selector and !use_markov and dflashSampledDraftsEnabled();
+        const use_markov = model.markov != null;
         var sel_path: ?dflash_mod.SelectedPath = null;
         defer if (sel_path) |*sp| sp.deinit(allocator);
         var draft_q: mlx.mlx_array = .{ .ctx = null }; // [m, V] proposal density
@@ -5106,21 +5009,6 @@ pub const Generator = struct {
             const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(host_arr);
             try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
-        } else if (sample_drafts) {
-            draft_q = try filteredProbsBlock(draft_logits, self.sampling, s);
-            var logq = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(logq);
-            try mlx.check(mlx.mlx_log(&logq, draft_q, s));
-            const null_key = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(null_key);
-            var sampled = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(sampled);
-            try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
-            var as_i32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(as_i32);
-            try mlx.check(mlx.mlx_astype(&as_i32, sampled, .int32, s));
-            const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
-            try mlx.check(mlx.mlx_reshape(&draft_ids, as_i32, &row_shape, 2, s));
         } else {
             var draft_amax = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(draft_amax);
@@ -5367,9 +5255,6 @@ pub const Generator = struct {
         self.dflash_accepted_tokens += accepted;
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
-        if (self.dflash_chooser) |*ch| ch.observe(m, accepted, MTP_EV_EMA_BETA);
-        // The calibrated sticky gate stays as the bootstrap that gets serial
-        // MEASURED (the chooser picks serial only from a measured w0 cell).
         self.checkDflashRuntimeGate();
         if (self.completion_tokens >= self.max_tokens) {
             self.done = true;
@@ -7006,7 +6891,7 @@ pub const Generator = struct {
         {
             const prev_bucket = self.mtp_adaptive.bucket;
             const prev_arm = self.mtp_adaptive.arm;
-            const action = mtpAdaptiveSerialTickFor(&self.mtp_adaptive, &self.xfm.round_cost, self.mtpKvLen(), mtpAdaptiveReentryTokens());
+            const action = mtpAdaptiveSerialTickFor(&self.mtp_adaptive, &self.xfm.round_cost, self.mtpKvLen());
             self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
             // Re-entry only when the head can prove it is in sync (else `qwen4MtpForward` returns
             // `error.MtpPositionGap`). A decline latches: the drift cannot shrink on its own.
@@ -8971,40 +8856,6 @@ pub const Generator = struct {
         }
     };
 
-    /// Sampled DFlash drafts — DEFAULT OFF, measured negative.
-    /// `SUSHI_DFLASH_SAMPLED_DRAFTS=1` draws each draft from the
-    /// request's own filtered distribution and accepts through the full
-    /// Leviathan ratio; off keeps the argmax draft and its one-hot q.
-    ///
-    /// The theory said this should help: a greedy draft's acceptance is
-    /// p(argmax q), which a flattened target row deflates, while a matched
-    /// proposal accepts at 1 − TV(p, q). Measured on Muse 4-bit at temp 0.7
-    /// (3 reps x 4 prompts, same-boot serial reference), it is a LOSS —
-    /// 52.4 tok/s / 54.5% per-draft against 55.5 / 57.7% greedy. This
-    /// assistant's ARGMAX tracks the trunk well while its distribution SHAPE
-    /// does not, so a one-hot proposal is the better proposal and sampling
-    /// spends the round's budget landing on tokens the trunk would not pick.
-    /// Greedy requests never reach this either way.
-    var dflash_sampled_drafts_cache: ?bool = null;
-    fn dflashSampledDraftsEnabled() bool {
-        if (dflash_sampled_drafts_cache) |v| return v;
-        var on = false;
-        if (std.c.getenv("SUSHI_DFLASH_SAMPLED_DRAFTS")) |p| {
-            const val = std.mem.span(p);
-            if (val.len > 0 and val[0] == '1') on = true;
-        }
-        dflash_sampled_drafts_cache = on;
-        return on;
-    }
-
-    /// `SUSHI_DFLASH_MARKOV=0` drafts a DSpark sidecar's block from its
-    /// UNCORRECTED base logits (the v1 arm) — an A/B lever for measuring what
-    /// the Markov chain is worth, never a default.
-    fn dflashMarkovEnabled() bool {
-        const p = std.c.getenv("SUSHI_DFLASH_MARKOV") orelse return true;
-        return !std.mem.eql(u8, std.mem.span(p), "0");
-    }
-
     var dflash_trace_cache: ?bool = null;
     fn dflashTraceEnabled() bool {
         if (dflash_trace_cache) |v| return v;
@@ -9435,8 +9286,8 @@ pub const Generator = struct {
     }
 
     /// One serial tick of the adaptive arm at `kv_len`, buckets resolved as the decision resolved them.
-    pub fn mtpAdaptiveSerialTickFor(a: *MtpAdaptive, t: *const round_cost.Table, kv_len: u32, redecide_tokens: u32) MtpAdaptiveAction {
-        return a.serialTickAt(mtpAdaptiveBucketOf(t.bucketToRead(kv_len), kv_len, t.layout), t.bucketOf(kv_len), redecide_tokens);
+    pub fn mtpAdaptiveSerialTickFor(a: *MtpAdaptive, t: *const round_cost.Table, kv_len: u32) MtpAdaptiveAction {
+        return a.serialTickAt(mtpAdaptiveBucketOf(t.bucketToRead(kv_len), kv_len, t.layout), t.bucketOf(kv_len));
     }
 
     fn mtpAdaptiveBucket(self: *const Generator, kv_len: u32) usize {
@@ -9564,8 +9415,6 @@ pub const Generator = struct {
         arm: MtpAdaptiveArm = .undecided,
         confirm: u32 = 0,
         bucket: ?usize = null,
-        /// Serial ticks since the arm went serial (or the last re-decision).
-        serial_ticks: u32 = 0,
         /// A re-entry was refused because the head's position bookkeeping is out of sync; latched.
         reentry_declined: bool = false,
         /// The switch left MTP on a module-owned head, so the arm is sticky: no re-entry, probe
@@ -9604,7 +9453,6 @@ pub const Generator = struct {
                     if (self.confirm < @max(@as(u32, 1), need)) return .none;
                     self.confirm = 0;
                     self.arm = .serial;
-                    self.serial_ticks = 0;
                     self.serial_own = null;
                     self.switches += 1;
                     return .to_serial;
@@ -9612,49 +9460,35 @@ pub const Generator = struct {
             }
         }
 
-        /// Serial tokens after which the decision is re-opened inside the same bucket. Default
-        /// OFF: a re-entry resumes a head whose history did not grow across the block.
-        /// `SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS` turns it on.
-        pub const REDECIDE_SERIAL_TOKENS_DEFAULT: u32 = 0;
-        /// The value the lever selects when it is enabled without a number.
-        pub const REDECIDE_SERIAL_TOKENS_ON: u32 = 512;
-
         /// Latch a refused re-entry: back to the serial arm, never ask again for this request.
         pub fn declineReentry(self: *MtpAdaptive) void {
             self.arm = .serial;
-            self.serial_ticks = 0;
             self.reentry_declined = true;
         }
 
         /// Make the serial arm permanent for this request (a `to_serial` on a module-owned head).
         pub fn stickSerial(self: *MtpAdaptive) void {
             self.arm = .serial;
-            self.serial_ticks = 0;
             self.sticky_serial = true;
         }
 
         /// `serialTick` plus a crossing of the request's own bucket (`own`).
-        pub fn serialTickAt(self: *MtpAdaptive, bucket: usize, own: usize, redecide_tokens: u32) MtpAdaptiveAction {
+        pub fn serialTickAt(self: *MtpAdaptive, bucket: usize, own: usize) MtpAdaptiveAction {
             if (self.arm == .serial and !self.sticky_serial and !self.reentry_declined) {
                 const at = self.serial_own orelse own;
                 self.serial_own = at;
                 if (own != at) return self.reopen(bucket);
             }
-            return self.serialTick(bucket, redecide_tokens);
+            return self.serialTick(bucket);
         }
 
-        pub fn serialTick(self: *MtpAdaptive, bucket: usize, redecide_tokens: u32) MtpAdaptiveAction {
+        pub fn serialTick(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
             // Sticky outranks both re-entry triggers, the bucket crossing included.
             if (self.sticky_serial) return .none;
             if (self.reentry_declined) return .none;
             if (self.arm != .serial) return .none;
             if (self.bucket) |b| {
-                if (b == bucket) {
-                    if (redecide_tokens == 0) return .none; // crossing-only
-                    self.serial_ticks +|= 1;
-                    if (self.serial_ticks < redecide_tokens) return .none;
-                    return self.reopen(bucket);
-                }
+                if (b == bucket) return .none; // only a bucket crossing re-opens the decision
             }
             return self.reopen(bucket);
         }
@@ -9662,7 +9496,6 @@ pub const Generator = struct {
         fn reopen(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
             self.bucket = bucket;
             self.confirm = 0;
-            self.serial_ticks = 0;
             self.serial_own = null;
             self.arm = .undecided;
             self.switches += 1;
@@ -9685,16 +9518,6 @@ pub const Generator = struct {
         const on = mtpAdaptiveSerialEnabledFromEnv(raw);
         mtp_adaptive_serial_cache = on;
         return on;
-    }
-
-    var mtp_reentry_tokens_cache: ?u32 = null;
-    /// `SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS`: 0 / unset = crossing-only; a bare `1` selects 512.
-    fn mtpAdaptiveReentryTokens() u32 {
-        if (mtp_reentry_tokens_cache) |v| return v;
-        const n = readEnvUsize("SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS", MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
-        const v: u32 = if (n == 1) MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON else @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
-        mtp_reentry_tokens_cache = v;
-        return v;
     }
 
     /// Drift between the head's position bookkeeping and what its next forward demands
@@ -17981,14 +17804,14 @@ test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 
     var osc = G.MtpAdaptive{};
     _ = osc.round(0, G.mtpAdaptiveBucketOf(own + 1, kv, .long), .serial, 1);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, osc.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv), 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv)));
 
     var ok = G.MtpAdaptive{};
     const b = G.mtpAdaptiveBucketOf(own + 1, kv, .long);
     _ = ok.round(0, b, .serial, 1);
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv, .long), 0));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv, .long)));
     }
     try testing.expectEqual(G.MtpAdaptiveArm.serial, ok.arm);
 }
@@ -18007,9 +17830,9 @@ test "adaptive serial re-enters when the request crosses into a bucket nothing h
 
     var kv: u32 = kv_switch + 1;
     while (kv < 65_536) : (kv += 61) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, G.mtpAdaptiveSerialTickFor(&a, &t, kv, 0));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, G.mtpAdaptiveSerialTickFor(&a, &t, kv));
     }
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, G.mtpAdaptiveSerialTickFor(&a, &t, 65_536, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, G.mtpAdaptiveSerialTickFor(&a, &t, 65_536));
     try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
 
     // A switch that read a neighbour (own bucket unmeasured) must not re-enter on its next tick (H6).
@@ -18019,9 +17842,9 @@ test "adaptive serial re-enters when the request crosses into a bucket nothing h
     _ = n.round(0, G.mtpAdaptiveBucketOf(lo.bucketToRead(40_000), 40_000, lo.layout), .serial, 1);
     kv = 40_001;
     while (kv < 65_536) : (kv += 61) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, G.mtpAdaptiveSerialTickFor(&n, &lo, kv, 0));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, G.mtpAdaptiveSerialTickFor(&n, &lo, kv));
     }
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, G.mtpAdaptiveSerialTickFor(&n, &lo, 65_536, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, G.mtpAdaptiveSerialTickFor(&n, &lo, 65_536));
 }
 
 test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the price window" {
@@ -18043,12 +17866,12 @@ test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the pric
     try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
     pb = a.bucket;
     pa = a.arm;
-    _ = a.serialTick(6, 0); // crossing: re-opens the decision
+    _ = a.serialTick(6); // crossing: re-opens the decision
     try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
     // A tick that changes nothing must not drop the window, or it can never fill.
     pb = a.bucket;
     pa = a.arm;
-    _ = a.serialTick(6, 0);
+    _ = a.serialTick(6);
     try testing.expect(!G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
 }
 
@@ -18165,49 +17988,16 @@ test "MtpAdaptive: the switch needs CONFIRM consecutive rounds, counted once per
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, f.round(0, 3, .serial, 0));
 }
 
-test "MtpAdaptive: crossing always re-opens; the periodic re-open is OFF by default" {
+test "MtpAdaptive: only a bucket crossing re-opens the serial decision" {
     const G = Generator;
-    const N = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
-    try testing.expectEqual(@as(u32, 0), G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
-
     var off = G.MtpAdaptive{};
     _ = off.round(0, 3, .serial, 1);
     var i: u32 = 0;
-    while (i < N * 2) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3, 0));
+    while (i < 1024) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3));
     }
     try testing.expectEqual(G.MtpAdaptiveArm.serial, off.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4, 0));
-
-    var a = G.MtpAdaptive{};
-    _ = a.round(0, 3, .serial, 1);
-    i = 0;
-    while (i < N - 1) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N));
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3, N));
-    try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N)); // not twice
-
-    var top = G.MtpAdaptive{};
-    const b_top = round_cost.bucketFor(300_000);
-    try testing.expectEqual(b_top, round_cost.bucketFor(900_000));
-    _ = top.round(0, b_top, .serial, 1);
-    var fired: u32 = 0;
-    i = 0;
-    while (i < N * 3) : (i += 1) {
-        if (top.serialTick(b_top, N) == .to_mtp) {
-            fired += 1;
-            _ = top.round(i, b_top, .serial, 1);
-        }
-    }
-    try testing.expectEqual(@as(u32, 3), fired);
-
-    var d = G.MtpAdaptive{};
-    _ = d.round(0, 3, .serial, 1);
-    i = 0;
-    while (i < N / 2) : (i += 1) _ = d.serialTick(3, N);
-    _ = d.round(1, 3, .mtp, 1);
-    _ = d.round(2, 3, .serial, 1);
-    try testing.expectEqual(@as(u32, 0), d.serial_ticks);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4));
 }
 
 test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in sync" {
@@ -18223,9 +18013,9 @@ test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in 
     a.declineReentry();
     try testing.expect(a.reentry_declined);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 512)); // crossing
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4)); // crossing
     var i: u32 = 0;
-    while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, 512));
+    while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
 }
 
 test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is trusted" {
@@ -18273,12 +18063,11 @@ test "S21: a to_serial on a per-request head is not sticky; the release stays a 
     try testing.expect(a.sticky_serial);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
 
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 0));
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(5, 0));
-    const on = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(5));
     var i: u32 = 0;
-    while (i < on * 2) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, on));
+    while (i < 1024) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
     }
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(1, 3, .mtp, 1));
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(2, 4, .serial, 1));
@@ -18298,7 +18087,7 @@ test "S21: a KV-only sidecar head keeps its re-arm, and nothing about it changes
     var b = G.MtpAdaptive{};
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, b.round(0, 3, .serial, 1));
     try testing.expect(!b.sticky_serial);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4));
     try testing.expectEqual(G.MtpAdaptiveArm.undecided, b.arm);
 
     try testing.expect(!Generator.mtpAdaptiveSerialEnabledFromEnv("0"));
@@ -20325,13 +20114,6 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     try std.testing.expectEqual(@as(usize, 8192), explicit);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
     try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
-
-    _ = setenv("SUSHI_PREFILL_CHUNK", "8192", 1);
-    defer _ = unsetenv("SUSHI_PREFILL_CHUNK");
-    prefill_chunk_explicit = false;
-    const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
-    try std.testing.expectEqual(@as(usize, 8192), env);
-    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
 }
 
 /// Records what `mimoStepOut` frees instead of freeing it, so a double free is a count, not a crash.

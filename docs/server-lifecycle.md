@@ -52,8 +52,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **Daily check**: a serving process (`serve`, `--serve`, `run`) asks GitHub at most once a day on a detached thread,
   with the in-process HTTPS client and the cached ETag (`~/.sushi/update-check.json`); a failure is one debug line and
   a retry an hour later. A newer release logs `sushi X is available: run \`sushi update\`` and shows in `/props` and the
-  `run` banner. Boot logs `[update] daily check on|off (source)`: `--no-update-check` > `SUSHI_NO_UPDATE_CHECK`
-  (`diagEnvOn`) > off for a source build > on. `SUSHI_UPDATE_API` is a test-only hook (tests/test_self_update.sh).
+  `run` banner. Boot logs `[update] daily check on|off (source)`: `--no-update-check` > off for a source
+  build > on. `SUSHI_UPDATE_API` is a test-only hook (tests/test_self_update.sh).
 - **Update and restart** (`/v1/update`, the REPL's `/update`): the server shuts down through its SIGTERM path, then
   main's last defer REPLACES the process (`posix_spawn` with `SETEXEC | CLOEXEC_DEFAULT`, fds 0-2 kept) with
   `sushi update --relaunch -- <argv>`, which in turn replaces itself with `<install>/sushi <argv>`, new or restored.
@@ -168,7 +168,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   drafting GLM slot joins as a plain row when its model has company ([glm5-arch](glm5-arch.md#concurrency)).
 - A cold prefill YIELDS to decode ticks at chunk boundaries (`scheduler.interleaveDecodeTick`;
   `SUSHI_PREFILL_INTERLEAVE=0` restores). Greedy byte-identical.
-- `--prefill-decode-share S` (flag > `SUSHI_PREFILL_DECODE_SHARE` > 0) targets the fraction of wall time given
+- `--prefill-decode-share S` (default 0) targets the fraction of wall time given
   to existing decoders during another request's prefill. Values above 0.9 clamp; negative values and NaN refuse.
   Zero preserves one decode tick per boundary; a nonzero share adds ticks until `chunk_ns*S/(1-S)` is spent or
   decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables both the share and its width cap.

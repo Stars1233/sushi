@@ -2078,7 +2078,6 @@ test "bf16 ngram store gathers rows across safetensors shards" {
 
 test "expert stream slab operand preserves direct gather output" {
     const t = std.testing;
-    const sandboxed = std.c.getenv("CODEX_SANDBOX") != null;
     const io = t.io;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -2098,10 +2097,7 @@ test "expert stream slab operand preserves direct gather output" {
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(io, &path_buf);
-    const s = if (sandboxed) mlx.mlx_default_cpu_stream_new() else mlx.gpuStream();
-    defer if (sandboxed) {
-        _ = mlx.mlx_stream_free(s);
-    };
+    const s = mlx.gpuStream();
     var engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], .{ .layers = 1, .experts = 2, .hidden = 2, .intermediate = 1 }, 12, s, .{ .bounce_size = 1 << 20 });
     defer engine.deinit();
     {
@@ -2270,10 +2266,6 @@ fn writeTinyExpertCheckpointLayers(allocator: std.mem.Allocator, dir: std.Io.Dir
     return file_bytes;
 }
 
-fn tinyStream() mlx.mlx_stream {
-    return if (std.c.getenv("CODEX_SANDBOX") != null) mlx.mlx_default_cpu_stream_new() else mlx.gpuStream();
-}
-
 test "expert stream zero copy hit refills nothing and keeps the slab operand" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
@@ -2284,7 +2276,7 @@ test "expert stream zero copy hit refills nothing and keeps the slab operand" {
     const path_len = try tmp.dir.realPath(t.io, &path_buf);
     const path = path_buf[0..path_len];
     const geom = Geometry{ .layers = 1, .experts = 4, .hidden = 64, .intermediate = 64 };
-    const s = tinyStream();
+    const s = mlx.gpuStream();
     var zero = try Engine.initWithOptions(t.allocator, path, geom, 2 * 24576, s, .{ .bounce_size = 1 << 20 });
     defer zero.deinit();
     try t.expectEqual(@as(u64, 0), zero.fallback_imports);
@@ -2325,7 +2317,7 @@ const TinyEngine = struct {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path_len = try tmp.dir.realPath(t.io, &path_buf);
         const geom = Geometry{ .layers = 1, .experts = experts, .hidden = 64, .intermediate = 64 };
-        const engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geom, @as(u64, slots) * 24576, tinyStream(), .{ .io_workers = 2, .bounce_size = 1 << 20 });
+        const engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geom, @as(u64, slots) * 24576, mlx.gpuStream(), .{ .io_workers = 2, .bounce_size = 1 << 20 });
         return .{ .tmp = tmp, .raw = raw, .engine = engine };
     }
 
@@ -2364,7 +2356,7 @@ const TinyLayersEngine = struct {
             .first_moe_layer = first_moe_layer,
         };
         const requested = @as(u64, slots) * @as(u64, moeLayerCount(geom)) * 24576;
-        const engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geom, requested, tinyStream(), .{ .io_workers = 2, .bounce_size = 1 << 20 });
+        const engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geom, requested, mlx.gpuStream(), .{ .io_workers = 2, .bounce_size = 1 << 20 });
         return .{ .tmp = tmp, .raw = raw, .engine = engine };
     }
 
@@ -2553,7 +2545,7 @@ test "expert stream a failure after the first lease leaves every slab reusable" 
 }
 
 test "expert stream a union view past 2^31 elements keeps its slot axes" {
-    const s = tinyStream();
+    const s = mlx.gpuStream();
     var slab = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(slab);
     try mlx.check(mlx.mlx_zeros(&slab, &[_]c_int{ 3, 32768, 32768 }, 3, .uint8, s));
@@ -2646,7 +2638,6 @@ fn bf16Of(bits: u16) f32 {
 
 test "expert stream bf16 kernels read the imported slab operand" {
     const t = std.testing;
-    if (std.c.getenv("CODEX_SANDBOX") != null) return error.SkipZigTest;
     var fixture = try TinyEngine.open(2, 4);
     defer fixture.close();
     const engine = &fixture.engine;
@@ -3043,7 +3034,7 @@ test "expert stream original MiMo source warms exact MXFP4 bytes" {
     const n = try tmp.dir.realPath(t.io, &path_buf);
     const geometry = Geometry{ .layers = 2, .experts = 2, .hidden = 32, .intermediate = 32, .first_moe_layer = 1 };
     const per_expert = try mxfp4ExpertBytes(32, 32);
-    var engine = try Engine.initWithOptions(t.allocator, path_buf[0..n], geometry, 2 * per_expert, tinyStream(), .{
+    var engine = try Engine.initWithOptions(t.allocator, path_buf[0..n], geometry, 2 * per_expert, mlx.gpuStream(), .{
         .io_workers = 1,
         .bounce_size = 1 << 20,
         .layout = .mxfp4_individual,
@@ -3081,7 +3072,7 @@ test "expert stream MXFP4 keeps nine component ids but imports and leases only s
         .first_moe_layer = 1,
     };
     const per_expert = try expertBytesFor(t.allocator, path_buf[0..path_len], geometry, .mxfp4_split);
-    var engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geometry, 2 * per_expert, tinyStream(), .{
+    var engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geometry, 2 * per_expert, mlx.gpuStream(), .{
         .io_workers = 1,
         .bounce_size = 1 << 20,
         .layout = .mxfp4_split,
@@ -3145,7 +3136,7 @@ test "expert stream quantized slabs alias the nine pack tensors and remap ids" {
     const path_len = try tmp.dir.realPath(t.io, &path_buf);
     const path = path_buf[0..path_len];
     const geom = Geometry{ .layers = 1, .experts = 4, .hidden = 64, .intermediate = 64 };
-    const s = tinyStream();
+    const s = mlx.gpuStream();
 
     const per_expert = try expertBytesFor(t.allocator, path, geom, .quantized_split);
     try t.expectEqual(@as(u64, 2 * (64 * 8 * 4 + 2 * 64 * 2 * 2) + (64 * 16 * 4 + 2 * 64 * 2 * 2)), per_expert);
@@ -3562,7 +3553,7 @@ test "GLM BF16 stream imports split expert slabs and preserves bytes across cach
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(t.io, &path_buf);
     const geometry = Geometry{ .layers = 4, .experts = 4, .hidden = 32, .intermediate = 16, .first_moe_layer = 3 };
-    const s = tinyStream();
+    const s = mlx.gpuStream();
     var engine = try Engine.initWithOptions(t.allocator, path_buf[0..path_len], geometry, 2 * 3072, s, .{ .layout = .bf16_individual, .bounce_size = 1 << 20 });
     defer engine.deinit();
     try t.expectEqual(@as(u64, 6), engine.slab_imports);

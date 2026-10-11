@@ -373,20 +373,19 @@ pub fn availableVersion(buf: []u8) ?[]const u8 {
 
 pub const CheckChoice = struct { on: bool, source: []const u8 };
 
-pub fn checkChoice(flag_off: bool, env_off: bool, source_build: bool) CheckChoice {
+pub fn checkChoice(flag_off: bool, source_build: bool) CheckChoice {
     if (flag_off) return .{ .on = false, .source = "--no-update-check" };
-    if (env_off) return .{ .on = false, .source = "SUSHI_NO_UPDATE_CHECK" };
     if (source_build) return .{ .on = false, .source = "source build" };
     return .{ .on = true, .source = "default" };
 }
 
 /// Logs the resolved choice once and, when on, checks on a detached thread: never the inference thread, never
 /// in the way of the boot, silent on failure.
-pub fn startDailyCheck(io: std.Io, flag_off: bool, env_off: bool) void {
+pub fn startDailyCheck(io: std.Io, flag_off: bool) void {
     var ebuf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_dir = selfDir(io, &ebuf) orelse "";
     homebrew.store(isHomebrewKeg(exe_dir), .release);
-    const choice = checkChoice(flag_off, env_off, isSourceBuild(io, exe_dir));
+    const choice = checkChoice(flag_off, isSourceBuild(io, exe_dir));
     if (choice.on or !std.mem.eql(u8, choice.source, "source build")) log.info("[update] daily check {s} ({s})\n", .{ if (choice.on) "on" else "off", choice.source });
     if (!choice.on) return;
     const t = std.Thread.spawn(.{}, checkLoop, .{io}) catch |err| {
@@ -1219,13 +1218,12 @@ test "update: /props carries null fields until a check answers, then the newer r
 }
 
 test "update: the daily check's resolved state names its source" {
-    try testing.expectEqualStrings("--no-update-check", checkChoice(true, true, false).source);
-    try testing.expectEqualStrings("SUSHI_NO_UPDATE_CHECK", checkChoice(false, true, false).source);
-    try testing.expectEqualStrings("source build", checkChoice(false, false, true).source);
-    const on = checkChoice(false, false, false);
+    try testing.expectEqualStrings("--no-update-check", checkChoice(true, true).source);
+    try testing.expectEqualStrings("source build", checkChoice(false, true).source);
+    const on = checkChoice(false, false);
     try testing.expect(on.on);
     try testing.expectEqualStrings("default", on.source);
-    try testing.expect(!checkChoice(true, false, false).on);
+    try testing.expect(!checkChoice(true, false).on);
 }
 
 test "update: /v1/update is refused on a public bind, a remote peer, a bad key or Origin, a host, a busy server" {

@@ -24,8 +24,6 @@ const capturePrefillHiddenLast = trf.capturePrefillHiddenLast;
 const decodeProfReport = trf.decodeProfReport;
 const decodeProfileEnabled = trf.decodeProfileEnabled;
 const decodeProfileRows = trf.decodeProfileRows;
-const diagEnvOnCached = trf.diagEnvOnCached;
-const fusedAddRmsNorm = trf.fusedAddRmsNorm;
 const fusedAddRmsNormRouted = trf.fusedAddRmsNormRouted;
 const fusedAddRmsNormUngated = trf.fusedAddRmsNormUngated;
 const fusedSdpaPrefillKv = trf.fusedSdpaPrefillKv;
@@ -89,9 +87,8 @@ pub fn mimoWarmPackedDecode(config: *const ModelConfig, kv_config: KVQuantConfig
 
 pub const MimoDecodeArm = enum { mpp, split_k, dense };
 
-/// `SUSHI_KVQ_FORCE_SPLITK=1` takes the no-matrix-unit arm on an M5, for a live A/B.
 pub fn mimoDecodeUsesNax() bool {
-    return verifyQmmNaxAvailable() and !diagEnvOnCached(&trf.kvq_force_splitk_env, "SUSHI_KVQ_FORCE_SPLITK");
+    return verifyQmmNaxAvailable();
 }
 
 /// MiMo global-layer decode on a packed cache: matmul2d where matrix units exist, else split-K.
@@ -765,7 +762,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
             const post_fused = if (fuse_norms)
                 try fusedAddRmsNormRouted(self.s, h, attn_out, lw.post_attn_norm, self.rms_eps_arr)
             else
-                try fusedAddRmsNorm(self.s, h, attn_out, lw.post_attn_norm, self.rms_eps_arr);
+                null;
             if (post_fused) |fused| {
                 _ = mlx.mlx_array_free(h);
                 h = fused.sum;

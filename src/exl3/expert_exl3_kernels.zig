@@ -6626,23 +6626,11 @@ const MimoMoeCase = struct {
     /// parity cases use; the served pack's own magnitudes are `MIMO_BANKS`.
     banks: [4]f32 = @splat(0.9),
     x_scale: f32 = 0.05,
-    /// Raw `[E]`-sliced gate/up/down trellis then suh_h/svh_i/suh_i/svh_h, as
-    /// the shards store them. Set, the fixture carries the PACK's own bytes.
-    real_blob: ?[*:0]const u8 = null,
 };
 
 /// The served w12 pack's own scale magnitudes: |suh| is ~0.01 and |svh| ~1,
 /// so the residual's size reaches the arm's f16 planes through the GEMMs.
 const MIMO_BANKS = [4]f32{ 0.0126, 1.03, 0.0083, 1.009 };
-
-fn readAll(fd: c_int, dst: []u8) !void {
-    var got: usize = 0;
-    while (got < dst.len) {
-        const n = std.c.read(fd, dst.ptr + got, dst.len - got);
-        if (n <= 0) return error.RealBlobShort;
-        got += @intCast(n);
-    }
-}
 
 const MimoMoeFixture = struct {
     arrays: [10]mlx.mlx_array,
@@ -6696,23 +6684,12 @@ fn mimoMoeFixture(alloc: std.mem.Allocator, c: MimoMoeCase) !MimoMoeFixture {
     for ([_][]u16{ gate_t, up_t, down_t }) |bank| {
         for (bank) |*v| v.* = @truncate(rnd.int(u32));
     }
-    var real_fd: ?c_int = null;
-    if (c.real_blob) |path| {
-        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
-        if (fd < 0) return error.RealBlobOpen;
-        real_fd = fd;
-        for ([_][]u16{ gate_t, up_t, down_t }) |bank| try readAll(fd, std.mem.sliceAsBytes(bank));
-    }
     const suh_h = try alloc.alloc(u16, c.e * c.hidden);
     const svh_i = try alloc.alloc(u16, c.e * c.inter);
     const suh_i = try alloc.alloc(u16, c.e * c.inter);
     const svh_h = try alloc.alloc(u16, c.e * c.hidden);
     for ([_][]u16{ suh_h, svh_i, suh_i, svh_h }, c.banks) |bank, mag| {
         for (bank) |*v| v.* = exl3.f32ToF16Bits(if (rnd.boolean()) mag else -mag);
-    }
-    if (real_fd) |fd| {
-        for ([_][]u16{ suh_h, svh_i, suh_i, svh_h }) |bank| try readAll(fd, std.mem.sliceAsBytes(bank));
-        _ = std.c.close(fd);
     }
     const xh = try alloc.alloc(u16, c.rows * c.hidden);
     const xf = try alloc.alloc(f32, c.rows * c.hidden);
@@ -6950,35 +6927,6 @@ fn mimoArmMatchesF32(c: MimoMoeCase) !void {
     if (rel < 0.01) return;
     std.debug.print("exl3 vs f32 SwiGLU rel_rms {d:.6}; peaks g={d:.0} u={d:.0} mid={d:.0}\n", .{ rel, peaks.g, peaks.u, peaks.mid });
     return error.TestExpectedEqual;
-}
-
-// The pack's own scale magnitudes with a residual the size the served model
-// carries put `silu(gate) * up` past 65504 while every input, weight and
-// output stays ordinary: an f16 plane there turns a whole routed row into inf.
-// Synthetic-magnitude parity cases cannot see it — they never leave f16 range.
-// Every other parity case drives the arms with synthetic trellis and a single
-// scale magnitude; a real shard's suh spans 0.0006..0.17 inside one vector.
-// `REAL_BLOB` names a pack slice (E experts of gate/up/down trellis, then
-// suh_h/svh_i/suh_i/svh_h) so the Metal arms are scored on the bytes a pack
-// actually ships. Absent, there is nothing to read and the case skips.
-test "mimo_v2 EXL3 arms match the f32 SwiGLU on a real pack's own bytes" {
-    const blob = std.c.getenv("REAL_BLOB") orelse return error.SkipZigTest;
-    for ([_]usize{ 1, 33 }) |rows| {
-        for ([_]f32{ 0.3, 1.0, 3.0 }) |xs| {
-            try mimoArmMatchesF32(.{
-                .e = 8,
-                .hidden = 4096,
-                .inter = 2048,
-                .topk = 8,
-                .rows = rows,
-                .rate = .{ .n = 40 },
-                .dec = .{ .codebook = .mcg, .window = .w12 },
-                .seed = 4242,
-                .x_scale = xs,
-                .real_blob = blob,
-            });
-        }
-    }
 }
 
 test "exl3 token preparation preserves a subnormal scale on a hot BF16 channel" {
@@ -7654,12 +7602,6 @@ fn weightReaderExact(comptime n: u32, comptime cb: exl3.Codebook, comptime win: 
     var trellis_data: [128 * n]u16 = undefined;
     var prng = std.Random.DefaultPrng.init(430);
     for (&trellis_data) |*v| v.* = prng.random().int(u16);
-    if (std.c.getenv("REAL_BLOB")) |path| {
-        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
-        if (fd < 0) return error.RealBlobOpen;
-        defer _ = std.c.close(fd);
-        try readAll(fd, std.mem.sliceAsBytes(&trellis_data));
-    }
     const tr = mlx.mlx_array_new_data(&trellis_data, &.{ 128, @intCast(n) }, 2, .uint16);
     defer _ = mlx.mlx_array_free(tr);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -7719,11 +7661,7 @@ fn n40PrefillBf16Truth(seed: u64, win: c_int) !void {
 }
 
 fn n40Bf16Truth(seed: u64, win: c_int, rows: usize, decode: bool) !void {
-    return n40Bf16TruthGeometry(seed, win, rows, decode, 256, 128);
-}
-
-fn n40Bf16TruthGeometry(seed: u64, win: c_int, rows: usize, decode: bool, hidden: usize, inter: usize) !void {
-    const c = MimoMoeCase{ .e = 8, .hidden = hidden, .inter = inter, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = seed, .banks = MIMO_BANKS, .x_scale = 3 };
+    const c = MimoMoeCase{ .e = 8, .hidden = 256, .inter = 128, .topk = 8, .rows = rows, .rate = .{ .n = 40 }, .dec = .{ .codebook = .mcg, .window = .w12 }, .seed = seed, .banks = MIMO_BANKS, .x_scale = 3 };
     return bf16TruthCase(c, win, decode);
 }
 
@@ -7736,7 +7674,6 @@ fn bf16TruthCaseAnyArm(c: MimoMoeCase, win: c_int, decode: bool) !void {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const hidden = c.hidden;
-    const inter = c.inter;
     const rows = c.rows;
     const seed = c.seed;
     setDecodeParams(c.dec);
@@ -7804,7 +7741,6 @@ fn bf16TruthCaseAnyArm(c: MimoMoeCase, win: c_int, decode: bool) !void {
             err_comp += (b - v) * (b - v);
         }
     }
-    if (diagEnvValueOn(std.c.getenv("PERF_REPORT"))) std.debug.print("PREPARED_PARITY n={d} decode={} prepared={} hidden={d} inter={d} rows={d} seed={d} rms={e:.9} composite={e:.9}\n", .{ c.rate.n, decode, prepared_mid_force orelse false, hidden, inter, rows, seed, @sqrt(err_new / @as(f64, @floatFromInt(c.rows * c.hidden))), @sqrt(err_comp / @as(f64, @floatFromInt(c.rows * c.hidden))) });
     if (err_new > err_comp) {
         std.debug.print("n40 bf16 truth seed={d} win={d}: squared error {d:.9} > composite {d:.9}\n", .{ seed, win, err_new, err_comp });
         return error.PrefillWorseThanComposite;
@@ -8659,15 +8595,6 @@ test "exl3 prepared mid keys on MiMo geometry, never on the rate, and excludes q
     try std.testing.expect(!preparedMidOn(4096, 2048, 256, 8, 9, .bfloat16));
     try std.testing.expect(!preparedMidOn(4096, 2048, 256, 8, 1, .float16));
     try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 1, .bfloat16));
-}
-
-test "exl3 prepared mid production geometry BF16 f32 truth" {
-    if (!diagEnvValueOn(std.c.getenv("PERF_REPORT"))) return error.SkipZigTest;
-    prepared_mid_force = true;
-    defer prepared_mid_force = null;
-    for (1..9) |rows| {
-        for (0..3) |seed| try n40Bf16TruthGeometry(318 + seed, 32, rows, true, 4096, 2048);
-    }
 }
 
 test "exl3 MCG half pairs preserve every codeword at windows 8 through 16" {

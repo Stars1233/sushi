@@ -2157,7 +2157,7 @@ pub fn gatedFullAttnProjected(
     const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
 
     // Q projection
-    const q_proj = if (projected) |values| values.q else try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill, layer);
+    const q_proj = if (projected) |values| values.q else try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill);
     defer if (projected == null) {
         _ = mlx.mlx_array_free(q_proj);
     };
@@ -2199,11 +2199,11 @@ pub fn gatedFullAttnProjected(
     }
 
     // K, V projections
-    const k_proj = if (projected) |values| values.k else try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill, layer);
+    const k_proj = if (projected) |values| values.k else try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill);
     defer if (projected == null) {
         _ = mlx.mlx_array_free(k_proj);
     };
-    const v_proj = if (projected) |values| values.v else try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill, layer);
+    const v_proj = if (projected) |values| values.v else try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill);
     defer if (projected == null) {
         _ = mlx.mlx_array_free(v_proj);
     };
@@ -2402,7 +2402,7 @@ pub fn gatedFullAttnProjected(
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out_b, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, false, self.s));
             }
         }
-        return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, batch, is_prefill, layer, skip_output);
+        return self.gatedAttnTail(attn_out_b, gate, fa, flat_shape, batch, is_prefill, skip_output);
     }
 
     var kv_view = try cache.update(layer, k_rope, v_t, self.s, 0);
@@ -2540,7 +2540,7 @@ pub fn gatedFullAttnProjected(
     if (Qwen4AttnProf.active) Qwen4AttnProf.lap(attn_out, .qsa);
 
     if (layer == 3) if (Transformer.qwen4_trace) |tr| Qwen4Trace.set(&tr.attn3_pre_tail, attn_out);
-    return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, layer, skip_output);
+    return self.gatedAttnTail(attn_out, gate, fa, flat_shape, batch, is_prefill, skip_output);
 }
 
 /// Shared tail of `gatedFullAttnWith`: transpose the attention output back
@@ -2554,7 +2554,6 @@ pub fn gatedAttnTail(
     flat_shape: [3]c_int,
     batch: c_int,
     is_prefill: bool,
-    layer: u32,
     skip_output: bool,
 ) !mlx.mlx_array {
     // Transpose back [B,H,S,D] -> [B,S,H,D] (view)
@@ -2578,14 +2577,14 @@ pub fn gatedAttnTail(
         defer _ = mlx.mlx_array_free(gated);
         try mlx.check(mlx.mlx_reshape(&gated, gated_4d, &flat_shape, 3, self.s));
         if (skip_output) return standinRef(gated);
-        return self.attnProj(gated, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill, layer);
+        return self.attnProj(gated, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill);
     }
 
     var attn_flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_flat);
     try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
     if (skip_output) return standinRef(attn_flat);
-    return self.attnProj(attn_flat, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill, layer);
+    return self.attnProj(attn_flat, fa.o_w, fa.o_s, fa.o_b, batch == 1 and !is_prefill);
 }
 
 pub const AttnVerifyInputs = struct {
@@ -2705,7 +2704,7 @@ pub fn verifyRowsJoined(
             errdefer _ = mlx.mlx_array_free(result[i]);
             try mlx.check(mlx.mlx_slice(&result[i], value, &.{ 0, offset, 0 }, 3, &.{ 1, offset + widths[i], mlx.getShape(value)[2] }, 3, &.{ 1, 1, 1 }, 3, self.s));
         } else result[i] = switch (kind) {
-            .attention => try self.attnProj(flat[i], out_w, out_s, out_b, decode, @intCast(layer)),
+            .attention => try self.attnProj(flat[i], out_w, out_s, out_b, decode),
             .gdn => try self.qmatmul(flat[i], out_w, out_s, out_b),
         };
         built += 1;

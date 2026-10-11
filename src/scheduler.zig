@@ -3359,7 +3359,6 @@ pub var load_serving_bill: ?*const fn (*const ModelConfig, u64) ?LoadServingBill
 
 fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: []const u8) !u64 {
     if (directory.len == 0) return 0;
-    if (std.c.getenv("SUSHI_DFLASH")) |v| if (v[0] == '0' and dflash_mod.probeIsDflash(io, allocator, directory)) return 0;
     return @import("glm5_diagnostic.zig").assistantResidentBytes(io, allocator, directory);
 }
 
@@ -3894,7 +3893,6 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64, required_bytes: 
 
 fn glmDflashLoadBytes(io: std.Io, allocator: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, directory: []const u8) !u64 {
     if (directory.len == 0) return 0;
-    if (std.c.getenv("SUSHI_DFLASH")) |v| if (v[0] == '0') return 0;
     if (!dflash_mod.probeIsDflash(io, allocator, directory)) return error.GlmDflashAssistantRequired;
     var cfg = try dflash_mod.parseConfig(io, allocator, directory);
     defer cfg.deinit(allocator);
@@ -4311,24 +4309,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
-    // Phase 2 experiment: opt-in full-forward Metal fusion via
-    // SUSHI_COMPILE_FORWARD=1. This wraps the entire forward pass in
-    // mlx_compile so the chunked-prefill loop dispatches a fused graph
-    // instead of ~hundreds of separate ops per chunk. Gated because
-    // (a) the compiled closure captures `xfm.cache` / `xfm.ssm_entries`
-    // as state, and any path that swaps those (multi-slot scheduler,
-    // future re-entrant callers) must verify they're not racing the
-    // compiled call; (b) mlx_compile with shapeless=false recompiles
-    // per unique input shape, which thrashes if the prefill loop sees
-    // many different chunk sizes.
-    if (std.c.getenv("SUSHI_COMPILE_FORWARD") != null) {
-        const raw = std.c.getenv("SUSHI_COMPILE_FORWARD").?;
-        const slice = std.mem.sliceTo(raw, 0);
-        if (std.mem.eql(u8, slice, "1")) {
-            xfm_ptr.compileForward();
-        }
-    }
-
     if (transformer_mod.diagEnvOn("SUSHI_PREFILL_UBENCH")) prefillUbench(sch.allocator, xfm_ptr, params.config, params.tok);
     if (transformer_mod.diagEnvOn("SUSHI_GLM_ROWS_UBENCH")) if (xfm_ptr.glm5) |target| glmRowsUbench(sch.allocator, target, kv_quant_config.glmLatentBits() orelse 0, params.tok);
 
@@ -4599,59 +4579,54 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // DFlash block-drafter (any `*_assistant` family); anything else is refused.
     var dflash_ptr: ?*DflashModel = null;
     if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
-        const env_off = if (std.c.getenv("SUSHI_DFLASH")) |v| v[0] == '0' else false;
-        if (env_off) {
-            log.info("[dflash] sidecar at {s} skipped (SUSHI_DFLASH=0)\n", .{drafter_dir});
-        } else {
-            const d = try sch.allocator.create(DflashModel);
-            d.* = (if (params.config.isGlm5()) @import("glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
-                sch.allocator.destroy(d);
-                log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
-                return err;
-            };
-            if (params.config.isGlm5()) {
-                d.native_glm_serving = true;
-                log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
-                if (transformer_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, xfm_ptr.glm5.?, d, kv_quant_config.glmLatentBits() orelse 0, params.tok);
-            } else d.bind(xfm_ptr) catch |err| {
-                d.deinit();
-                sch.allocator.destroy(d);
-                log.err(
-                    "DFlash assistant at {s} is incompatible with target: {s}\n" ++
-                        "  (assistant+target must share hidden_size, the mask token and\n" ++
-                        "  target_layer_ids must exist in the target, and the target must\n" ++
-                        "  run the standard dense-attention forward path)\n",
-                    .{ drafter_dir, @errorName(err) },
-                );
-                return err;
-            };
-            dflash_ptr = d;
-            const wide_lane = dflash_mod.wideVerifyLaneAvailable();
-            const block_cap = dflash_mod.blockCapForMachine(chip_mod.chipBrand());
-            sch.drafter_block_size = dflash_mod.resolveBlockSize(
-                d.config.block_size,
-                params.draft_block_size,
-                params.draft_block_size_explicit,
-                wide_lane,
-                block_cap.cap,
+        const d = try sch.allocator.create(DflashModel);
+        d.* = (if (params.config.isGlm5()) @import("glm5_dflash.zig").loadAssistantStored(sch.io, sch.allocator, drafter_dir, xfm_ptr.glm5.?) else dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir)) catch |err| {
+            sch.allocator.destroy(d);
+            log.err("Failed to load DFlash assistant at {s}: {s}\n", .{ drafter_dir, @errorName(err) });
+            return err;
+        };
+        if (params.config.isGlm5()) {
+            d.native_glm_serving = true;
+            log.info("[glm-dflash] native DFlash2 loaded; greedy and sampled target decisions use layerwise tree verification\n", .{});
+            if (transformer_mod.diagEnvOn("SUSHI_GLM_ROUND_UBENCH")) glmRoundUbench(sch.allocator, xfm_ptr.glm5.?, d, kv_quant_config.glmLatentBits() orelse 0, params.tok);
+        } else d.bind(xfm_ptr) catch |err| {
+            d.deinit();
+            sch.allocator.destroy(d);
+            log.err(
+                "DFlash assistant at {s} is incompatible with target: {s}\n" ++
+                    "  (assistant+target must share hidden_size, the mask token and\n" ++
+                    "  target_layer_ids must exist in the target, and the target must\n" ++
+                    "  run the standard dense-attention forward path)\n",
+                .{ drafter_dir, @errorName(err) },
             );
-            var cap_note_buf: [96]u8 = undefined;
-            const cap_note: []const u8 = if (params.draft_block_size_explicit)
-                ", user-clamped"
-            else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
-                std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
-                    block_cap.label,
-                    block_cap.cap,
-                }) catch ", capped"
-            else
-                "";
-            log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
-                sch.drafter_block_size,
-                cap_note,
-                wide_lane,
-                d.config.target_layer_ids,
-            });
-        }
+            return err;
+        };
+        dflash_ptr = d;
+        const wide_lane = dflash_mod.wideVerifyLaneAvailable();
+        const block_cap = dflash_mod.blockCapForMachine(chip_mod.chipBrand());
+        sch.drafter_block_size = dflash_mod.resolveBlockSize(
+            d.config.block_size,
+            params.draft_block_size,
+            params.draft_block_size_explicit,
+            wide_lane,
+            block_cap.cap,
+        );
+        var cap_note_buf: [96]u8 = undefined;
+        const cap_note: []const u8 = if (params.draft_block_size_explicit)
+            ", user-clamped"
+        else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
+            std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
+                block_cap.label,
+                block_cap.cap,
+            }) catch ", capped"
+        else
+            "";
+        log.info("DFlash drafter ready (block_size={d}{s}, wide_verify_lane={}, targets={any}).\n", .{
+            sch.drafter_block_size,
+            cap_note,
+            wide_lane,
+            d.config.target_layer_ids,
+        });
     } else if (drafter_dir.len > 0) {
         log.err("Drafter at {s} is not a DFlash assistant (its config lacks block_size, mask_token_id and target_layer_ids)\n", .{drafter_dir});
         return error.UnsupportedDrafter;
@@ -5794,11 +5769,11 @@ fn finishEmbedRequest(sch: *Scheduler, req: *EmbedRequest, err_name: []const u8)
 /// `req.entry`, mark ready, and broadcast `req.done_cond` so the conn
 /// thread wakes. On failure, mark `.error_state` so future ensureLoaded
 /// calls fail fast; the conn thread surfaces a 500.
-fn logWiredPolicy(r: mlx.WiredPolicyResult) void {
-    if (r.target) |t| {
-        log.info("[wired] mode={s} limit={d} MB\n", .{ @tagName(r.mode), t / (1024 * 1024) });
+fn logWiredPolicy(limit: ?usize) void {
+    if (limit) |bytes| {
+        log.info("[wired] limit={d} MB\n", .{bytes / (1024 * 1024)});
     } else {
-        log.debug("[wired] mode={s} declined (no gpu / empty live set)\n", .{@tagName(r.mode)});
+        log.debug("[wired] declined (no gpu)\n", .{});
     }
 }
 
@@ -8768,20 +8743,6 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     return true;
 }
 
-/// qwen4_exp verify rows are expert bytes, so a batched verify measured no better than
-/// solo rounds: its MTP rounds stay solo unless opted in; two interleave, three go plain.
-var mtp_batched_qwen4_env: ?bool = null;
-fn mtpBatchedQwen4Enabled() bool {
-    if (mtp_batched_qwen4_env) |v| return v;
-    const on = if (std.c.getenv("SUSHI_MTP_BATCHED_QWEN4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
-    mtp_batched_qwen4_env = on;
-    return on;
-}
-
-fn mtpQwen4StaySolo(has_qwen4: bool, env_on: bool) bool {
-    return has_qwen4 and !env_on;
-}
-
 /// Why this group cannot take the merged `[N, S]` verify forward, or null for a shape that
 /// may: a qwen4 trunk's batched sub-paths are decode-shaped and uncertified past width 1.
 pub fn mergedVerifyDeclineReason(has_qwen4: bool, width: u32) ?[]const u8 {
@@ -8803,7 +8764,8 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     // A MiMo verify keeps each row's decode arithmetic only in its own solo forward.
     if (t.config.isMimo()) return true;
-    return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
+    // qwen4_exp verify rows are expert bytes, so a batched verify measured no better than solo rounds.
+    return t.qwen4 != null;
 }
 
 fn mtpCrowdThresholdFor(slot: *const Slot) usize {
@@ -9992,13 +9954,6 @@ test "batchedEffectiveKvLen: qwen4 bills selected length, other archs keep raw k
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&raw_pair));
     const other = [_]u32{ 1_000, 162_000 };
     try testing.expectEqual(@as(usize, 0), batchedKvKeepCount(&other));
-}
-
-test "mtpQwen4StaySolo is opt-in" {
-    try testing.expect(mtpQwen4StaySolo(true, false));
-    try testing.expect(!mtpQwen4StaySolo(true, true));
-    try testing.expect(!mtpQwen4StaySolo(false, false));
-    try testing.expect(!mtpQwen4StaySolo(false, true));
 }
 
 test "a GDN trunk is batchable AND is not clamped by the server's concurrency gate" {
@@ -12103,9 +12058,6 @@ pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
     if (std.math.isNan(v) or v < 0) return error.InvalidDecodeShare;
     return @min(v, PREFILL_DECODE_SHARE_MAX);
 }
-pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
-    return parseDecodeShare(flag orelse env orelse return 0);
-}
 /// The decode share's prefill width cap for this model. GLM prefill numerics depend on the chunk
 /// boundaries, so its chunks stay whole whatever else decodes: it yields only between chunks.
 pub fn prefillShareCapFor(cfg: *const ModelConfig, decoding: usize, share: f32) u32 {
@@ -12166,11 +12118,6 @@ test "decode share: parse clamps above 0.9 and rejects anything that is not a sh
     for ([_][]const u8{ "", "abc", "nan", "-0.3", "0.5x" }) |bad| {
         try testing.expectError(error.InvalidDecodeShare, parseDecodeShare(bad));
     }
-    // The flag outranks the env; neither set is 0; a bad env is an error, not 0.
-    try testing.expectEqual(@as(f32, 0.3), try resolveDecodeShare("0.3", "0.5"));
-    try testing.expectEqual(@as(f32, 0.5), try resolveDecodeShare(null, "0.5"));
-    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare(null, null));
-    try testing.expectError(error.InvalidDecodeShare, resolveDecodeShare(null, "abc"));
 }
 
 test "decode share: the budget is chunk * S / (1 - S), zero when off" {
@@ -12252,7 +12199,6 @@ test "decode share: the kill switch disables the effective share and only live s
     slots[0].finished = true;
     try testing.expectEqual(@as(usize, 0), liveDecodingCount(&sch));
     try testing.expectEqual(std.math.maxInt(u64), decodeShareBudgetNs(std.math.maxInt(u64), 0.9));
-    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare("0", "invalid"));
 }
 
 

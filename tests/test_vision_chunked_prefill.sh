@@ -6,7 +6,7 @@
 # hit a 400 no flag can fix).
 #
 # Two arms, same binary: SUSHI_VISION_CHUNKED=0 (old whole-prompt forward)
-# vs default-on, both at SUSHI_PREFILL_CHUNK=32 so chunk boundaries land
+# vs default-on, both at --prefill-chunk 32 so chunk boundaries land
 # INSIDE the image's placeholder span (the image splices at prompt start; the
 # prompt is padded past nextChunkEnd's TAIL_MERGE_MAX so chunking actually
 # engages). Asserts: [1] the on arm logs "[vision] chunked prefill" and the
@@ -89,8 +89,8 @@ PYEOF
 run_arm() {
     local arm="$1" env_val="$2"
     local log="$WORK/$arm.log"
-    SUSHI_VISION_CHUNKED="$env_val" SUSHI_PREFILL_CHUNK=32 \
-        "$BINARY" --serve --model "$MODEL" \
+    SUSHI_VISION_CHUNKED="$env_val" \
+        "$BINARY" --serve --model "$MODEL" --prefill-chunk 32 \
         --host 127.0.0.1 --port "$PORT" --prefix-cache-entries 0 \
         --log-level debug --log-file "$log" \
         >"$WORK/$arm.stdout" 2>&1 &
