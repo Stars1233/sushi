@@ -50,6 +50,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`); `engine-`, `serve
 | [docs/server-http-apis.md](docs/server-http-apis.md) | API contracts, streaming, sampling, reasoning budget, constrained JSON, launcher |
 | [docs/server-tool-calling.md](docs/server-tool-calling.md) | templates, tool-call parse chain and invariants, think tags, loop stops |
 | [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, media |
+| [docs/envvar.md](docs/envvar.md) | every env var the engine reads: kind, read cost, docs, keep/cut/flag verdict, the cut list |
 | [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, metadata stamp, window, loader rules |
 | [docs/perf-baselines.md](docs/perf-baselines.md) | method, roofline, shared EXL3 kernel timings, release ladders |
 | [docs/bench/v1.2.1/summary.md](docs/bench/v1.2.1/summary.md) | release context ladder and per-model benchmark reports |
