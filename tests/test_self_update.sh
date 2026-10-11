@@ -193,10 +193,16 @@ if boot --no-update-check; then
     check "--no-update-check turns it off by name" "$(has "$WORK/server.log" "\[update\] daily check off (--no-update-check)")"
 fi
 stop_server
+rm -f "$HOME/.sushi/update-check.json"
+API_HITS=$(wc -l < "$WORK/api.log")
 "$BINARY" serve --model-dir "$EMPTY" --port "$PORT" --log-file off > "$WORK/src-serve.log" 2>&1 &
 SPID=$!
 for _ in $(seq 1 60); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 0.5; done
-check "a source build never checks" "$(has "$WORK/src-serve.log" "\[update\] daily check off (source build)")"
+sleep 2
+# A source build stays silent and never reaches the release API, so it leaves no cache behind either.
+check "a source build logs no update line" "$([ "$(grep -c '\[update\]\|is available' "$WORK/src-serve.log")" = 0 ] && echo 1 || echo 0)"
+check "a source build never asks the release API" "$(is "$(wc -l < "$WORK/api.log")" "$API_HITS")"
+check "a source build writes no check cache" "$([ ! -e "$HOME/.sushi/update-check.json" ] && echo 1 || echo 0)"
 stop_server
 
 echo "[4/7] the chat page's guard"

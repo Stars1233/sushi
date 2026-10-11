@@ -1,16 +1,16 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
 # DFlash block-drafter integration test — env-gated on a local target +
-# assistant pair (Muse-Glimmer-30B + its DFlash assistant today):
+# assistant pair (GLM-5.3-Flash Sushi pack + its DFlash2 drafter today):
 #
-#   DFLASH_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw \
-#   DFLASH_TEST_DRAFTER=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/Qwen3.8-Flash-Next-Sushi-3bpw \
+#   DFLASH_TEST_MODEL=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw \
+#   DFLASH_TEST_DRAFTER=${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/GLM-5.3-Flash-Sushi-2bpw/dflash2 \
 #       ./tests/test_dflash.sh
 #
 # Pins the live contract: the sidecar probe classifies the assistant as
 # DFlash (boot log), rounds ENGAGE (`[spec-stats] mode=dflash attempts>0` —
 # engagement COUNTS, never output shape), greedy dflash-on equals greedy
-# dflash-off byte-for-byte over reasoning+content (always-thinking target),
+# dflash-off over reasoning+content (byte-for-byte at 8-bit or wider),
 # per-request enable_drafter:false opts out, and tool calls still parse with
 # the drafter engaged.
 
@@ -36,7 +36,8 @@ LOG=$(mktemp /tmp/dflash_test_serve.XXXXXX)
 # --no-mtp: a loaded DFlash sidecar outranks an in-checkpoint MTP head
 # (Qwen3.8 packs) since 26.9.2, so this is belt and braces — it keeps the
 # MTP head out of the boot lines and pins the arm on older builds too.
-"$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
+# --prefix-cache-mem: the RAM tier is opt-in (SSD-only by default), and [11] needs it.
+"$BIN" --model "$MODEL" --drafter "$DRAFTER" --no-mtp --prefix-cache-mem 1GB --serve --host 127.0.0.1 --port "$PORT" --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/null || true; }
 trap cleanup EXIT
@@ -341,12 +342,14 @@ fi
 CTX_PROMPT="Repeat this sentence exactly, word for word: the keeper trimmed the wick and wrote three lines in the logbook about the wind and the sea state and the ships that had passed by the point before dawn."
 gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_COLD=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
+RESTORES_COLD=$(grep -c "dflash context restored" "$LOG" || true)
 gen "$CTX_PROMPT" 120 ", \"enable_drafter\": true" > /dev/null
 RATE_HIT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | tail -1)
-if grep -q "dflash context restored" "$LOG" && [ "$RATE_COLD" = "$RATE_HIT" ]; then
+RESTORES_HIT=$(grep -c "dflash context restored" "$LOG" || true)
+if [ "$RESTORES_HIT" -gt "$RESTORES_COLD" ] && [ "$RATE_COLD" = "$RATE_HIT" ]; then
     ok "assistant context restored from the prefix cache (cold==hit $RATE_HIT)"
 else
-    bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$(grep -c 'dflash context restored' "$LOG")"
+    bad "assistant context restored from the prefix cache" "cold=$RATE_COLD hit=$RATE_HIT restores=$RESTORES_COLD->$RESTORES_HIT"
 fi
 
 # [12] The assistant context also survives the SSD tier (v4 spec sidecar):
