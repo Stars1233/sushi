@@ -3,9 +3,8 @@
 # Per-model settings (`~/.sushi/model-settings.json`, issue #269): a model's
 # `ctx_size` / `kv_quant` / `mtp` / `mtp_acceptance` / `mtp_greedy_tail` follow the MODEL, apply on its
 # load (boot AND cold load), and a second model cold-loaded in the same process
-# keeps the globals and the launch flags. An explicit launch flag outranks the file,
-# and `--fast` sits between them; on an SSD-streamed load it drops its MTP (STREAM_MODEL,
-# skipped when absent).
+# keeps the globals and the launch flags. An explicit launch flag outranks the file, and an
+# explicit --mtp refuses an SSD-streamed load (STREAM_MODEL, skipped when absent).
 # The served packs cannot sit side by side under the resident cap, so the second
 # model is loaded after the first is unloaded: precedence, not coexistence.
 #
@@ -196,60 +195,20 @@ CODE="$(load "$MODEL_A")"
 check "[7] mtp:false in the file turns the default off (load $CODE, default_on $(props_mtp_default_on "$MODEL_A"))" \
     "$([ "$CODE" = "200" ] && [ "$(props_mtp_default_on "$MODEL_A")" = "False" ] && echo 1 || echo 0)"
 
-# [8] --fast: its values name --fast and outrank every competing key in the file
-kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
-cat >"$SETTINGS" <<JSON
-{ "$MODEL_A/": { "kv_quant": "4", "mtp": false, "mtp_acceptance": "tokenv3", "mtp_greedy_tail": false },
-  "$STREAM_MODEL/": { "ssd_budget_gb": 60 } }
+# [8] an explicit --mtp refuses a streamed load
+if [ -f "$STREAM_MODEL/config.json" ]; then
+    kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
+    cat >"$SETTINGS" <<JSON
+{ "$STREAM_MODEL/": { "ssd_budget_gb": 60 } }
 JSON
-boot --fast
-props() { # props <model path> <python expr over s = /props settings>
-    local id; id="$(model_id "$1")"
-    curl -s "http://127.0.0.1:$PORT/props?model=$id" | python3 -c "import sys, json; s = json.load(sys.stdin)['settings']; print($2)"
-}
-PROPS_FAST="s['mtp']['source'], s['mtp']['acceptance'], s['mtp']['acceptance_source'], s['mtp']['acceptance_param'], s['mtp']['greedy_tail'], s['mtp']['greedy_tail_source'], s['kv_cache']['scheme'], s['kv_cache']['source']"
-GOT="$(props "$MODEL_A" "$PROPS_FAST")"
-check "[8] /props: MTP, typical 0.2, greedy tail and kv8, all from --fast (got $GOT)" \
-    "$([ "$GOT" = "--fast typical --fast 0.2 True --fast kv8 --fast" ] && echo 1 || echo 0)"
-check "[8] load log: --fast outranks mtp, mtp_acceptance and mtp_greedy_tail in the file" \
-    "$(grep -q "\[mtp\] on (--fast); acceptance typical (--fast); greedy tail on (--fast)" "$LOG" && echo 1 || echo 0)"
-check "[8] --fast's kv8 outranks kv_quant 4 (got $(row "$MODEL_A" kv), source $(row "$MODEL_A" src))" \
-    "$([ "$(row "$MODEL_A" kv)" = "8" ] && [ "$(row "$MODEL_A" src)" = "--fast" ] && grep -q "\[kv-cache\] kv8 (--fast)" "$LOG" && echo 1 || echo 0)"
-
-# [9] an SSD-streamed cold load under --fast drops its MTP and still loads, at kv8
-if [ -f "$STREAM_MODEL/config.json" ]; then
-    post unload-model "{\"model\":\"$MODEL_A\"}" >/dev/null
-    for _ in $(seq 1 12); do # a streamed load outlasts `post`'s 300 s; retry a preflight 503 like `load`
-        CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1800 -X POST "http://127.0.0.1:$PORT/v1/load-model" \
-            -H 'Content-Type: application/json' -d "{\"model\":\"$STREAM_MODEL\"}")"
-        [ "$CODE" = "503" ] || break
-        sleep 5
-    done
-    check "[9] streamed cold load under --fast -> 200 (got $CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
-    check "[9] the log says --fast's MTP is off under streaming" \
-        "$(grep -q "\[mtp\] off: unsupported under streaming (--fast)" "$LOG" && echo 1 || echo 0)"
-    GOT="$(props "$STREAM_MODEL" "s['mtp']['loaded'], s['mtp']['source'], s['kv_cache']['scheme'], s['kv_cache']['source']")"
-    check "[9] /props: no head, source --fast, kv8 from --fast (got $GOT)" \
-        "$([ "$GOT" = "False --fast kv8 --fast" ] && echo 1 || echo 0)"
-    post unload-model "{\"model\":\"$STREAM_MODEL\"}" >/dev/null
-else
-    echo "  SKIP [9]: no streamed checkpoint at $STREAM_MODEL"
-fi
-
-# [10] an explicit flag beside --fast wins its key; an explicit --mtp still refuses a streamed load
-kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
-boot --fast --mtp --mtp-typical 0.1 --kv-quant 4
-GOT="$(props "$MODEL_A" "$PROPS_FAST")"
-check "[10] /props: --mtp, --mtp-typical 0.1 and --kv-quant 4 win; the greedy tail stays --fast (got $GOT)" \
-    "$([ "$GOT" = "--mtp typical --mtp-typical 0.1 True --fast kv4 --kv-quant" ] && echo 1 || echo 0)"
-check "[10] load log names each source" \
-    "$(grep -q "\[mtp\] on (--mtp); acceptance typical (--mtp-typical); greedy tail on (--fast)" "$LOG" && grep -q "\[kv-cache\] kv4 (--kv-quant)" "$LOG" && echo 1 || echo 0)"
-if [ -f "$STREAM_MODEL/config.json" ]; then
+    boot --mtp
     post unload-model "{\"model\":\"$MODEL_A\"}" >/dev/null
     BODY="$(curl -s --max-time 1800 -X POST "http://127.0.0.1:$PORT/v1/load-model" \
         -H 'Content-Type: application/json' -d "{\"model\":\"$STREAM_MODEL\"}")"
-    check "[10] --fast --mtp: the streamed load is refused (got $BODY)" \
+    check "[8] --mtp: the streamed load is refused (got $BODY)" \
         "$(echo "$BODY" | grep -q "expert_streaming_mtp_unsupported" && echo 1 || echo 0)"
+else
+    echo "  SKIP [8]: no streamed checkpoint at $STREAM_MODEL"
 fi
 
 if [ "$FAIL" -gt 0 ]; then
