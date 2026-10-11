@@ -383,6 +383,27 @@ tests, `taskpolicy -a`, GPU lock per boot, 2026-10-04: 2048-row chunks prefilled
 2048 for numerics
 ([glm5-kernels](glm5-kernels.md#prefill-chunk-2048-two-layers-pending)); a quiet-box A/B is owed.
 
+<a id="glm-prefill-pool-clear"></a>
+## Prefill: the per-chunk pool clear stays (A/B, not landed)
+
+The prefill chunk loop returns MLX's buffer pool after every chunk (`mlx_clear_cache` in `generate.zig`). Handing the
+pool to the next chunk instead lost on speed and on memory. Seam binary `d0d3216a` (main `e8c9c47e` plus PR #41 and a
+throwaway env arm), Sushi-2bpw at release defaults (kv8 latent, DFlash2), `--prefix-cache-entries 0`,
+`--prefill-trace`, llmprobe's prefill prompt builder at 8,210 and 16,505 tokens, a warmup then three timed requests per
+cell, `taskpolicy -a`, GPU lock per boot, fans at max, quiet window, boots A B B A, 2026-10-11 (another worker's benches
+ran between boots). Greedy output was equal in all 28 requests.
+
+| arm | 8K tok/s (boot medians) | 16K tok/s | peak footprint 8K / 16K | pool between chunks |
+|---|---|---|---|---|
+| clear every chunk (shipped) | 768.6, 796.5 | 721.7, 748.6 | 82.1 / 82.3 GB | 0 (2.2-3.0 GB before the clear) |
+| keep the pool | 721.7, 737.2 | 693.2, 708.3 | 85.1 / 85.4 GB | 2.9-3.2 GB; 5.5-6.0 after the last chunk |
+
+Keeping the pool: -6.8% at 8K and -4.7% at 16K, with every chunk slower (chunk 0 included) and the fastest keep boot
+under the slowest clear boot. The process footprint was 3 GB higher and `/props` `available_bytes` 4.4 GB lower after
+the run; `mlx_get_peak_memory` did not move (80.39 GiB). Qwen 2.6bpw at 9,134 tokens, one boot each: 2,221 → 2,121
+tok/s (-4.5%), footprint 47.5 → 48.5 GB. A chunk boundary spends 10-17 ms outside the forwards, about 5 ms of it in
+the clear, so the clear is not what idles the GPU between chunks.
+
 <a id="glm-longctx"></a>
 ## GLM-5.3-Flash: long-context profile and the exact index-scoring wins (contended)
 

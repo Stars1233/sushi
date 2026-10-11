@@ -71,6 +71,8 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 
 - `mlx_clear_cache()` once per CHUNK and per emitted block, INTERVAL-based (`step -| last_clear >= 256`),
   un-skippable; `Generator.advanceStep` is the one step mover.
+- The prefill loop's per-chunk clear stays: handing the pool to the next chunk measured 5-7% slower prefill and a
+  3 GB larger footprint ([glm5-perf](glm5-perf.md#glm-prefill-pool-clear)).
 - `active` flat while phys climbs = the POOL (`memory.cache_bytes`). RSS is blind to Metal.
 
 ## Zig

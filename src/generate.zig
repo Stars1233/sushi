@@ -2985,6 +2985,7 @@ pub const Generator = struct {
                     };
                     _ = mlx.mlx_eval(eval_vec);
                 }
+                // Every chunk: handing the pool to the next chunk was slower and larger (glm5-perf).
                 _ = mlx.mlx_clear_cache();
                 if (trace_enabled) {
                     const eval_dt = prefill_sw.read() - eval_start_ns;
