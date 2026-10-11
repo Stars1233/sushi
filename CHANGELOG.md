@@ -19,6 +19,10 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Flags**: `--expert-cache-gb` is removed (also on `sushi kld`); `--ssd-budget-gb` sizes the expert cache.
 - **Flags**: `--embedding-max-length` is removed; `/v1/embeddings` accepts inputs up to the model's window.
 - **Flags**: `--logit-bias-file` is removed; requests carry `logit_bias`, and the `logit_bias_file` model setting stays.
+- **Models**: `sushi pull` and `sushi run` download only Sushi packs from the Hugging Face org `beamster` (a short name or `beamster/<repo>`); any other `org/repo` is refused before anything downloads.
+- **Models**: `sushi list` shows each published pack with its size, whether it is downloaded and whether this Mac meets its memory tier, marks the recommended pack, and falls back to the local models when Hugging Face is unreachable.
+- **Models**: `sushi pull` warns when this Mac has less memory than the pack's documented tier (it may still run with `--ssd-budget-gb`), then pulls anyway; `sushi pull` and `sushi list` reject extra arguments.
+- **Models**: `glm-5.3-flash:2bpw` is added for 96 GB Macs; `sushi pull` and `sushi list` say so while its repo is not published yet.
 - **Flags**: `--no-safety` is removed (it had no effect).
 - **Flags**: `--warmup-eager` and `--no-warmup-eager` are removed; the boot warmup always runs.
 - **Flags**: `--kv-attn-mode` is removed; `auto` is always the server default and a request's `kv_attn_mode` field still forces `dense` or `fused`.

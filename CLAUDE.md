@@ -165,6 +165,9 @@ merged` since the last tag); a credit missed in a shipped release goes into the 
 A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
 owner-approved card; the README pack line follows once the repo is live.
 
+- **Adding a pack** updates, in the same landing, its `aliases` row in `src/cli.zig` (`Alias.tier_gb`, `recommend_gb`),
+  the tier table and recommended launch in `docs/usage.md`, and the README pack line once the repo is live.
+
 ## Conventions
 
 - Minimal DRY Zig; tests at the bottom of each source file; shell integration tests in `tests/`.

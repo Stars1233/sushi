@@ -97,8 +97,17 @@ fn printUsage(io: std.Io) void {
         \\                      whether tools are on. The same chat opens in a
         \\                      browser at the URL it prints. /update installs
         \\                      a newer release and restarts the chat.
-        \\  pull <model>        Download a model into ~/.sushi/models
-        \\  list                Show downloaded models
+        \\  pull <model>        Download a Sushi pack from the Hugging Face org
+        \\                      beamster into ~/.sushi/models: a short name
+        \\                      (qwen3.8-flash-next[:tag], mimo-v2.6-flash,
+        \\                      glm-5.3-flash[:tag]) or beamster/<repo>. Warns
+        \\                      when this Mac has less memory than the pack's
+        \\                      documented tier, then pulls anyway.
+        \\  list                Show the Sushi packs with their size, whether they
+        \\                      are downloaded and whether this Mac meets their
+        \\                      memory tier (the recommended one marked), then
+        \\                      the other models on disk. Offline: the local
+        \\                      models only.
         \\  serve               Start the server over ~/.sushi/models
         \\                      (every pulled model loads on demand by name)
         \\  launch <agent>      Configure + launch a coding agent CLI against the
@@ -388,13 +397,20 @@ pub fn main(init: std.process.Init) !void {
     if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
         const cmd = args[1];
         if (std.mem.eql(u8, cmd, "pull")) {
-            if (args.len < 3) {
-                log.err("usage: sushi pull <model>\n", .{});
+            const model = cli_mod.parsePullArgs(args[2..]) catch |err| {
+                switch (err) {
+                    error.MissingModel => log.err("usage: sushi pull <model>\n", .{}),
+                    error.UnexpectedArgument => log.err("sushi pull: unexpected argument '{s}' (usage: sushi pull <model>)\n", .{args[3]}),
+                }
                 std.process.exit(1);
-            }
-            try cli_mod.cmdPull(allocator, io, args[2]);
+            };
+            try cli_mod.cmdPull(allocator, io, model);
             return;
         } else if (std.mem.eql(u8, cmd, "list")) {
+            cli_mod.parseListArgs(args[2..]) catch {
+                log.err("sushi list: unexpected argument '{s}' (usage: sushi list)\n", .{args[2]});
+                std.process.exit(1);
+            };
             try cli_mod.cmdList(allocator, io);
             return;
         } else if (std.mem.eql(u8, cmd, "run")) {

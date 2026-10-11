@@ -4,11 +4,11 @@
 //!   sushi run qwen3.8-flash-next          # download if missing, serve, drop into a REPL
 //!   sushi pull qwen3.8-flash-next:2.6bpw  # download only
 //!   sushi run mimo-v2.6-flash             # MiMo-V2.6-Flash (128 GB)
-//!   sushi list                            # what's on disk
+//!   sushi list                            # the Sushi packs for this Mac, and what's on disk
 //!
-//! Short names resolve through the published Sushi packs (`aliases`);
-//! anything containing '/' is treated as a HuggingFace repo id directly ("org/repo", with optional
-//! "hf.co/" prefix and ":tag" suffix). Downloads land in
+//! Short names resolve through the published Sushi packs (`aliases`); `beamster/<repo>` (optionally
+//! "hf.co/"-prefixed, with a ":tag" suffix) names a repo of that Hugging Face org directly. Any other
+//! org is refused before anything downloads. Downloads land in
 //! `~/.sushi/models/<org>/<repo>` — the single source of truth shared
 //! with the app's DownloadManager and the server's media-dep resolution.
 //!
@@ -108,26 +108,86 @@ pub const Alias = struct {
     repo: []const u8,
     /// Picked when the user gives the bare name with no tag.
     is_default: bool = false,
-    /// Non-empty: restrict the download to this single .gguf artifact.
-    gguf_file: []const u8 = "",
+    /// Installed RAM, in GB, the README and docs/usage.md document for running the pack in memory.
+    tier_gb: u32,
+    /// Installed RAM, in GB, from which `sushi list` recommends the pack (the largest such pack of a
+    /// family at or under the machine's RAM); 0 = never recommended.
+    recommend_gb: u32 = 0,
 };
 
-/// The published Sushi packs. The bare Qwen name picks 3bpw: 2.6bpw needs the same
-/// 64 GB and scores worse on KLD; 4bpw needs 96 GB. MiMo's and GLM's one pack each
-/// need 128 GB.
+/// The Hugging Face org every `pull` and `run` download comes from.
+pub const HF_ORG = "beamster";
+
+/// The published Sushi packs, with the memory tiers the README and docs/usage.md state. The bare Qwen
+/// name picks 3bpw: 2.6bpw needs the same 64 GB and scores worse on KLD; 4bpw needs 96 GB. MiMo's pack and
+/// GLM's default 2.4bpw need 128 GB, GLM's 2bpw 96 GB. Qwen 2bpw also streams on a 32 GB Mac (README, "Streaming on a 32 GB Mac").
+/// A new pack lands here, in docs/usage.md and, once its repo is live, in the README.
 pub const aliases = [_]Alias{
-    .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw" },
-    .{ .name = "qwen3.8-flash-next", .tag = "2.6bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw" },
-    .{ .name = "qwen3.8-flash-next", .tag = "3bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-3bpw", .is_default = true },
-    .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw" },
-    .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true },
-    .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true },
+    .{ .name = "qwen3.8-flash-next", .tag = "2bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2bpw", .tier_gb = 48, .recommend_gb = 32 },
+    .{ .name = "qwen3.8-flash-next", .tag = "2.6bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", .tier_gb = 64, .recommend_gb = 64 },
+    .{ .name = "qwen3.8-flash-next", .tag = "3bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-3bpw", .is_default = true, .tier_gb = 64 },
+    .{ .name = "qwen3.8-flash-next", .tag = "4bpw", .repo = "beamster/Qwen3.8-Flash-Next-Sushi-4bpw", .tier_gb = 96, .recommend_gb = 96 },
+    .{ .name = "mimo-v2.6-flash", .tag = "2.3bpw", .repo = "beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
+    .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .tier_gb = 96, .recommend_gb = 96 },
+    .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128 },
 };
 
 pub const Resolved = struct {
     repo: []const u8,
-    gguf_file: []const u8 = "",
 };
+
+/// Whether `repo` is `beamster/<repo>`.
+pub fn isBeamsterRepo(repo: []const u8) bool {
+    const prefix = HF_ORG ++ "/";
+    return repo.len > prefix.len and std.ascii.startsWithIgnoreCase(repo, prefix) and
+        std.mem.indexOfScalarPos(u8, repo, prefix.len, '/') == null;
+}
+
+/// The GB of installed RAM a tier is stated in: whole GiB, rounded down (a 64 GB Mac reports ~68.7e9 bytes).
+pub fn installedGb(bytes: u64) u64 {
+    return bytes >> 30;
+}
+
+/// `fits`: the machine meets the pack's documented tier. `may_stream`: below it, where the pack may still run
+/// with `--ssd-budget-gb`; nothing promises it does.
+pub const Verdict = enum {
+    fits,
+    may_stream,
+
+    pub fn label(self: Verdict) []const u8 {
+        return switch (self) {
+            .fits => "fits",
+            .may_stream => "may stream (--ssd-budget-gb)",
+        };
+    }
+};
+
+pub fn verdictFor(a: Alias, ram_gb: u64) Verdict {
+    return if (ram_gb >= a.tier_gb) .fits else .may_stream;
+}
+
+pub fn aliasForRepo(repo: []const u8) ?Alias {
+    for (aliases) |a| if (std.ascii.eqlIgnoreCase(a.repo, repo)) return a;
+    return null;
+}
+
+/// The pack of `family` that `sushi list` recommends for a machine with `ram_gb`: the one with the
+/// largest `recommend_gb` at or under it. Null below the family's smallest tier.
+pub fn recommendedAlias(family: []const u8, ram_gb: u64) ?Alias {
+    var best: ?Alias = null;
+    for (aliases) |a| {
+        if (!std.ascii.eqlIgnoreCase(a.name, family) or a.recommend_gb == 0 or ram_gb < a.recommend_gb) continue;
+        if (best == null or a.recommend_gb > best.?.recommend_gb) best = a;
+    }
+    return best;
+}
+
+/// The warning `pull` prints before downloading a pack the machine is below the tier of; null otherwise.
+pub fn tierWarning(buf: []u8, repo: []const u8, ram_gb: u64) ?[]const u8 {
+    const a = aliasForRepo(repo) orelse return null;
+    if (verdictFor(a, ram_gb) == .fits) return null;
+    return std.fmt.bufPrint(buf, "warning: {s}:{s} is below the documented {d} GB for this pack (this Mac has {d} GB); it may run with --ssd-budget-gb", .{ a.name, a.tag, a.tier_gb, ram_gb }) catch null;
+}
 
 /// "name:tag" → "name"; a ':' before a '/' is part of the name (a host:port).
 fn stripTag(name: []const u8) []const u8 {
@@ -139,7 +199,7 @@ fn stripTag(name: []const u8) []const u8 {
 
 /// Short name / repo ref → HF repo id. Accepts:
 ///   "qwen3.8-flash-next" / "qwen3.8-flash-next:2.6bpw"  (alias table)
-///   "org/repo" / "org/repo:tag"       (direct, tag stripped)
+///   "org/repo" / "org/repo:tag"       (direct, tag stripped; `checkPullable` refuses any org but beamster)
 ///   "hf.co/org/repo", "huggingface.co/org/repo"
 /// Returns null for unknown alias-shaped names (no '/').
 pub fn resolveShortName(name: []const u8) ?Resolved {
@@ -168,12 +228,31 @@ pub fn resolveShortName(name: []const u8) ?Resolved {
     for (aliases) |a| {
         if (!std.ascii.eqlIgnoreCase(a.name, base)) continue;
         if (tag.len == 0) {
-            if (a.is_default) return .{ .repo = a.repo, .gguf_file = a.gguf_file };
+            if (a.is_default) return .{ .repo = a.repo };
         } else if (std.ascii.eqlIgnoreCase(a.tag, tag)) {
-            return .{ .repo = a.repo, .gguf_file = a.gguf_file };
+            return .{ .repo = a.repo };
         }
     }
     return null;
+}
+
+/// A name `pull` may download: an alias or `beamster/<repo>`. Any other org is refused before anything downloads.
+pub fn checkPullable(name: []const u8) error{ UnknownModel, NotBeamster }!Resolved {
+    const resolved = resolveShortName(name) orelse return error.UnknownModel;
+    if (!isBeamsterRepo(resolved.repo)) return error.NotBeamster;
+    return resolved;
+}
+
+/// `sushi pull <model>`: exactly one model and nothing else.
+pub fn parsePullArgs(rest: []const []const u8) error{ MissingModel, UnexpectedArgument }![]const u8 {
+    if (rest.len == 0) return error.MissingModel;
+    if (rest.len > 1) return error.UnexpectedArgument;
+    return rest[0];
+}
+
+/// `sushi list` takes no arguments.
+pub fn parseListArgs(rest: []const []const u8) error{UnexpectedArgument}!void {
+    if (rest.len > 0) return error.UnexpectedArgument;
 }
 
 /// `~/.sushi/models/<org>/<repo>` — the single models root shared with
@@ -333,26 +412,58 @@ fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) 
     return null;
 }
 
-/// GET a small HTTPS document (the tree listing) via curl; returns stdout.
-fn curlFetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
+/// How an HTTP status reads for a Hugging Face lookup: a document, "no such repo" (HF answers 401 for a repo
+/// it does not show an anonymous caller, and 403/404 for the others), or a failure to try again later.
+pub fn statusKind(code: u16) enum { ok, not_found, failed } {
+    if (code >= 200 and code < 300) return .ok;
+    if (code == 401 or code == 403 or code == 404) return .not_found;
+    return .failed;
+}
+
+const Fetched = struct { status: u16, body: []u8 };
+
+/// GET an HTTPS document via curl and return its status and body. No `-f`: the status is ours to read.
+/// `quick` bounds the wait to a few seconds and skips the retries, for a listing that must never hang.
+fn curlGet(allocator: std.mem.Allocator, io: std.Io, url: []const u8, quick: bool) !Fetched {
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
-    const header_storage = try curlBaseArgs(&argv, allocator);
-    defer if (header_storage) |h| allocator.free(h);
-    try argv.appendSlice(allocator, &.{ "-s", url });
+    try argv.appendSlice(allocator, &.{ "curl", "-sL" });
+    try argv.appendSlice(allocator, if (quick)
+        &.{ "--connect-timeout", "3", "--max-time", "6" }
+    else
+        &.{ "--retry", "3", "--retry-delay", "2" });
+    var header: ?[]u8 = null;
+    defer if (header) |h| allocator.free(h);
+    if (std.c.getenv("HF_TOKEN")) |tok| {
+        header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{std.mem.span(tok)});
+        try argv.appendSlice(allocator, &.{ "-H", header.? });
+    }
+    try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
     const result = std.process.run(allocator, io, .{
         .argv = argv.items,
         .stdout_limit = .limited(64 * 1024 * 1024),
     }) catch return error.FetchFailed;
     defer allocator.free(result.stderr);
-    errdefer allocator.free(result.stdout);
+    defer allocator.free(result.stdout);
     switch (result.term) {
-        // Quiet on failure — callers report (the REPL health poll EXPECTS
-        // failures while the server boots).
         .exited => |code| if (code != 0) return error.FetchFailed,
         else => return error.FetchFailed,
     }
-    return result.stdout;
+    const cut = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return error.FetchFailed;
+    const code = std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout[cut + 1 ..], " \r\n"), 10) catch return error.FetchFailed;
+    return .{ .status = code, .body = try allocator.dupe(u8, result.stdout[0..cut]) };
+}
+
+/// GET a small HTTPS document (the tree listing) via curl; returns its body.
+/// Quiet on failure: callers report (the REPL health poll EXPECTS failures while the server boots).
+fn curlFetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
+    const got = try curlGet(allocator, io, url, false);
+    errdefer allocator.free(got.body);
+    return switch (statusKind(got.status)) {
+        .ok => got.body,
+        .not_found => error.NotFound,
+        .failed => error.FetchFailed,
+    };
 }
 
 /// Download one file to `<dest_dir>/<file>` via curl (`-C -` resume onto a
@@ -404,7 +515,7 @@ fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
 /// (live SIGSEGV — see tests/test_partial_download.sh). Complete means: no
 /// .partial leftovers anywhere (top level or one subdir deep, e.g.
 /// mtp/weights.safetensors.partial), plus config.json AND at least one
-/// .safetensors for MLX dirs — or any .gguf, which is self-contained.
+/// .safetensors.
 pub fn modelPresent(io: std.Io, dir_path: []const u8) bool {
     if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return false;
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
@@ -415,7 +526,6 @@ pub fn modelPresent(io: std.Io, dir_path: []const u8) bool {
 fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
     var has_config = false;
     var has_safetensors = false;
-    var has_gguf = false;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         switch (entry.kind) {
@@ -423,7 +533,6 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
                 if (std.mem.endsWith(u8, entry.name, ".partial")) return false;
                 if (std.mem.eql(u8, entry.name, "config.json")) has_config = true;
                 if (std.mem.endsWith(u8, entry.name, ".safetensors")) has_safetensors = true;
-                if (std.mem.endsWith(u8, entry.name, ".gguf")) has_gguf = true;
             },
             .directory => {
                 // One level deep is enough for the pull layouts (mtp/ is the
@@ -438,7 +547,6 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
             else => {},
         }
     }
-    if (has_gguf) return true;
     return has_config and has_safetensors;
 }
 
@@ -448,8 +556,12 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     reporter.say("pulling manifest for {s}", .{resolved.repo});
     const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
     defer allocator.free(tree_url);
-    const tree_json = curlFetch(allocator, io, tree_url) catch {
-        reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
+    const tree_json = curlFetch(allocator, io, tree_url) catch |err| {
+        if (err == error.NotFound) {
+            reporter.say("error: {s} was not found on Hugging Face: it may not be published yet (or it is gated: set HF_TOKEN)", .{resolved.repo});
+        } else {
+            reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
+        }
         return error.PullFailed;
     };
     defer allocator.free(tree_json);
@@ -462,7 +574,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     var wanted: usize = 0;
     var total_bytes: u64 = 0;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path)) continue;
+        if (!wantedFile(f.path)) continue;
         wanted += 1;
         total_bytes += f.size;
     }
@@ -474,7 +586,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
 
     var idx: usize = 0;
     for (files) |f| {
-        if (!wantedFile(resolved, f.path)) continue;
+        if (!wantedFile(f.path)) continue;
         idx += 1;
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
         defer allocator.free(dest_path);
@@ -497,11 +609,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     reporter.say("success: {s} ready", .{resolved.repo});
 }
 
-fn wantedFile(resolved: Resolved, path: []const u8) bool {
-    if (resolved.gguf_file.len > 0) {
-        // Single-artifact GGUF repos: just that file (plus nothing else).
-        return std.mem.eql(u8, path, resolved.gguf_file);
-    }
+fn wantedFile(path: []const u8) bool {
     return shouldDownload(path);
 }
 
@@ -516,7 +624,8 @@ var stderr_reporter_dummy: u8 = 0;
 const stderr_reporter = Reporter{ .impl = &stderr_reporter_dummy, .reportFn = &stderrReport };
 
 /// Resolve + download-if-missing; returns the local model dir (owned).
-/// Exits the process with a friendly message on unknown names.
+/// Exits the process with a friendly message on unknown names, and on a repo of another org that is not
+/// already on disk (downloads come from the `beamster` org only).
 pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
     // A path that exists locally is used as-is.
     if (std.fs.path.isAbsolute(name)) return allocator.dupe(u8, name);
@@ -528,11 +637,32 @@ pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []co
     const dest = try modelDestPath(allocator, homeDir(), resolved.repo);
     errdefer allocator.free(dest);
     if (modelPresent(io, dest)) return dest;
+    if (!isBeamsterRepo(resolved.repo)) refuseOrg(io, name);
+    warnBelowTier(resolved.repo);
     try pullRepo(allocator, io, resolved, dest, stderr_reporter, true);
     return dest;
 }
 
+fn refuseOrg(io: std.Io, name: []const u8) noreturn {
+    log.err("'{s}' is not a Sushi pack: downloads come from the Hugging Face org {s} only\n", .{ name, HF_ORG });
+    printKnownAliases(io);
+    std.process.exit(1);
+}
+
+fn warnBelowTier(repo: []const u8) void {
+    var buf: [256]u8 = undefined;
+    if (tierWarning(&buf, repo, installedGb(status.getTotalMemBytes()))) |line| log.warn("{s}\n", .{line});
+}
+
 pub fn cmdPull(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void {
+    _ = checkPullable(name) catch |err| switch (err) {
+        error.UnknownModel => {
+            log.err("unknown model '{s}'\n", .{name});
+            printKnownAliases(io);
+            std.process.exit(1);
+        },
+        error.NotBeamster => refuseOrg(io, name),
+    };
     const dir = try ensureModelAvailable(allocator, io, name);
     defer allocator.free(dir);
     log.info("model at {s}\n", .{dir});
@@ -541,7 +671,7 @@ pub fn cmdPull(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void
 
 fn printKnownAliases(io: std.Io) void {
     _ = io;
-    log.err("known short names (or use any HuggingFace 'org/repo'):\n", .{});
+    log.err("known short names (or beamster/<repo>):\n", .{});
     for (aliases) |a| {
         if (a.is_default) {
             log.err("  {s} (= {s}:{s}) -> {s}\n", .{ a.name, a.name, a.tag, a.repo });
@@ -551,7 +681,112 @@ fn printKnownAliases(io: std.Io) void {
     }
 }
 
-/// `sushi list` — models on disk under ~/.sushi/models.
+// ── List ────────────────────────────────────────────────────────────────
+
+/// Sum of the blob sizes in a Hugging Face model document (`/api/models/<repo>?blobs=true`, `siblings`).
+pub fn parseRepoSize(allocator: std.mem.Allocator, json: []const u8) !u64 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.InvalidModelInfo;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidModelInfo;
+    const siblings = parsed.value.object.get("siblings") orelse return error.InvalidModelInfo;
+    if (siblings != .array) return error.InvalidModelInfo;
+    var total: u64 = 0;
+    for (siblings.array.items) |item| {
+        if (item != .object) continue;
+        const size = item.object.get("size") orelse continue;
+        if (size == .integer and size.integer > 0) total +|= @intCast(size.integer);
+    }
+    return total;
+}
+
+/// What asking Hugging Face about one repo returned: its size, "no such repo" (an HTTP error: a pack
+/// that is not published yet), or nothing at all (no network, a timeout).
+pub const FetchOutcome = union(enum) { size: u64, not_found, offline };
+
+pub const CatalogRow = struct { alias: Alias, size: ?u64, downloaded: bool, published: bool = true };
+
+pub const SizeFetch = *const fn (ctx: *anyopaque, repo: []const u8) FetchOutcome;
+
+/// One outcome per alias, in table order. False when the first repo gets no answer at all: Hugging Face
+/// is unreachable, and asking the others would only repeat the wait.
+pub fn fetchCatalogSizes(ctx: *anyopaque, fetch: SizeFetch, out: *[aliases.len]FetchOutcome) bool {
+    for (aliases, 0..) |a, i| {
+        out[i] = fetch(ctx, a.repo);
+        if (i == 0 and out[i] == .offline) return false;
+    }
+    return true;
+}
+
+/// The catalog table of `sushi list`: every published pack with its size, whether it is on disk, the verdict
+/// for this Mac's RAM, and the recommended pack of each family marked.
+pub fn writeCatalog(w: *std.Io.Writer, ram_gb: u64, rows: []const CatalogRow) !void {
+    try w.print("This Mac: {d} GB\n\n", .{ram_gb});
+    try w.print("{s: <30} {s: >9}  {s: <10}  {s}\n", .{ "PACK", "SIZE", "DOWNLOADED", "THIS MAC" });
+    for (rows) |row| {
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{s}:{s}", .{ row.alias.name, row.alias.tag }) catch row.alias.name;
+        var size_buf: [32]u8 = undefined;
+        const size = if (row.size) |bytes| formatSize(&size_buf, bytes) else "?";
+        const recommended = if (recommendedAlias(row.alias.name, ram_gb)) |r| std.mem.eql(u8, r.tag, row.alias.tag) else false;
+        try w.print("{s: <30} {s: >9}  {s: <10}  {s}{s}{s}\n", .{
+            name,
+            size,
+            if (row.downloaded) "yes" else "no",
+            verdictFor(row.alias, ram_gb).label(),
+            if (recommended) "  <- recommended" else "",
+            if (row.published) "" else "  (not yet published)",
+        });
+    }
+}
+
+pub const offline_note = "note: could not reach huggingface.co; showing the local models only, with no sizes or recommendations\n";
+
+fn fetchSizeViaCurl(ctx: *anyopaque, repo: []const u8) FetchOutcome {
+    const env: *const ListEnv = @ptrCast(@alignCast(ctx));
+    const url = std.fmt.allocPrint(env.allocator, "https://huggingface.co/api/models/{s}?blobs=true", .{repo}) catch return .offline;
+    defer env.allocator.free(url);
+    const got = curlGet(env.allocator, env.io, url, true) catch return .offline;
+    defer env.allocator.free(got.body);
+    return switch (statusKind(got.status)) {
+        .ok => .{ .size = parseRepoSize(env.allocator, got.body) catch return .offline },
+        .not_found => .not_found,
+        .failed => .offline,
+    };
+}
+
+const ListEnv = struct { allocator: std.mem.Allocator, io: std.Io };
+
+/// A catalog row from what the API said about the repo: a pack it does not return is listed as not yet
+/// published, without a size.
+pub fn catalogRow(a: Alias, outcome: FetchOutcome, downloaded: bool) CatalogRow {
+    return switch (outcome) {
+        .size => |bytes| .{ .alias = a, .size = bytes, .downloaded = downloaded },
+        .not_found, .offline => .{ .alias = a, .size = null, .downloaded = downloaded, .published = outcome != .not_found },
+    };
+}
+
+fn catalogDownloaded(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) bool {
+    const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo }) catch return false;
+    defer allocator.free(org_path);
+    if (modelPresent(io, org_path)) return true;
+    // `hf download --local-dir ~/.sushi/models/<pack>` (docs/usage.md) lands without the org folder.
+    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return false;
+    const flat_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, repo[slash + 1 ..] }) catch return false;
+    defer allocator.free(flat_path);
+    return modelPresent(io, flat_path);
+}
+
+/// Whether a local model row (`name` as `list` prints it) is one of the catalog packs.
+fn isCatalogName(name: []const u8) bool {
+    for (aliases) |a| {
+        if (std.ascii.eqlIgnoreCase(a.repo, name)) return true;
+        if (std.ascii.eqlIgnoreCase(a.repo[HF_ORG.len + 1 ..], name)) return true;
+    }
+    return false;
+}
+
+/// `sushi list` — the Sushi packs with this Mac's verdict, then the other models on disk under ~/.sushi/models.
+/// With Hugging Face unreachable it lists only the local models.
 pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     const root = try modelsRootPath(allocator, homeDir());
     defer allocator.free(root);
@@ -561,13 +796,24 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     const w = &stdout_w.interface;
     defer w.flush() catch {};
 
+    var env = ListEnv{ .allocator = allocator, .io = io };
+    var outcomes: [aliases.len]FetchOutcome = undefined;
+    const online = fetchCatalogSizes(&env, &fetchSizeViaCurl, &outcomes);
+    if (online) {
+        var rows: [aliases.len]CatalogRow = undefined;
+        for (aliases, 0..) |a, i| rows[i] = catalogRow(a, outcomes[i], catalogDownloaded(io, allocator, root, a.repo));
+        try writeCatalog(w, installedGb(status.getTotalMemBytes()), &rows);
+        try w.writeAll("\n");
+    } else {
+        try w.writeAll(offline_note);
+    }
+
     var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch {
-        try w.print("no models yet (looked in {s})\ntry: sushi pull qwen3.8-flash-next\n", .{root});
+        if (!online) try w.print("no models yet (looked in {s})\ntry: sushi pull qwen3.8-flash-next\n", .{root});
         return;
     };
     defer dir.close(io);
 
-    try w.print("{s: <56} {s: <12} {s: >10}\n", .{ "NAME", "TYPE", "SIZE" });
     var count: usize = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
@@ -576,6 +822,8 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer sub.close(io);
         if (isModelDir(io, &sub)) {
+            if (online and isCatalogName(entry.name)) continue;
+            try printLocalHeader(w, count);
             try printModelRow(io, allocator, w, &sub, entry.name, root);
             count += 1;
             continue;
@@ -589,13 +837,17 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             if (!isModelDir(io, &leaf)) continue;
             var name_buf: [512]u8 = undefined;
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
+            if (online and isCatalogName(full)) continue;
+            try printLocalHeader(w, count);
             try printModelRow(io, allocator, w, &leaf, full, root);
             count += 1;
         }
     }
-    if (count == 0) {
-        try w.print("(none) — try: sushi pull qwen3.8-flash-next\n", .{});
-    }
+    if (count == 0 and !online) try w.print("(none) — try: sushi pull qwen3.8-flash-next\n", .{});
+}
+
+fn printLocalHeader(w: *std.Io.Writer, count: usize) !void {
+    if (count == 0) try w.print("{s: <56} {s: <12} {s: >10}\n", .{ "NAME", "TYPE", "SIZE" });
 }
 
 /// A tree-walk entry worth descending into: a real directory OR a symlink
@@ -1655,6 +1907,7 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     try testing.expectEqualStrings("beamster/MiMo-V2.6-Flash-Sushi-2.3bpw", resolveShortName("MiMo-V2.6-Flash:2.3bpw").?.repo);
     try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-2bpw", resolveShortName("qwen3.8-flash-next:2bpw").?.repo);
     try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2.4bpw", resolveShortName("glm-5.3-flash").?.repo);
+    try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2bpw", resolveShortName("glm-5.3-flash:2bpw").?.repo);
     try testing.expectEqualStrings("beamster/GLM-5.3-Flash-Sushi-2.4bpw", resolveShortName("GLM-5.3-Flash:2.4bpw").?.repo);
     // Direct org/repo passthrough, tag stripped, hf.co prefixes stripped.
     try testing.expectEqualStrings("org/repo", resolveShortName("org/repo").?.repo);
@@ -1667,7 +1920,167 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
     try testing.expect(resolveShortName("gemma4") == null);
 }
 
+test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
+    try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", (try checkPullable("qwen3.8-flash-next:2.6bpw")).repo);
+    try testing.expectEqualStrings("beamster/Some-Pack", (try checkPullable("beamster/Some-Pack")).repo);
+    try testing.expectEqualStrings("beamster/Some-Pack", (try checkPullable("hf.co/beamster/Some-Pack:latest")).repo);
+    try testing.expectEqualStrings("Beamster/Some-Pack", (try checkPullable("Beamster/Some-Pack")).repo);
+    try testing.expectError(error.NotBeamster, checkPullable("someone/else"));
+    try testing.expectError(error.NotBeamster, checkPullable("https://huggingface.co/Qwen/Qwen3.8-Flash-Next"));
+    try testing.expectError(error.NotBeamster, checkPullable("beamster-fake/pack"));
+    try testing.expectError(error.NotBeamster, checkPullable("beamster/a/b"));
+    try testing.expectError(error.UnknownModel, checkPullable("gemma4"));
+    try testing.expect(!isBeamsterRepo("beamster/"));
+    try testing.expect(!isBeamsterRepo("beamster"));
+}
+
+test "pull and list reject stray arguments" {
+    try testing.expectEqualStrings("m", try parsePullArgs(&.{"m"}));
+    try testing.expectError(error.MissingModel, parsePullArgs(&.{}));
+    try testing.expectError(error.UnexpectedArgument, parsePullArgs(&.{ "m", "--anything" }));
+    try parseListArgs(&.{});
+    try testing.expectError(error.UnexpectedArgument, parseListArgs(&.{"--anything"}));
+}
+
+test "memory tiers: installed RAM rounds down to whole GB and picks fits or may stream" {
+    const gb: u64 = 1 << 30;
+    try testing.expectEqual(@as(u64, 64), installedGb(68_719_476_736));
+    try testing.expectEqual(@as(u64, 63), installedGb(64 * gb - 1));
+    try testing.expectEqual(@as(u64, 48), installedGb(51_539_607_552));
+    try testing.expectEqual(@as(u64, 128), installedGb(128 * gb + 12345));
+    const q2 = resolveShortName("qwen3.8-flash-next:2bpw").?.repo;
+    const a2 = aliasForRepo(q2).?;
+    try testing.expectEqual(Verdict.may_stream, verdictFor(a2, 32));
+    try testing.expectEqual(Verdict.may_stream, verdictFor(a2, 47));
+    try testing.expectEqual(Verdict.fits, verdictFor(a2, 48));
+    const a26 = aliasForRepo(resolveShortName("qwen3.8-flash-next:2.6bpw").?.repo).?;
+    const a3 = aliasForRepo(resolveShortName("qwen3.8-flash-next:3bpw").?.repo).?;
+    const a4 = aliasForRepo(resolveShortName("qwen3.8-flash-next:4bpw").?.repo).?;
+    try testing.expectEqual(Verdict.may_stream, verdictFor(a26, 63));
+    try testing.expectEqual(Verdict.fits, verdictFor(a26, 64));
+    try testing.expectEqual(Verdict.fits, verdictFor(a3, 64));
+    try testing.expectEqual(Verdict.may_stream, verdictFor(a4, 95));
+    try testing.expectEqual(Verdict.fits, verdictFor(a4, 96));
+    for ([_][]const u8{ "mimo-v2.6-flash", "glm-5.3-flash" }) |name| {
+        const a = aliasForRepo(resolveShortName(name).?.repo).?;
+        try testing.expectEqual(Verdict.may_stream, verdictFor(a, 96));
+        try testing.expectEqual(Verdict.fits, verdictFor(a, 128));
+    }
+    const glm2 = aliasForRepo(resolveShortName("glm-5.3-flash:2bpw").?.repo).?;
+    try testing.expectEqual(Verdict.may_stream, verdictFor(glm2, 95));
+    try testing.expectEqual(Verdict.fits, verdictFor(glm2, 96));
+}
+
+test "list recommends one pack per family from the tier table" {
+    const q = "qwen3.8-flash-next";
+    try testing.expect(recommendedAlias(q, 16) == null);
+    try testing.expectEqualStrings("2bpw", recommendedAlias(q, 32).?.tag);
+    try testing.expectEqualStrings("2bpw", recommendedAlias(q, 48).?.tag);
+    try testing.expectEqualStrings("2.6bpw", recommendedAlias(q, 64).?.tag);
+    try testing.expectEqualStrings("2.6bpw", recommendedAlias(q, 95).?.tag);
+    try testing.expectEqualStrings("4bpw", recommendedAlias(q, 96).?.tag);
+    try testing.expectEqualStrings("4bpw", recommendedAlias(q, 128).?.tag);
+    try testing.expect(recommendedAlias("mimo-v2.6-flash", 96) == null);
+    try testing.expectEqualStrings("2.3bpw", recommendedAlias("mimo-v2.6-flash", 128).?.tag);
+    try testing.expect(recommendedAlias("glm-5.3-flash", 95) == null);
+    try testing.expectEqualStrings("2bpw", recommendedAlias("glm-5.3-flash", 96).?.tag);
+    try testing.expectEqualStrings("2bpw", recommendedAlias("glm-5.3-flash", 127).?.tag);
+    try testing.expectEqualStrings("2.4bpw", recommendedAlias("glm-5.3-flash", 128).?.tag);
+}
+
+test "pull warns only below the documented tier, naming --ssd-budget-gb" {
+    var buf: [256]u8 = undefined;
+    try testing.expect(tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", 64) == null);
+    try testing.expect(tierWarning(&buf, "beamster/unlisted-pack", 8) == null);
+    const warn = tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw", 48).?;
+    try testing.expect(std.mem.indexOf(u8, warn, "documented 64 GB") != null);
+    try testing.expect(std.mem.indexOf(u8, warn, "--ssd-budget-gb") != null);
+}
+
+const FakeFetch = struct {
+    reachable: bool,
+    /// The repo the API does not return (an unpublished pack).
+    missing: []const u8 = "",
+
+    fn fetch(ctx: *anyopaque, repo: []const u8) FetchOutcome {
+        const self: *const FakeFetch = @ptrCast(@alignCast(ctx));
+        if (!self.reachable) return .offline;
+        if (std.mem.eql(u8, repo, self.missing)) return .not_found;
+        return .{ .size = @as(u64, repo.len) << 30 };
+    }
+};
+
+test "list: Hugging Face unreachable falls back to the local models, with no sizes" {
+    var down = FakeFetch{ .reachable = false };
+    var outcomes: [aliases.len]FetchOutcome = undefined;
+    try testing.expect(!fetchCatalogSizes(&down, &FakeFetch.fetch, &outcomes));
+    var up = FakeFetch{ .reachable = true };
+    try testing.expect(fetchCatalogSizes(&up, &FakeFetch.fetch, &outcomes));
+    for (outcomes) |outcome| try testing.expect(outcome == .size);
+}
+
+test "list: a pack the API does not return is listed as not yet published, without a size" {
+    var api = FakeFetch{ .reachable = true, .missing = "beamster/GLM-5.3-Flash-Sushi-2bpw" };
+    var outcomes: [aliases.len]FetchOutcome = undefined;
+    try testing.expect(fetchCatalogSizes(&api, &FakeFetch.fetch, &outcomes));
+    var rows: [aliases.len]CatalogRow = undefined;
+    for (aliases, 0..) |a, i| rows[i] = catalogRow(a, outcomes[i], false);
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeCatalog(&w, 96, &rows);
+    var found: usize = 0;
+    var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "glm-5.3-flash:2bpw")) continue;
+        found += 1;
+        try testing.expect(std.mem.indexOf(u8, line, "(not yet published)") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "?") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "fits") != null);
+    }
+    try testing.expectEqual(@as(usize, 1), found);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "(not yet published)") == std.mem.lastIndexOf(u8, w.buffered(), "(not yet published)"));
+}
+
+test "pull: Hugging Face's 401/403/404 mean a missing repo, other failures mean try later" {
+    try testing.expect(statusKind(200) == .ok);
+    try testing.expect(statusKind(401) == .not_found);
+    try testing.expect(statusKind(403) == .not_found);
+    try testing.expect(statusKind(404) == .not_found);
+    try testing.expect(statusKind(429) == .failed);
+    try testing.expect(statusKind(503) == .failed);
+}
+
+test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.6bpw recommended" {
+    var rows: [aliases.len]CatalogRow = undefined;
+    for (aliases, 0..) |a, i| rows[i] = .{ .alias = a, .size = (@as(u64, i) + 1) << 30, .downloaded = i == 1 };
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeCatalog(&w, installedGb(68_719_476_736), &rows);
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "This Mac: 64 GB") != null);
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    var recommended: usize = 0;
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "<- recommended") == null) continue;
+        recommended += 1;
+        try testing.expect(std.mem.startsWith(u8, line, "qwen3.8-flash-next:2.6bpw"));
+        try testing.expect(std.mem.indexOf(u8, line, "yes") != null);
+        try testing.expect(std.mem.indexOf(u8, line, "fits") != null);
+    }
+    try testing.expectEqual(@as(usize, 1), recommended);
+    try testing.expect(std.mem.indexOf(u8, out, "may stream (--ssd-budget-gb)") != null);
+}
+
+test "list: a pack size is the sum of its Hugging Face blob sizes" {
+    try testing.expectEqual(@as(u64, 600), try parseRepoSize(testing.allocator,
+        \\{"siblings":[{"rfilename":"config.json","size":100},{"rfilename":"model.safetensors","size":500},{"rfilename":"x"}]}
+    ));
+    try testing.expectError(error.InvalidModelInfo, parseRepoSize(testing.allocator, "[]"));
+    try testing.expectError(error.InvalidModelInfo, parseRepoSize(testing.allocator, "not json"));
+}
+
 test "cli: every short name is a published Sushi pack" {
+    for (aliases) |a| try testing.expect(isBeamsterRepo(a.repo));
     for (aliases) |a| try testing.expect(std.mem.startsWith(u8, a.repo, "beamster/Qwen3.8-Flash-Next-Sushi-") or
         std.mem.startsWith(u8, a.repo, "beamster/MiMo-V2.6-Flash-Sushi-") or
         std.mem.startsWith(u8, a.repo, "beamster/GLM-5.3-Flash-Sushi-"));
@@ -1713,7 +2126,7 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     // true on config.json alone, so the rerun skipped the resume and fed a
     // weightless dir to the loader (SIGSEGV). Present now means: no .partial
     // leftovers anywhere (top level or one subdir deep), and config.json +
-    // >=1 .safetensors (MLX) or any .gguf.
+    // >=1 .safetensors.
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1762,24 +2175,6 @@ test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
     try tmp.dir.writeFile(io, .{ .sub_path = "c/mtp/weights.safetensors.partial", .data = "x" });
     {
         var d = try tmp.dir.openDir(io, "c", .{ .iterate = true });
-        defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
-    }
-
-    // GGUF: the file itself is the checkpoint (no config.json needed)…
-    try tmp.dir.createDirPath(io, "g");
-    try tmp.dir.writeFile(io, .{ .sub_path = "g/model-Q4_K_M.gguf", .data = "x" });
-    {
-        var d = try tmp.dir.openDir(io, "g", .{ .iterate = true });
-        defer d.close(io);
-        try testing.expect(modelPresentInDir(io, d));
-    }
-
-    // …but a partial GGUF is not.
-    try tmp.dir.createDirPath(io, "h");
-    try tmp.dir.writeFile(io, .{ .sub_path = "h/model-Q4_K_M.gguf.partial", .data = "x" });
-    {
-        var d = try tmp.dir.openDir(io, "h", .{ .iterate = true });
         defer d.close(io);
         try testing.expect(!modelPresentInDir(io, d));
     }
