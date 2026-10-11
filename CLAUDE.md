@@ -244,6 +244,9 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Bench thermal: fans to max; 3 min idle first if the die is over 90 °C after heavy GPU work, else 10 s; fans back to
   auto after. One A then one B suffices; A B B A only when the expected difference is within a few percent.
 - Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
+- **The box is macOS, with no `setsid` binary.** To detach a long job, run `nohup perl -e 'use POSIX; POSIX::setsid(); exec @ARGV' zsh <script> > <log> 2>&1 < /dev/null &`
+  and record `$!`. Plain `nohup … &` stays in the tool's session, which harness cleanup kills.
+  - Write the END marker from an EXIT trap, and end every wait loop when that PID is gone.
 - Confirm the load lines (`[kv-cache]`, `[mtp]`, engagement lines) show the intended arm.
 - KLD is 16 prompts x 512 tokens scored to the first EOS (GLM: the 4x512 native teacher, code 2x512 reported apart);
   the teacher carries no lossy step of its own.
