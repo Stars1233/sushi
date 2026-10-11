@@ -391,6 +391,30 @@ pub fn shiftScoped(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: ?mlx.mlx_ar
     } else {
         try mlx.check(mlx.mlx_array_set(&deltas, if (p.phase == .inside) inside else outside));
     }
+    return addDeltas(out, logits, deltas, s);
+}
+
+/// Row j of `logits` `[1, L, V]` at the span state the caller decided (`inside[j]`), with
+/// `shiftScoped`'s arithmetic: a draft tree's rows have no prefix order for `ids` to gate by.
+pub fn shiftDecided(out: *mlx.mlx_array, logits: mlx.mlx_array, mask: ?mlx.mlx_array, p: ThinkPenalty, inside: []const bool, s: mlx.mlx_stream) !void {
+    if (!p.hasBias() and (mask == null or p.lambda <= 0)) return mlx.check(mlx.mlx_array_set(out, logits));
+    const gate = mlx.mlx_array_new_data(inside.ptr, &[_]c_int{ 1, @intCast(inside.len), 1 }, 3, .bool_);
+    defer _ = mlx.mlx_array_free(gate);
+    if (!p.hasBias()) {
+        var cond = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cond);
+        try mlx.check(mlx.mlx_logical_and(&cond, gate, mask.?, s));
+        return shiftWhere(out, logits, cond, p.lambda, s);
+    }
+    const prepared = p.prepared orelse return error.LogitBiasNotPrepared;
+    var deltas = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deltas);
+    try mlx.check(mlx.mlx_where(&deltas, gate, prepared.inside, prepared.outside, s));
+    return addDeltas(out, logits, deltas, s);
+}
+
+/// `logits + deltas` in the logits' dtype; lanes whose delta is zero keep their bytes.
+fn addDeltas(out: *mlx.mlx_array, logits: mlx.mlx_array, deltas: mlx.mlx_array, s: mlx.mlx_stream) !void {
     var typed = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(typed);
     try mlx.check(mlx.mlx_astype(&typed, deltas, mlx.mlx_array_dtype(logits), s));
@@ -458,6 +482,51 @@ test "logit bias GPU: scoped verify rows equal serial across boundaries and add 
         const want = try readF32(a, serial, s);
         defer a.free(want);
         try testing.expectEqualSlices(f32, want, got[j * v ..][0..v]);
+    }
+}
+
+test "logit bias GPU: rows at caller-decided span states equal their serial rows" {
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const v = 48;
+    const mask = try buildMask(a, &.{ 2, 5, 47 }, v);
+    defer _ = mlx.mlx_array_free(mask);
+    const file = [_]bias_mod.Bias{
+        .{ .id = 2, .delta = 1, .scope = .reasoning },
+        .{ .id = 5, .delta = 0.375, .scope = .answer },
+    };
+    const request_bias = [_]bias_mod.Bias{.{ .id = 9, .delta = -100 }};
+    // Tree siblings: no prefix order for `ids` to gate by.
+    const inside = [_]bool{ true, false, true, false };
+    for ([_]bool{ false, true }) |with_bias| {
+        var p = ThinkPenalty{ .lambda = 2.5, .opener_id = 30, .closer_id = 31, .phase = .inside };
+        if (with_bias) {
+            p.file_biases = &file;
+            p.biases = &request_bias;
+        }
+        try p.prepare(a, v, mask, s);
+        defer p.deinitPrepared();
+        const block = try testBlock(inside.len, v, s);
+        defer _ = mlx.mlx_array_free(block);
+        var shifted = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(shifted);
+        try shiftDecided(&shifted, block, mask, p, &inside, s);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(shifted));
+        const got = try readF32(a, shifted, s);
+        defer a.free(got);
+        for (inside, 0..) |in_span, j| {
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            try mlx.check(mlx.mlx_slice(&row, block, &.{ 0, @intCast(j), 0 }, 3, &.{ 1, @as(c_int, @intCast(j)) + 1, v }, 3, &.{ 1, 1, 1 }, 3, s));
+            var state = p;
+            state.phase = if (in_span) .inside else .after;
+            var serial = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(serial);
+            try shiftScoped(&serial, row, mask, state, null, s);
+            const want = try readF32(a, serial, s);
+            defer a.free(want);
+            try testing.expectEqualSlices(f32, want, got[j * v ..][0..v]);
+        }
     }
 }
 

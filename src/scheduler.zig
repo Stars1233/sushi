@@ -9131,8 +9131,9 @@ fn glmRowsForward(sch: *Scheduler, allocator: std.mem.Allocator, xfm: *Transform
         const gen = &slot.legacy_gen.?;
         if (gen.glm_dflash_native) taps = gen.dflash.?.config.target_layer_ids;
         const request = gen.ctx.glm5_request orelse return error.GlmRequestMissing;
+        // Plain rows take the policy when their slot samples them (`thinkShifted`).
         groups[i] = if (tree_at == i)
-            .{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count] }
+            .{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = gen.glmPenalty() }
         else
             .{ .request = request, .tokens = tokens[i .. i + 1], .parents = &.{-1} };
     }
@@ -10510,6 +10511,9 @@ test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained
     const t = testing;
     try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }, 0));
     try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 1 }, 0));
+    // tool_choice "none" bans the call opener; the verifier honours the bias.
+    const none_ban = [_]@import("logit_bias.zig").Bias{.{ .id = 5, .delta = -100 }};
+    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .think_penalty = .{ .biases = &none_ban } }, 0));
 
     try t.expect(!glmNativeDflashArmed(false, true, true, .{ .temperature = 0 }, 0));
     try t.expect(!glmNativeDflashArmed(true, false, true, .{ .temperature = 0 }, 0));

@@ -166,8 +166,8 @@ out-of-range biases return 400; `null` and `[]` mean no bias. `think_penalty: 0`
 Overlapping entries add. Sampling uses shifted logits; returned logprobs remain raw.
 
 Scoped vectors are prepared once per request on the inference thread. Active biases use the full target vocabulary
-head, including positive rewards. Serial, MTP and prompt-lookup rows apply the same prefix-dependent shifts;
-streaming and non-streaming preserve the same generated tokens. Existing non-stream-only repetition-tail trimming
+head, including positive rewards. Serial, MTP, prompt-lookup and GLM DFlash2 rows apply the same prefix-dependent
+shifts; streaming and non-streaming preserve the same generated tokens. Existing non-stream-only repetition-tail trimming
 can still shorten displayed loop-stop replies; `SUSHI_LOOP_TRIM=0` disables that presentation step for strict byte
 comparisons while retaining loop detection. The unchanged `--think-penalty` preset remains off by default.
 

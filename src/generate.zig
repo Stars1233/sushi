@@ -1163,9 +1163,9 @@ pub fn draftsRefused(sampling: SamplingParams) bool {
     return sampling.constraint != null or sampling.call_force != null or penaltyActive(sampling);
 }
 
+/// Logit biases and the think penalty ride the verifier (`Generator.glmPenalty`).
 pub fn glmDflashEligible(sampling: SamplingParams, logprobs_n: u32) bool {
-    return !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null and
-        !sampling.think_penalty.active();
+    return !specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null;
 }
 
 /// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
@@ -4008,10 +4008,13 @@ pub const Generator = struct {
         timer.reset();
         const request = self.ctx.glm5_request.?;
         // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
-        var layerwise = try @import("glm5_dflash_model.zig").verify(self.xfm.glm5.?, request, proposal.tokens[0..proposal.count], proposal.parents[0..proposal.count], self.dflash.?.config.target_layer_ids, .affine_rows_ffn);
+        const group = @import("glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = self.glmPenalty() };
+        var verified: [1]@import("glm5_dflash_model.zig").Verified = undefined;
+        try @import("glm5_dflash_model.zig").verifyGroups(self.xfm.glm5.?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
+        const layerwise = &verified[0];
         defer layerwise.deinit();
         const verify_ns = timer.read();
-        const result = try self.glmRoundEnd(allocator, &proposal, &layerwise, draft_ns, verify_ns, lookup != null);
+        const result = try self.glmRoundEnd(allocator, &proposal, layerwise, draft_ns, verify_ns, lookup != null);
         if (lookup != null) {
             self.glm_lookup.rounds += 1;
             self.glm_lookup.landed += result.accepted_tokens;
@@ -4032,6 +4035,15 @@ pub const Generator = struct {
         const chain = glmLookupProposal(got, self.next_token_id, self.max_tokens -| self.completion_tokens) orelse return null;
         if (self.glm_lookup.rounds == 0) log.info("[glm-dflash] lookup chain engaged: {d} drafts, suffix {d}\n", .{ glm_lookup_drafts, got.?.suffix });
         return chain;
+    }
+
+    /// The logit policy this request's DFlash2 tree rows take in the verifier; null = none.
+    pub fn glmPenalty(self: *Generator) ?@import("glm5_dflash_model.zig").Penalty {
+        const tp = &self.sampling.think_penalty;
+        if (!tp.active()) return null;
+        tp.observe(self.generated_ids.items);
+        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or tp.phase == .after)) return null;
+        return .{ .state = tp.*, .markers = self.xfm.think_marker_mask };
     }
 
     /// A DFlash2 GLM round may run: not done, no stop due.
@@ -19208,7 +19220,10 @@ test "GLM serving DFlash2 arms only requests the native verifier can reproduce" 
     try testing.expect(glmDflashEligible(.{ .temperature = 1 }, 0));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0 }, 1));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0, .presence_penalty = 1 }, 0));
-    try testing.expect(!glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1 } }, 0));
+    const ban = [_]logit_bias.Bias{.{ .id = 7, .delta = -100 }};
+    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .biases = &ban } }, 0));
+    try testing.expect(glmDflashEligible(.{ .temperature = 1, .think_penalty = .{ .file_biases = &ban } }, 0));
+    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1, .closer_id = 3, .phase = .inside } }, 0));
 }
 
 test "GLM snapshot backoff lands the prompt-end checkpoint on a pool boundary" {
