@@ -4,30 +4,35 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## v1.2.2 — GLM on 96 GB, file tools, a stricter CLI
+## v1.2.2 — GLM on 96 GB, faster loads, built-in file editing
 
 - **GLM-5.3-Flash on 96 GB Macs**: the new Sushi-2bpw pack serves GLM-5.3-Flash with DFlash2 and images on a 96 GB
-  Mac, with a 512K context at 8-bit KV (300K at BF16). `sushi list` shows every Sushi pack with its size, whether this Mac fits it
-  and which one to pick; `sushi pull` warns before pulling a pack that will need `--ssd-budget-gb`.
-- **File tools**: the chat page and `sushi run` can let the model create and edit files inside the folder you choose,
-  switched per conversation with the Edit chip or `/edit on|off`; every write stays inside that folder.
+  Mac, with a 512K context at 8-bit KV (300K at BF16). `sushi list` shows every Sushi pack with its size, whether this
+  Mac fits it and which one to pick; `sushi pull` warns before pulling a pack that will need `--ssd-budget-gb`.
+- **Faster loads**: weights load without filling the macOS file cache, so a large load no longer compresses or swaps
+  the weights already in memory. GLM-5.3-Flash Sushi-2.4bpw is serving in 12 s instead of 22 s and MiMo-V2.6-Flash
+  in 15 s instead of 26 s, with about 57 GB less memory compression each. Thanks @ViRb3.
+- **Built-in file editing**: the chat page and `sushi run` can let the model create and edit files inside the folder
+  you choose, switched per conversation with the Edit chip or `/edit on|off`; every write stays inside that folder.
+  Thanks @lukadisanto for asking for it.
 - **Agents and APIs**: Claude Code no longer counts cached context twice and compacts at half its real size;
   `/v1/messages` streams thinking live when tools are on; `tool_choice: "none"` stops stray tool calls; structured
-  output follows `$ref`, so nested Pydantic and Zod models are enforced; chat responses report their reasoning tokens
-  and `sushi launch opencode` works with OpenCode builds without `--standalone`. Thanks @felk-dev.
+  output follows `$ref`, so nested Pydantic and Zod models are enforced; a repetition loop inside a thought now ends
+  the thought and lets the model answer; chat responses report their reasoning tokens and `sushi launch opencode`
+  works with OpenCode builds without `--standalone`. Thanks @felk-dev.
 - **Speed**: GLM-5.3-Flash drafts about 6% faster per DFlash2 round, EXL3 prefill no longer waits on the GPU to build
   host-side expert tables, and expert rates from 1.5 bits per weight take the fast kernels, all with identical output.
   Thanks @davidtai.
-- **Memory**: the load check bills what each model really allocates plus 1 GiB instead of a flat 7 GiB, and the
-  available-memory figure no longer counts a resident model twice, so loads that fit are no longer refused.
-- **Reliability**: a repetition loop inside a thought now ends the thought and lets the model answer; a stalled
-  client is dropped after 30 seconds; model-load races and a double registry unlock are fixed; a broken SSD cache entry
-  is dropped instead of failing every later match.
-- **Leaner CLI**: `--help` lists every flag, and a bad value or stray argument stops before anything loads. `--fast`,
-  prompt lookup decoding (`--pld*`), `--expert-cache-gb` (use `--ssd-budget-gb`), `--logit-bias-file`,
-  `--embedding-max-length`, `--kv-attn-mode`, `--decode-attn-quant` and other flags with no real choice are gone;
-  `--no-prefix-cache-ram` is now `--prefix-cache-mem off`. `sushi pull` downloads only from the `beamster` org, and
-  over a hundred internal environment switches are removed. New: `--qwen-gdn fp32` keeps Qwen's recurrent state in f32.
+- **Memory and reliability**: the load check bills what each model really allocates plus 1 GiB instead of a flat
+  7 GiB, and the available-memory figure no longer counts a resident model twice, so loads that fit are no longer
+  refused. A stalled client is dropped after 30 seconds, model-load races are fixed, and a broken SSD cache entry is
+  dropped instead of failing every later match.
+- **Leaner engine**: 12% less source code. `--help` lists every flag, and a bad value or stray argument stops before
+  anything loads. `--fast`, prompt lookup decoding (`--pld*`), `--expert-cache-gb` (use `--ssd-budget-gb`),
+  `--logit-bias-file`, `--embedding-max-length`, `--kv-attn-mode`, `--decode-attn-quant` and other flags with no real
+  choice are gone; `--no-prefix-cache-ram` is now `--prefix-cache-mem off`. `sushi pull` downloads only from the
+  `beamster` org, and over a hundred internal environment switches are removed. New: `--qwen-gdn fp32` keeps Qwen's
+  recurrent state in f32.
 
 ---
 
