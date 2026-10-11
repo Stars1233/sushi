@@ -100,9 +100,9 @@ run_request() {
     # --no-mtp: an MTP slot runs speculative rounds and never reaches the plain batched tick under test.
     logfile=$(mktemp)
     if [ "$force_flag" = "1" ]; then
-        SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
+        SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-mtp > "$logfile" 2>&1 &
     else
-        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
+        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-mtp > "$logfile" 2>&1 &
     fi
     local pid=$!
     local up=0
@@ -153,9 +153,9 @@ run_and_tokenize() {
     local logfile
     logfile=$(mktemp)
     if [ "$force_flag" = "1" ]; then
-        SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
+        SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-mtp > "$logfile" 2>&1 &
     else
-        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp > "$logfile" 2>&1 &
+        "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-mtp > "$logfile" 2>&1 &
     fi
     local pid=$!
     local up=0
@@ -291,15 +291,13 @@ echo
 echo "== real N=2 concurrency (batch != 1) =="
 # Everything above forces the batched kernel at N=1, which is the ONE width
 # where `batch == 1` still holds inside the forward — and several decisions key
-# on exactly that. `attnProj` passes `batch == 1 and !is_prefill` as its
-# decode_shape, so `--decode-attn-quant` (default ON) engages at forced-N=1 and
-# does NOT at real N>1; the fused QK-norm+RoPE gates are `batch == 1` too. A
+# on exactly that: the fused QK-norm+RoPE gates are `batch == 1`. A
 # guard that only ever runs at N=1 therefore pins a shape that never ships.
 # This arm runs two genuinely concurrent streams and holds each to the same
 # first-N-tokens bar against the serial answer.
 sleep 2
 CONC_LOG=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$CONC_LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-mtp --max-concurrent 4 > "$CONC_LOG" 2>&1 &
 CONC_PID=$!
 up=0
 for i in $(seq 1 60); do
@@ -433,7 +431,7 @@ echo "== batched-kernel x kv-quant crash guard =="
 
 sleep 2
 KVQ_LOG=$(mktemp)
-SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --kv-quant 8 > "$KVQ_LOG" 2>&1 &
+SUSHI_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-mtp --kv-quant 8 > "$KVQ_LOG" 2>&1 &
 KVQ_PID=$!
 up=0
 for i in $(seq 1 60); do
@@ -530,7 +528,7 @@ pathlib.Path(sys.argv[2]).write_text(json.dumps(body("64k", 50000, 600)))
 pathlib.Path(sys.argv[3]).write_text(json.dumps(body("1k", 800, 400)))
 PW_PYEOF
 
-    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$PW_LOG" 2>&1 &
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-mtp --max-concurrent 4 > "$PW_LOG" 2>&1 &
     PW_PID=$!
     up=0
     for i in $(seq 1 90); do

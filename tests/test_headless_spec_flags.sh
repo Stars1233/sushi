@@ -1,23 +1,14 @@
 #!/bin/bash
 . "$(dirname "$0")/private_cache.sh"
-# Regression test: headless serve mode must honor the CLI's spec-decode flags.
+# Regression test: headless serve mode must honor the CLI's launch flags.
 #
-# `runHeadlessServe` builds its own ServerConfig literal. It shipped with all
-# three PLD fields hardcoded (`false`/`5`/`3`), so nothing the user passed on
-# the command line reached a headless request. #95 threaded `--pld`; the
-# neighbouring `--pld-draft-len` / `--pld-key-len` stayed literals and were
-# still silently dropped.
-#
-# This is the mode that matters: the Swift app ALWAYS launches headless
-# (`--serve --model-dir`, no `--model` — ServerOptions.swift:455) and ALWAYS
-# emits all three flags (:497-499), so every app-launched server ran on the
-# hardcoded values regardless of Settings.
+# `runHeadlessServe` builds its own ServerConfig literal, so a flag threaded
+# only through the `--model` path never reached a headless request. This is
+# the mode that matters: the Swift app ALWAYS launches headless
+# (`--serve --model-dir`, no `--model`).
 #
 # Fully hermetic: an EMPTY --model-dir discovers zero models and never loads
-# one, so the boot banner is reachable with no checkpoint on disk. The banner
-# is the observable — server.zig's
-# `[pld] <on|off> (<source>); draft_len=N, key_len=M...` line reads
-# the exact ServerConfig fields a request would.
+# one, so the boot banner is reachable with no checkpoint on disk.
 #
 # Usage: ./tests/test_headless_spec_flags.sh [port]
 
@@ -83,39 +74,11 @@ boot() {
     return 0
 }
 
-echo "Headless spec-decode flag plumbing (port $PORT)"
-
-echo "[1/6] --pld with non-default draft/key lengths"
-if boot --pld --pld-draft-len 8 --pld-key-len 4; then
-    grep -q "\[pld\] on (--pld)" "$LOG"
-    check "--pld enables PLD in headless mode" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -q "draft_len=8" "$LOG"
-    check "--pld-draft-len 8 reaches the request defaults" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-    grep -q "key_len=4" "$LOG"
-    check "--pld-key-len 4 reaches the request defaults" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-else
-    check "boot with --pld" 0
-fi
-
-echo "[2/6] --no-pld still disables"
-if boot --no-pld --pld-draft-len 8 --pld-key-len 4; then
-    grep -q "\[pld\] off (--no-pld)" "$LOG"
-    check "--no-pld keeps PLD off even with lengths passed" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-else
-    check "boot with --no-pld" 0
-fi
-
-echo "[3/6] bare default matches the documented 5/3"
-if boot; then
-    grep -q "\[pld\] on (default); draft_len=5, key_len=3" "$LOG"
-    check "default headless boot is PLD on at 5/3" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-else
-    check "bare default boot" 0
-fi
+echo "Headless launch flag plumbing (port $PORT)"
 
 # `--max-tokens` used to feed only the offline `--prompt` mode; headless hand-rolls its own
-# ServerConfig literal, which is how the --pld* trio was eaten.
-echo "[4/6] --max-tokens reaches the serve-mode omitted-field default"
+# ServerConfig literal, which is how launch flags were eaten.
+echo "[1/2] --max-tokens reaches the serve-mode omitted-field default"
 if boot --max-tokens 4096; then
     grep -q "default max_tokens for omitted requests: 4096" "$LOG"
     check "--max-tokens 4096 reaches the headless request defaults" "$([ $? -eq 0 ] && echo 1 || echo 0)"
@@ -136,7 +99,7 @@ fi
 # to anything that maps endpoints by probing them — llmprobe scored every
 # surface absent against a headless boot for exactly this reason (2026-07-25).
 # Headless with an EMPTY model dir is the only place this is observable.
-echo "[5/6] endpoint existence does not depend on a model being loaded"
+echo "[2/2] endpoint existence does not depend on a model being loaded"
 require_free_port
 : > "$LOG"
 "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
@@ -162,28 +125,6 @@ check "a served endpoint still reports 503 no-model (got $known_code)" \
     "$([ "$known_code" = "503" ] && echo 1 || echo 0)"
 check "a removed media-generation endpoint is 404 (got $media_code)" \
     "$([ "$media_code" = "404" ] && echo 1 || echo 0)"
-
-# `--fast` is a flag profile: each setting it turns on yields to its own flag given beside it.
-# The boot line echoes the launch layer, before any model's own settings.
-echo "[6/6] --fast turns on its preset; an explicit flag beside it wins"
-if boot --fast; then
-    grep -q "\[args\] fast: mtp on (--fast); acceptance typical (--fast); greedy tail on (--fast); kv8 (--fast)" "$LOG"
-    check "--fast alone names --fast for MTP, acceptance, greedy tail and KV" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-else
-    check "boot with --fast" 0
-fi
-if boot --no-mtp --fast --mtp-tokenv3 0.9 --kv-quant 4; then
-    grep -q "\[args\] fast: mtp off (--no-mtp); acceptance tokenv3 (--mtp-tokenv3); greedy tail on (--fast); kv4 (--kv-quant)" "$LOG"
-    check "explicit --no-mtp, --mtp-tokenv3 and --kv-quant outrank --fast, in any order" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-else
-    check "boot with --fast and explicit flags" 0
-fi
-if boot; then
-    grep -q "\[args\] fast:" "$LOG"
-    check "no --fast, no fast line" "$([ $? -ne 0 ] && echo 1 || echo 0)"
-else
-    check "bare boot for --fast" 0
-fi
 
 echo
 echo "  passed: $PASS   failed: $FAIL"

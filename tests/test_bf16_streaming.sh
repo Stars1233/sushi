@@ -38,7 +38,7 @@ KLD_JSON=$(mktemp /tmp/sushi-bf16-stream.XXXXXX.kld.json)
 jq -e '.mean_kld_to_eos < 0.02 and .mean_top1_to_eos > 0.95' "$KLD_JSON" >/dev/null
 rm -f "$KLD_JSON"
 
-./zig-out/bin/sushi --model "$CHECKPOINT" --serve --host 127.0.0.1 --port "$PORT" --expert-cache-gb 60 --no-mtp --kv-quant 8 --ctx-size 65536 --metrics --no-vision >"$LOG" 2>&1 &
+./zig-out/bin/sushi --model "$CHECKPOINT" --serve --host 127.0.0.1 --port "$PORT" --ssd-budget-gb 60 --no-mtp --kv-quant 8 --ctx-size 65536 --metrics --no-vision >"$LOG" 2>&1 &
 PID=$!
 for _ in $(seq 1 1200); do
     if curl --connect-timeout 1 --max-time 2 -fsS "http://127.0.0.1:$PORT/health" >/dev/null; then break; fi

@@ -14,7 +14,7 @@
 #     Cancelled-checkpoint salvage: `initWithOptions` hands its captured
 #     SSM stride checkpoints to the slot on abort, so the commit carries
 #     them and the re-issue restores at the last checkpoint ≤ matched (the
-#     boot pins --prefill-chunk/--ssm-checkpoint-stride at 512 so the
+#     boot pins --prefill-chunk at 512 so the
 #     cancelled window always spans checkpoint boundaries — the effective
 #     stride otherwise coarsens to the prefill chunk and a short window may
 #     salvage nothing).
@@ -67,7 +67,7 @@ done
 boot_server() {
     rm -f "$LOG"
     "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-        --ctx-size 16384 --prefill-chunk 512 --ssm-checkpoint-stride 512 \
+        --ctx-size 16384 --prefill-chunk 512 \
         --kv-quant 4 --prefix-cache-entries 4 --prefix-cache-mem 2GB \
         > "$LOG" 2>&1 &
     SERVER_PID=$!

@@ -146,7 +146,7 @@ start_server() { # $1 = extra flags
     # --no-drafter: a pack shipping its own drafter/ would otherwise outrank
     # the MTP head and this script would measure DFlash.
     # shellcheck disable=SC2086
-    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS $1 >"$LOG" 2>&1 &
+    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS $1 >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 120); do
         curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
@@ -513,7 +513,7 @@ echo "── fixed-depth server (SUSHI_MTP_ADAPTIVE=0) ──"
 BOOT=$((BOOT+1))
 # SUSHI_MTP_COST_TABLE=0: the lookup gate and the plan read no measured round
 # times, so a seeded sampled request takes the same rounds streamed or not.
-SUSHI_MTP_ADAPTIVE=0 SUSHI_MTP_COST_TABLE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS >"$LOG" 2>&1 &
+SUSHI_MTP_ADAPTIVE=0 SUSHI_MTP_COST_TABLE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS >"$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 120); do
     curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break

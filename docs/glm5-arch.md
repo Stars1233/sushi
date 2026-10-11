@@ -62,7 +62,7 @@ private converter repo.
   expansion beyond it (billed for the widest pending layer: 576 MiB at two pending layers).
 - The BF16 source checkpoint is the KLD teacher, run with SSD-streamed experts
   ([engine-expert-streaming](engine-expert-streaming.md)).
-- `--ssd-budget-gb`/`--expert-cache-gb` stream any pack's EXL3 experts, or the BF16 source's, through the same engine
+- `--ssd-budget-gb` streams any pack's EXL3 experts, or the BF16 source's, through the same engine
   for `serve`, `run` and `kld compare`: DFlash2 off, image and video only with `--vision`, output identical to the
   resident load.
 - The FP8 release (E4M3FN block-128 trunk and experts) streams its experts as stored and runs its trunk on `fp8_block`
@@ -131,7 +131,7 @@ inside 1.46% drift) because verification per round grew 20.6%.
 - **N2 saturates on copies, breaks even on prose** (no runtime yield gate): a ~2K-token verbatim copy and a rename
   edit accepted 2.00 of 2 drafts every round (41.4/40.8 vs 25.2 tok/s serial), low-effort prose 0.88 (26.1 vs 25.6);
   greedy bytes equal serial (`144f63db`, BF16 latent, Sushi-2.3bpw + A4 g64, `taskpolicy -a`, busy box, 2026-10-04).
-- **Verbatim lookup chains instead of PLD**: PLD never runs on GLM (`specInitWiring`'s module branch), so `--no-drafter`
+- **Verbatim lookup chains**: there is no standalone PLD, so `--no-drafter`
   decodes plain serial and the 0.010 n-gram gate is inert. A request drafting alone whose output agrees with its context
   for `mtp_lookup.STRONG_SUFFIX` tokens verifies the context's next three tokens as a four-row chain in place of the
   assistant's tree (`glmLookupProposal`, `[spec-stats] … lookup=rounds/landed`). `--no-mtp-lookup` turns the chains off.

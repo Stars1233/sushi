@@ -462,9 +462,6 @@ over two porting rounds in July 2026:
   * The certified lm_head prune, a port of `LagunaLmHeadPrune.swift`: an MXFP8
     coarse GEMV producing a certified per-row bound, a mask, and an exact pass
     over the surviving candidates.
-  * Decode-only dense-attention requant (`--decode-attn-quant`): int8 side
-    copies of dense attention weights served at decode widths, with real
-    nvfp4-g16 copies on the tail layers at their measured split point.
   * The fused decode QK-norm + RoPE kernel, from their
     `laguna_sliding_qk_norm_rope_*`.
   * The fused MoE down + router-weighting + K-reduction tail, from their fused

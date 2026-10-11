@@ -63,7 +63,7 @@ wait_health() {
 echo ""
 echo "── Phase 1: without --metrics ──"
 
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --log-level warn > "$LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --log-level warn > "$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true' EXIT
 wait_health
@@ -87,7 +87,7 @@ echo ""
 echo "── Phase 2: with --metrics (idle — no requests yet) ──"
 
 # --log-level info so the "Prometheus metrics: ENABLED" startup line is visible.
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --metrics --no-pld --log-level info > "$LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --metrics --log-level info > "$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true' EXIT
 wait_health

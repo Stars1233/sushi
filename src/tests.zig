@@ -40,7 +40,6 @@ test {
     _ = @import("token_mask.zig");
     _ = @import("responses.zig");
     _ = @import("ws.zig");
-    _ = @import("pld_index.zig");
     _ = @import("mtp_lookup.zig");
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");

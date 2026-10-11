@@ -12,7 +12,7 @@
 #   QWEN4_EXP_MODEL=<pack> MIMO_STREAM_MODEL=<pack> MIMO_SSD_BUDGET_GB=60
 #
 # Configs: default (kv8) | off (--kv-quant off) | kv4 (--kv-quant 4) | kv8 (--kv-quant 8) | mtp (--mtp, only
-# where the pack ships a head and does not stream) | nospec (--no-pld --no-mtp
+# where the pack ships a head and does not stream) | nospec (--no-mtp
 # --no-drafter). The MiMo EXL3 pack serves resident with its vision tower and MTP heads;
 # MIMO_SSD_BUDGET_GB adds --ssd-budget-gb for a streamed MiMo checkpoint, which skips mtp.
 # Per boot: chat non-stream/stream, thinking on/off, tools, json_schema,
@@ -274,7 +274,7 @@ for entry in "${ARCHES[@]}"; do
             kv8)     flags+=(--kv-quant 8) ;;
             mtp)     [[ "$arch" == mimo_v2 && -n "${MIMO_SSD_BUDGET_GB:-}" ]] && { skip "$CELL" "streamed experts refuse MTP"; continue; }
                      has_mtp_head "$model" || { skip "$CELL" "no MTP head"; continue; }; flags+=(--mtp) ;;
-            nospec)  flags+=(--no-pld --no-mtp --no-drafter) ;;
+            nospec)  flags+=(--no-mtp --no-drafter) ;;
             *) skip "$CELL" "unknown config"; continue ;;
         esac
         echo ""
@@ -287,7 +287,7 @@ for entry in "${ARCHES[@]}"; do
             check "mtp: engaged in the log" "$(grep -q 'spec-stats\] mode=mtp' "$OUT/$CELL.server.log" && echo 0 || echo 1)"
         fi
         if [[ "$cfg" == nospec ]]; then
-            check "nospec: no speculation engaged" "$(grep -Eq 'spec-stats\] mode=(mtp|pld|drafter|dflash)' "$OUT/$CELL.server.log" && echo 1 || echo 0)"
+            check "nospec: no speculation engaged" "$(grep -Eq 'spec-stats\] mode=(mtp|drafter|dflash)' "$OUT/$CELL.server.log" && echo 1 || echo 0)"
         fi
         stop
     done

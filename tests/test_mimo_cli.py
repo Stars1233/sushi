@@ -30,7 +30,7 @@ def main():
         "--host", "127.0.0.1", "--port", str(port),
         "--ssd-budget-gb", os.environ.get("MIMO_SSD_BUDGET_GB", "100"),
         "--kv-quant", "8", "--ctx-size", "4096", "--prefill-chunk", "512",
-        "--max-tokens", "32", "--no-mtp", "--no-pld", "--no-vision",
+        "--max-tokens", "32", "--no-mtp", "--no-vision",
         "--prefix-cache-entries", "0", "--log-file", str(out / "server.log"),
     ]
     master, slave = pty.openpty()

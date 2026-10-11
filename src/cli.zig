@@ -702,8 +702,7 @@ pub const ReplOptions = struct {
     }
 };
 
-/// The one switch for the prompt-lookup drafts in MTP rounds and GLM DFlash2; `--pld`/`--no-pld`
-/// (standalone PLD) and `--no-mtp` are separate flags and never imply it.
+/// The one switch for the prompt-lookup drafts in MTP rounds and GLM DFlash2; `--no-mtp` is a separate flag and never implies it.
 pub fn isNoMtpLookupFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--no-mtp-lookup");
 }
@@ -1603,9 +1602,9 @@ fn mergeToolCallDelta(allocator: std.mem.Allocator, calls: *std.ArrayList(ToolCa
 
 const testing = std.testing;
 
-test "cli: --no-mtp-lookup is its own flag, not --no-pld or --no-mtp" {
+test "cli: --no-mtp-lookup is its own flag, not --no-mtp" {
     try testing.expect(isNoMtpLookupFlag("--no-mtp-lookup"));
-    for ([_][]const u8{ "--no-pld", "--pld", "--no-mtp", "--mtp", "--no-mtp-lookups", "--mtp-lookup" }) |other| {
+    for ([_][]const u8{ "--no-mtp", "--mtp", "--no-mtp-lookups", "--mtp-lookup" }) |other| {
         try testing.expect(!isNoMtpLookupFlag(other));
     }
 }

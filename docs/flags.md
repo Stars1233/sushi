@@ -4,11 +4,11 @@ A flag exists for a setting a user picks: a real tradeoff (`--qwen-gdn fp32` for
 
 Precedence: an explicit flag outranks `model-settings.json`, which outranks the default ([server-lifecycle](server-lifecycle.md#settings)). A flag that mirrors a settings key adds the precedence and nothing else; that is not bloat by itself.
 
-The map is the code's: every argument the parsers accept, at `main` 393228b9 less the 13 flags listed under [Removed](#removed) (the parse-site line numbers below are 393228b9's and drift). `main.zig` is the one parser for `run`, `serve` and the bare `sushi [options]` form; `launch`, `update` and `kld` parse their own. `pull` and `list` take no flags.
+The map is the code's: every argument the parsers accept, at `main` 393228b9 less the flags listed under [Removed](#removed) (the parse-site line numbers below are 393228b9's and drift). `main.zig` is the one parser for `run`, `serve` and the bare `sushi [options]` form; `launch`, `update` and `kld` parse their own. `pull` and `list` take no flags and reject extra arguments.
 
 **Reading the columns.** *default → effect* ends with the parse site. *who* is `user` (a tradeoff), `machine` (fits a Mac), `operator` (port, auth, paths, logging), `dev` (A/B, debug, bench), `test` (only a test needs it), `dead` (no effect left). *documented* names `help` (`sushi --help` or the subcommand's), `usage` (`docs/usage.md`), `README`, the topic docs, and how many `tests/` scripts pass it (`scripts/` counted apart); *hidden* means parsed but absent from `--help`. *recommendation* starts with `keep`, `cut`, `merge` (names the target) or `owner call` (the evidence that decides it is under [Owner calls](#owner-calls)).
 
-**Summary.** 104 rows: 67 shared by `run`, `serve` and the bare form, 37 in `run`, `launch`, `update` and `kld`. By who: user 27, operator 27, machine 19, dev 28, dead 2, test 1. By recommendation: keep 87, cut 7, owner call 10. Among the 67 shared rows: keep 51, cut 7, owner call 9.
+**Summary.** 93 rows: 57 shared by `run`, `serve` and the bare form, 36 in `run`, `launch`, `update` and `kld`. By who: user 24, operator 26, machine 17, dev 25, dead 1. By recommendation: keep 87, cut 4, owner call 2. Among the 57 shared rows: keep 51, cut 4, owner call 2.
 
 ## Serving, network and auth
 
@@ -21,13 +21,12 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--api-key-strict` | off → also require the key from loopback (main.zig:732) | operator | help; 1 test | keep: embedders on shared machines |
 | `--api-key-env` | none → read the key from a named env var so argv does not carry it (main.zig:734) | operator | help, envvar; 0 tests | keep: the only way to keep the key out of the process table |
 | `--metrics` | off → Prometheus `/metrics` and `/metrics.json` (main.zig:726) | operator | help, server-http-apis; 10 tests, 2 scripts | keep |
-| `--max-concurrent` | `1` → only sizes the submit queue (`n + 32`) and floors the prefix-cache capacity; slots batch at any value (main.zig:913) | dead | hidden; server-lifecycle; 21 tests, 2 scripts | cut: the queue depth is fixed, batching is the model's answer, not this number |
+| `--max-concurrent` | `1` → only sizes the submit queue (`n + 32`) and floors the prefix-cache capacity; slots batch at any value (main.zig:913) | dead | help; server-lifecycle; 21 tests, 2 scripts | cut: the queue depth is fixed, batching is the model's answer, not this number |
 | `--parent-pid` | none → exit when that pid dies (main.zig:811) | operator | help, server-http-apis; 1 test | keep: for a host that embeds the engine |
 | `--timeout` | `300` → stall timeout in seconds, 0 = none (main.zig:690) | operator | help, server-http-apis; 1 test | keep |
 | `--no-prevent-sleep` | off → allow idle sleep during inference (main.zig:697) | operator | help; 1 test | keep |
 | `--gpu-warm-secs` | `60` → keep the GPU awake this long after a request (main.zig:953) | machine | help, server-lifecycle; 0 tests | keep: a power-against-latency choice |
 | `--no-tool-autocorrect` | off → stop coercing tool-call arguments to the schema's types (main.zig:706) | dev | help, server-tool-calling; 0 tests | cut: kill switch of an adopted default, no test, no measurement |
-| `--embedding-max-length` | `auto` = the model window → lower per-input ceiling for `/v1/embeddings` (main.zig:681) | operator | help; 0 tests | owner call |
 | `--no-update-check` | off → never ask GitHub for a newer release (main.zig:818) | operator | help, server-lifecycle; 2 tests | keep |
 
 ## Model, memory and context
@@ -45,7 +44,6 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--skip-mem-preflight` | off → bypass the free-RAM check before a load (main.zig:699) | machine | help, engine-memory-admission, qwen4-perf; 0 tests | keep: the refusal text names it; the M2 Max runs need it |
 | `--wired-margin-gib` | `1` → headroom under `iogpu.wired_limit_mb`, 1..32 (main.zig:898) | machine | help, README, engine-memory-admission; 0 tests | keep |
 | `--ssd-budget-gb` | none → stream experts from SSD within a TOTAL resident target; also `ssd_budget_gb` in settings (main.zig:985) | machine | help, README, engine-expert-streaming; 9 tests | keep |
-| `--expert-cache-gb` | none → stream experts with a fixed decimal-GB cache; outranks `--ssd-budget-gb` (main.zig:979) | machine | help, engine-expert-streaming; 1 test | owner call |
 | `--expert-pick-tolerance` | `0` exact → swap a missed streamed expert for a cached one within n, 0..0.6 (main.zig:904) | user | help, README, engine-expert-streaming; 1 test | keep: a measured speed-for-exactness tradeoff |
 | `--prefill-chunk` | `8192` → ceiling on tokens per prefill chunk, auto-capped per model (main.zig:824) | machine | help, usage, engine-memory-admission; 11 tests, 2 scripts | keep |
 | `--prefill-decode-share` | `0` → target decode share of wall time during another request's prefill, 0..0.9 (main.zig:910) | user | help, server-lifecycle; 1 test | keep: latency of live streams against prefill speed |
@@ -56,7 +54,6 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 |---|---|---|---|---|
 | `--kv-quant` | `8` → KV scheme 8, 4 or 16 (`off` = BF16); also `kv_quant` in settings and per request (main.zig:972) | user | help, usage, engine-kv-cache; 21 tests | keep |
 | `--qwen-gdn` | `bf16` → store the GatedDeltaNet state in `fp32`, Qwen only (main.zig:966) | user | help, engine-kernels, quality-kld; 0 tests (kld parse test) | keep: the long-context precision tradeoff; add a serve-side test |
-| `--no-decode-attn-quant` | requantizes DENSE attention projections to int8 g32 for decode and verify, lossy, only when a pack ships dense attention; this restores exact decode (main.zig:766) | user | help, engine-kv-cache; 0 tests | owner call |
 | `--mtp-head-kv-quant` | off → Qwen's MTP head KV follows `--kv-quant`; no effect on MiMo (main.zig:762) | machine | help, usage, README, engine-mtp; 0 tests | keep: the long-context memory bills use it |
 
 ## Speculation (MTP, prompt lookup, drafter)
@@ -69,15 +66,10 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--mtp-typical` | off, exact → typical acceptance, d > 0, lossy for sampled requests; also `mtp_acceptance` in settings (main.zig:780) | user | help, engine-mtp; 1 test | keep: measured 15-20% on sampled decode; docs warn it has looped |
 | `--mtp-tokenv3` | off → TokenV3 cascade acceptance, 0..1, lossy (main.zig:783) | user | help; 2 tests | owner call |
 | `--mtp-greedy-tail` | off → sampled requests draft only the first token by sampling; also in settings (main.zig:786) | user | help, engine-mtp, mimo2-perf; 1 test | keep: measured to pay only beside `--mtp-typical` |
-| `--fast` | off → profile: MTP, typical acceptance, greedy tail, kv8; between flags and the file (main.zig:788) | user | help, engine-mtp, server-lifecycle; 3 tests | owner call |
 | `--max-mtp-ctx` | `0` no ceiling → MTP off past n context tokens (main.zig:790) | machine | help, `/props`; 0 tests | owner call |
 | `--no-mtp-lookup` | off → drop prompt-lookup drafts inside MTP rounds and GLM DFlash2 chains (cli.zig:708) | dev | help, engine-mtp; 2 tests | cut: kill switch of an adopted default; one arm per boot is why a bench wants it |
-| `--pld` | on already → the explicit "on" form of standalone prompt lookup; only changes the reported source (main.zig:703) | dead | help; 9 tests | cut: states the default; no settings key to outrank |
-| `--no-pld` | standalone PLD on, but it runs only when MTP and the drafter are both off, never on Qwen (main.zig:710) | test | help, engine-mtp; 27 tests | owner call |
-| `--pld-draft-len` | `5` → max draft tokens per PLD step (main.zig:713) | dev | help; 1 test | cut: never measured, the one test only checks it is wired |
-| `--pld-key-len` | `3` → n-gram key length for PLD (main.zig:716) | dev | help; 1 test | cut: same |
-| `--drafter` | none → path of a GLM DFlash2 assistant stored elsewhere (main.zig:719) | operator | hidden; usage, glm5-arch; 7 tests | keep: add it to `--help` |
-| `--no-drafter` | on when the assistant is found → never load it, saves its memory (main.zig:752) | machine | hidden; usage, glm5-arch; 9 tests | keep: add it to `--help` |
+| `--drafter` | none → path of a GLM DFlash2 assistant stored elsewhere (main.zig:719) | operator | help, usage, glm5-arch; 7 tests | keep |
+| `--no-drafter` | on when the assistant is found → never load it, saves its memory (main.zig:752) | machine | help; usage, glm5-arch; 9 tests | keep |
 
 ## Prefix cache
 
@@ -86,7 +78,6 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--prefix-cache-entries` | `32` → hot-cache capacity, `0` disables all reuse; a bad value silently becomes 1 (main.zig:840) | user | help, usage, engine-prefix-cache; 41 tests, 2 scripts | keep |
 | `--prefix-cache-mem` | off → RAM retention with this byte budget, `0` or `off` keeps it off (main.zig:843) | machine | help, usage, engine-prefix-cache; 19 tests, 2 scripts | keep |
 | `--prefix-cache-disk` | min(sized + 2 GiB, 20 GiB, free - 4 GiB) → SSD tier budget, `0` or `off` disables (main.zig:854) | machine | help, usage, engine-prefix-cache; 16 tests, 2 scripts | keep |
-| `--ssm-checkpoint-stride` | `256` → hybrid (Qwen) state checkpoint every n tokens, `0` bypasses the hot cache; a bad value silently becomes 128 (main.zig:888) | machine | help; 3 tests | owner call |
 | `--ssm-checkpoint-max` | `16` → checkpoints kept per entry, `0` unlimited (main.zig:895) | dev | help; 2 tests, 2 scripts | cut: the scripts pass the default and the cache byte budget already bounds it |
 
 ## Sampling and reasoning defaults
@@ -100,7 +91,6 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--reasoning-budget` | unlimited → max thinking tokens per request (main.zig:799) | user | help, server-http-apis; 2 tests | keep |
 | `--preserve-thinking` | template default → keep every turn's thinking, `on` or `off`; also in settings (main.zig:876) | user | help, usage; 0 tests (settings test) | keep |
 | `--think-penalty` | `0` off → lower overthinking-marker logits inside the reasoning span; also in settings (main.zig:868) | user | help, server-http-apis; 2 tests | keep |
-| `--logit-bias-file` | none → JSON or CSV of scoped token penalties and rewards, "experimental" in `--help`; also in settings (main.zig:865) | user | help, server-http-apis; 1 test | owner call |
 
 ## Logging, diagnostics and info
 
@@ -114,7 +104,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 
 ## Subcommands
 
-`pull <model>` and `list` take no flags (`HF_TOKEN` is read from the environment). `serve` and `run <model>` take every flag above.
+`pull <model>` and `list` take no flags and reject any extra argument (`HF_TOKEN` is read from the environment); `pull` accepts only the `beamster` org. `serve` and `run <model>` take every flag above.
 
 | flag | default → effect | who | documented | recommendation |
 |---|---|---|---|---|
@@ -132,7 +122,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `update`: `--pre` | off → consider prereleases (update.zig:711) | user | help; 0 tests | keep |
 | `update`: `--force` | off → update while a sushi of this install runs (update.zig:713) | user | help; 0 tests | keep |
 | `update`: `--rollback` | off → swap `<install>.previous` back (update.zig:715) | user | help; 1 test | keep |
-| `update`: `--relaunch --` | internal: the updater restarts the server with its argv (update.zig:717) | dev | hidden; 1 test | keep: plumbing, not a user flag |
+| `update`: `--relaunch --` | internal: the updater restarts the server with its argv (update.zig:717) | dev | not in help (internal); 1 test | keep: plumbing, not a user flag |
 | `kld`: `--model` | required → pack to score or capture (kld.zig:99) | dev | help, quality-kld | keep |
 | `kld`: `--prompts` | required for capture → `standard4`, a fixture dir, `*.txt` dir or `.jsonl` (kld.zig:100) | dev | help, quality-kld | keep |
 | `kld`: `--out` | required for capture → fixture output dir (kld.zig:101) | dev | help, quality-kld | keep |
@@ -147,10 +137,9 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `kld`: `--kv-quant` | dense BF16 → KV scheme; the teacher adds no quantization of its own (kld.zig:109) | dev | help, quality-kld | keep |
 | `kld`: `--qwen-gdn` | `bf16` → fp32 GDN state for a teacher that prices that rounding (kld.zig:110) | dev | help, quality-kld | keep |
 | `kld`: `--ssd-budget-gb` | none → expert streaming budget (kld.zig:111) | dev | help, quality-kld | keep |
-| `kld`: `--expert-cache-gb` | none → streamed cache size, outranks the budget (kld.zig:112) | dev | help | owner call: follows the serve flag |
 | `kld`: `--expert-pick-tolerance` | `0` → compare only, lossy swap of a missed expert (kld.zig:113) | dev | help, quality-kld; 1 test | keep |
 | `kld`: `--wired-margin-gib` | `1` → headroom under the wired limit (kld.zig:114) | dev | help | keep |
-| `kld`: `--mtp` / `--no-mtp` | head not resident → keep the head loaded (kld.zig:145) | dev | help (`--mtp` only); quality-kld | keep: list `--no-mtp` in its help |
+| `kld`: `--mtp` / `--no-mtp` | head not resident → keep the head loaded (kld.zig:145) | dev | help; quality-kld | keep |
 | `kld`: `--layer-major` | off → native GLM BF16 teacher in batches, layer by layer, resumable (kld.zig:151) | dev | help, quality-kld, glm5-arch | keep |
 | `kld`: `--batch-windows` | from the budget → windows per layer-major batch (kld.zig:115) | dev | help, quality-kld | keep |
 | `kld`: `--imatrix-windows` | all → layer-major imatrix covers the first n windows (kld.zig:116) | dev | help, engine-expert-streaming | keep |
@@ -165,8 +154,6 @@ Delete the flag, its parse arm, its help line and the code only its off arm reac
   - `--no-tool-autocorrect`: kill switch of the schema-coercion default, no test, no measurement.
 - **Speculation**
   - `--no-mtp-lookup`: kill switch of an adopted default; a bench that wants one arm per boot needs an env knob, not a flag.
-  - `--pld`: the default; it only changes the reported source label.
-  - `--pld-draft-len`, `--pld-key-len`: never measured, undocumented; the single test checks they reach the request defaults and would go with them.
 - **Prefix cache**
   - `--ssm-checkpoint-max`: the byte budget already bounds the cache; the two scripts pass the default `16`.
 
@@ -180,7 +167,7 @@ Landed; their rows are gone from the tables above. A removed flag now fails as `
 | `--no-safety` | nothing; it was accepted and ignored |
 | `--warmup-eager`, `--no-warmup-eager` | the boot warmup always runs; test boots no longer shorten it |
 | `--kv-attn-mode` | `auto` is the server default; the per-request `kv_attn_mode` field and the `SUSHI_KV_ATTN_*` env vars stay |
-| `--decode-attn-quant` | the default; `--no-decode-attn-quant` stays, and the "explicit" accessor nothing read is gone |
+| `--decode-attn-quant`, `--no-decode-attn-quant` | nothing: the whole int8 requantization of dense attention at decode is gone; it only engaged on the BF16 source checkpoint, which made the KLD teacher lossy |
 | `--mtp-depth` | `--mtp-min-depth` / `--mtp-max-depth`; the tombstone message is gone |
 | `--mtp-history-window` | full head history (the old default 0); the windowing code is gone |
 | `--draft-block-size` | the machine's automatic block cap (`dflash.blockCapForMachine`) alone |
@@ -190,26 +177,22 @@ Landed; their rows are gone from the tables above. A removed flag now fails as `
 | `--hf-overrides` | `--config-overrides` (the same arm) |
 | `--mtp-cascade` | `--mtp-tokenv3` (the same arm) |
 | `--no-prefix-cache-ram` | `--prefix-cache-mem off` (or `0`); the last `--prefix-cache-mem` on the line wins, where the old flag won in either order |
+| `--fast` | the flags it set: `--mtp`, `--mtp-typical 0.2`, `--mtp-greedy-tail`, `--kv-quant 8`; the `fast` source label and preset are gone |
+| `--pld`, `--no-pld`, `--pld-draft-len`, `--pld-key-len` | nothing: standalone prompt lookup decoding, its request field `enable_pld` and `/props settings.pld` are gone; MTP's and GLM DFlash2's own lookups stay (`--no-mtp-lookup`) |
+| `--ssm-checkpoint-stride` | a fixed 256 (`server.SSM_CHECKPOINT_STRIDE_DEFAULT`); only tests move it |
+| `--expert-cache-gb` (also `kld`) | `--ssd-budget-gb`; the BF16-source streaming test passes it |
+| `--embedding-max-length` | the model's window |
+| `--logit-bias-file` | request `logit_bias`; the `logit_bias_file` key in `model-settings.json` stays (a settings twin, left alone) |
 
 ## Owner calls
 
 What would decide each.
 
-- `--embedding-max-length`: whether any deployment lowers the embedding ceiling below the model's window. No test, no doc, no script passes it; the 400-on-overflow behavior at the window is the default. Cut if nobody does.
-- `--expert-cache-gb` (and `kld --expert-cache-gb`): whether any run needs a cache size apart from the total budget. One test (a BF16 source checkpoint at 60 GB) uses it; if `--ssd-budget-gb` can state that run, merge into `--ssd-budget-gb`.
-- `--no-decode-attn-quant`: boot each served pack and read `[decode-attn-quant] engaged` or `/props settings.decode_attn_quant`. The code says a fully quantized pack decodes the same with or without it and the default-on characterization was on an arch this tree no longer serves. If no served pack engages, cut it; if one does, keep this as the exactness switch and measure its KLD against dense decode.
 - `--mtp-tokenv3`: a same-boot 16x512 sampled A/B, two seeds, exact against typical against TokenV3 (tok/s and emitted-text NLL, as `engine-mtp` records for typical). None is recorded; it was ported with the upstream verifiers. Cut if it does not beat typical.
-- `--fast`: the cause of the sampled looping seen under typical acceptance. If typical is the cause, drop `--fast` or its typical part; if not, keep the preset as the one-flag speed profile. Either way the README and cards recommend neither today.
 - `--max-mtp-ctx`: whether the adaptive speculate-or-serial vote (on by default) already switches MTP off at the contexts a ceiling would, on the M1/M2/M5 long-context ladders. Run `--max-mtp-ctx n` against the default with the vote on; cut if the vote covers every chip.
-- `--no-pld`: whether standalone PLD ever engages and wins on a served configuration (GLM with `--no-drafter`, a streamed pack with MTP off). Never on Qwen. If it never wins, remove standalone PLD and its request field with it; if it does, keep `--no-pld` as the off switch only.
-- `--ssm-checkpoint-stride`: warm-reuse hit rate and checkpoint bytes at strides 128, 256 and 1024 on a multi-turn agent trace. None is recorded, and on MoE targets the stride is raised to the prefill chunk anyway. Cut if the default wins everywhere.
-- `--logit-bias-file`: whether any user or agent ships a bias file. It is marked experimental in `--help` and requests already carry `logit_bias`; cut if there is no user.
 
 ## Help and parse mismatches
 
-- **Parsed, absent from `--help`:** `--drafter`, `--no-drafter` (both in `docs/usage.md`), `--max-concurrent`; `kld --no-mtp` (only `--mtp` is listed); `update --relaunch` is internal on purpose. `kld --model`, `--prompts`, `--out` and `--fixture` appear in its usage lines but not its options block.
-- **In `--help`, not parsed:** none. The text-scan hits `--prompt` and `--no-mtp-lookup` are parsed through helpers (`isPromptFlag`, `isNoMtpLookupFlag`).
-- **Stale text:** `--mtp` and `--no-mtp` say "both served models" and there are three, GLM's head staying off. The `launch` line in `--help` lists agents without `grok`, which `AgentKind.names` and the error text include; `docs/usage.md` omits `zcode`.
-- **Silent value fallbacks**, where the serve loop otherwise exits naming the flag: `--prefix-cache-entries` bad value becomes 1, `--ssm-checkpoint-stride` 128 (help and the server default say 256), `--ssm-checkpoint-max` 16, `--max-concurrent` 1, `--max-resident-models` 3, `--idle-evict-secs` off; `--log-level` and `--prefill-chunk` ignore an unknown or zero value.
-- **Silent extra arguments:** `sushi pull <model> --anything` and `sushi list --anything` ignore what follows, where the serve loop exits with `unrecognized argument`.
-- **Accepted, no effect in the mode:** `--tool` under `serve` (it only gates the REPL and conflicts with `-p`); `--stream` without `--prompt`.
+Every flag the parsers accept is in `--help` (the subcommand's for `kld`, `update`, `launch`), except `update --relaunch`, which the updater passes to itself to restart the server and which is internal on purpose (a comment in `update.zig` says so). `kld` keeps its value flags in one table (`kld.value_flags`) that a unit test checks against its usage text; `main.zig` parses with an if-chain, so its help is checked by reading, not by a test.
+
+A bad value for a numeric launch flag, an unknown `--log-level`, and `--tool` outside `sushi run` or `--stream` without `--prompt` exit with an error naming the flag and the value, before any model loads. `sushi pull` and `sushi list` reject extra arguments.

@@ -23,7 +23,7 @@ pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
         return false;
     }
     if (cfg.quant_bits != 0 or
-        opts.tokens == 0 or opts.ssd_budget_bytes == 0 or opts.expert_cache_bytes != 0 or opts.pick_tolerance != 0 or
+        opts.tokens == 0 or opts.ssd_budget_bytes == 0 or opts.pick_tolerance != 0 or
         !opts.no_template or opts.enable_mtp or
         opts.kv_quant_config.scheme != .off or opts.wired_margin_bytes != 0)
         return error.NativeGlmTeacherRequiresLosslessStreaming;
@@ -895,9 +895,9 @@ test "GLM native KLD capture rejects lossy options" {
     opts.enable_mtp = true;
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
     opts.enable_mtp = false;
-    opts.expert_cache_bytes = 1;
+    opts.pick_tolerance = 0.3;
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
-    opts.expert_cache_bytes = 0;
+    opts.pick_tolerance = 0;
     opts.kv_quant_config = @import("transformer.zig").KVQuantConfig.affine(8);
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
     opts.command = .compare;

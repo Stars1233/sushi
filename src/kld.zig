@@ -38,7 +38,6 @@ pub const Options = struct {
     /// `--qwen-gdn fp32`: store the teacher's GDN state in f32 so its KLD sees
     /// the rounding every bf16 student pays.
     qwen_gdn_fp32: bool = false,
-    expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     pick_tolerance: f32 = 0,
     wired_margin_bytes: u64 = 0,
@@ -86,7 +85,6 @@ const ValueFlag = enum {
     kv_quant,
     qwen_gdn,
     ssd_budget_gb,
-    expert_cache_gb,
     expert_pick_tolerance,
     wired_margin_gib,
     batch_windows,
@@ -168,7 +166,6 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .kv_quant => o.kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
                 .qwen_gdn => o.qwen_gdn_fp32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
-                .expert_cache_gb => o.expert_cache_bytes = server_mod.parseExpertCacheGb(v) catch return error.BadFlagValue,
                 .expert_pick_tolerance => o.pick_tolerance = expert_stream_mod.parsePickTolerance(v) catch return error.BadFlagValue,
                 .wired_margin_gib => o.wired_margin_bytes = server_mod.parseWiredMarginGib(v) catch return error.BadFlagValue,
                 .batch_windows => o.batch_windows = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
@@ -226,7 +223,6 @@ pub const USAGE =
     \\                      it. GLM's KDA state is f32 already and refuses the
     \\                      flag; a GLM pack has no GDN arm.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
-    \\  --expert-cache-gb <n> streamed expert cache size (GB), outranks --ssd-budget-gb
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
@@ -904,11 +900,10 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
     if (expert_stream_mod.expertStreamingEngaged(
         self.config.supportsExpertStreaming(),
         self.config.expertStreamingRequired(),
-        opts.expert_cache_bytes,
         kld_budget.bytes,
     )) {
         const budget = kld_budget;
-        if (opts.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
+        if (budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = model_settings_mod.MtpChoice.resolve(model_settings_mod.launchFlag(bool, opts.enable_mtp, opts.mtp_explicit), self.config.mtp_override, false);
         switch (expert_stream_mod.mtpUnderStreaming(mtp.on, mtp.source == .model_settings, mtp.source == .default, false)) {
             .keep, .refuse => {
@@ -921,7 +916,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
             },
             .drop_default, .off => {},
         }
-        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, opts.expert_cache_bytes, budget.bytes, false);
+        const plan = try scheduler_mod.planExpertStreaming(io, allocator, &self.config, opts.model_dir, budget.bytes, false);
         scheduler_mod.applyStreamingPlan(&self.config, plan, budget.bytes);
         if (self.config.expert_source_dir == null) self.config.expert_source_dir = try allocator.dupe(u8, opts.model_dir);
         log.info("[kld] expert streaming: cache {d:.2} GB, {d} slots/layer\n", .{
@@ -1954,8 +1949,6 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
         "8",
         "--ssd-budget-gb",
         "94",
-        "--expert-cache-gb",
-        "40",
         "--no-mtp",
     });
     try testing.expectEqual(Command.capture, capture.command);
@@ -1970,7 +1963,6 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(@as(u32, 8192), capture.ctx_size);
     try testing.expectEqual(@as(u8, 8), capture.kv_quant_config.bits);
     try testing.expectEqual(@as(u64, 94) << 30, capture.ssd_budget_bytes);
-    try testing.expectEqual(@as(u64, 40) * 1_000_000_000, capture.expert_cache_bytes);
     try testing.expect(!capture.enable_mtp);
 
     const compare = try parseArgs(&.{ "compare", "--model", "/models/pack", "--fixture", "/fixtures/teacher", "--json", "/tmp/out.json" });

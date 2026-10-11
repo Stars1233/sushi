@@ -27,7 +27,7 @@ fi
 ARTIFACTS="${PENALTY_TEST_OUTPUT_DIR:-$(mktemp -d)}"
 mkdir -p "$ARTIFACTS"
 LOG="$ARTIFACTS/server.log"
-"$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 \
+"$BIN" --model "$MODEL" --serve --port "$PORT" --no-drafter --prefix-cache-entries 0 \
     --ctx-size 8192 --max-concurrent 4 --log-level info >"$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null' EXIT

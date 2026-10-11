@@ -2,7 +2,7 @@
 . "$(dirname "$0")/private_cache.sh"
 # Agent-loop cross-mode regression test for spec-decode.
 #
-# A single long-running server with `--pld` (and `--drafter` when the target
+# A single long-running server (with `--drafter` when the target
 # is a Gemma 4 checkpoint) is driven through a 6-turn synthetic conversation
 # that exercises every spec-decode mode transition the real agent harness
 # triggers:
@@ -90,7 +90,7 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
 fi
 
 LOGFILE=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --pld "${DRAFTER_ARGS[@]}" > "$LOGFILE" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" "${DRAFTER_ARGS[@]}" > "$LOGFILE" 2>&1 &
 SERVER_PID=$!
 cleanup() {
     kill $SERVER_PID 2>/dev/null || true

@@ -10,10 +10,16 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Cleanup**: `SUSHI_GDN_PIPELINED` is removed; the software-pipelined GDN prefill kernel is always the route of Flash-Next on NAX GPUs.
 - **Cleanup**: `SUSHI_SSD_WRITE_THROUGH` is removed; the prefill write-through to the SSD prefix cache is always on when its gates pass, and behaviour is unchanged.
 - **Cleanup**: `SUSHI_FUSED_256` is removed; the fused head-dim-256 prefill attention is always on, and output is unchanged.
+- **Flags**: `--fast` is removed; pass the flags it set (`--mtp`, `--mtp-typical`, `--mtp-greedy-tail`, `--kv-quant 8`) yourself.
+- **Flags**: standalone prompt lookup decoding is removed with `--pld`, `--no-pld`, `--pld-draft-len` and `--pld-key-len`, the request field `enable_pld` and `/props settings.pld`; the prompt lookups inside MTP rounds and GLM DFlash2 stay (`--no-mtp-lookup`).
+- **Flags**: `--ssm-checkpoint-stride` is removed; the stride is fixed at the 256 tokens the help always named (a bad value used to become 128).
+- **Flags**: `--expert-cache-gb` is removed (also on `sushi kld`); `--ssd-budget-gb` sizes the expert cache.
+- **Flags**: `--embedding-max-length` is removed; `/v1/embeddings` accepts inputs up to the model's window.
+- **Flags**: `--logit-bias-file` is removed; requests carry `logit_bias`, and the `logit_bias_file` model setting stays.
 - **Flags**: `--no-safety` is removed (it had no effect).
 - **Flags**: `--warmup-eager` and `--no-warmup-eager` are removed; the boot warmup always runs.
 - **Flags**: `--kv-attn-mode` is removed; `auto` is always the server default and a request's `kv_attn_mode` field still forces `dense` or `fused`.
-- **Flags**: `--decode-attn-quant` is removed (it is the default); `--no-decode-attn-quant` still turns it off.
+- **Flags**: `--decode-attn-quant` and `--no-decode-attn-quant` are removed with the decode-time int8 requantization of dense attention, which only engaged on the BF16 source checkpoint and made that teacher lossy.
 - **Flags**: `--mtp-depth` (already rejected with a message naming `--mtp-min-depth` and `--mtp-max-depth`) is removed; it now fails as an unknown flag.
 - **Flags**: `--mtp-history-window` is removed; the MTP head always sees the full prompt history.
 - **Flags**: `--draft-block-size` is removed; the DFlash assistant's block is always capped by the machine automatically.
@@ -26,7 +32,6 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Cleanup**: `SUSHI_NO_UPDATE_CHECK` is removed; use `--no-update-check`.
 - **Cleanup**: `SUSHI_CACHE_LIMIT`, `SUSHI_WIRED` and `SUSHI_WIRED_SLACK_MB` are removed; the MLX buffer-pool cap is always RAM/16 clamped to 2..8 GB and the wired limit is always the recommended working set.
 - **Cleanup**: opt-in experiments that never shipped are removed with their environment switches: the DFlash width chooser and draft-only head, sampled DFlash drafts, periodic MTP re-entry, batched Qwen4 MTP rounds, fused QKV, the pruned lm_head, batched MoE decode, the paired gate/up and crossrow verify kernels, the fused add+RMSNorm lever and the compiled whole-forward.
-- **Cleanup**: `--decode-attn-quant` side copies are always INT8 group-32; the NVFP4 tail and `SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM` are removed.
 - **Cleanup**: the `--dspark` flag is removed; it only set an environment variable that nothing read.
 - **Cleanup**: the speculation env switches and sweep knobs (MTP planner, drafting and DFlash gates) are removed; default behaviour is unchanged.
 - **Cleanup**: the env switches for adopted MoE, verify-qmm, prefix-cache, prefill-chunk and load behaviour are removed; default arms are unchanged.

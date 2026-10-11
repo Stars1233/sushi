@@ -51,7 +51,7 @@ kill "$PID"
 wait "$PID" 2>/dev/null || true
 PID=
 HOME="$OUT/home" "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-    --ssd-budget-gb "$BUDGET" --no-mtp --no-pld --no-vision --kv-quant off \
+    --ssd-budget-gb "$BUDGET" --no-mtp --no-vision --kv-quant off \
     --ctx-size 4096 --prefill-chunk 512 --prefix-cache-entries 0 --metrics \
     --log-file "$OUT/server.log" >"$OUT/console.log" 2>&1 &
 PID=$!

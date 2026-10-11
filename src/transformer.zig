@@ -14448,14 +14448,6 @@ pub const Transformer = struct {
     /// kernel (built once — an eps array per layer per token is exactly the
     /// per-call allocation this fusion exists to remove).
     rms_eps_arr: mlx.mlx_array = .{ .ctx = null },
-    /// Decode-only INT8 side copies of dense (bf16/f16) attention projection
-    /// weights, keyed by the source weight's ctx pointer (mlxfast native-affine
-    /// class). null value = probed and ineligible, don't re-probe. Built
-    /// lazily on the first [1,1,·] decode dispatch; prefill and every
-    /// multi-token forward keep the authoritative dense weight.
-    attn_dq: std.AutoHashMapUnmanaged(usize, ?AttnDqCopy) = .empty,
-    /// `weightsHaveDenseAttnProj` at load: false = decode-attn-quant never engages.
-    dense_attn_proj: bool = false,
     /// Reserved-token suppression mask (`[vocab]` bool, true = never
     /// sample), built once at load by `server`'s install step from the
     /// tokenizer's `special: true` set minus template-emitted markers and
@@ -14969,7 +14961,6 @@ pub const Transformer = struct {
             .cache = cache,
             .s = s,
             .allocator = allocator,
-            .dense_attn_proj = attnProjRouted(&config, moe_layers != null or qwen4_state != null) and weightsHaveDenseAttnProj(weights),
             .emb_w = emb_w,
             .emb_s = emb_s_arr,
             .emb_b = emb_b_arr,
@@ -15238,15 +15229,6 @@ pub const Transformer = struct {
         _ = mlx.mlx_array_free(self.half);
         _ = mlx.mlx_array_free(self.one);
         if (self.rms_eps_arr.ctx != null) _ = mlx.mlx_array_free(self.rms_eps_arr);
-        {
-            var it = self.attn_dq.valueIterator();
-            while (it.next()) |maybe| if (maybe.*) |copy| {
-                _ = mlx.mlx_array_free(copy.w);
-                _ = mlx.mlx_array_free(copy.s);
-                if (copy.b.ctx != null) _ = mlx.mlx_array_free(copy.b);
-            };
-            self.attn_dq.deinit(self.allocator);
-        }
         for (&self.qk_angle_cache) |*slot| {
             if (slot.arr.ctx != null) _ = mlx.mlx_array_free(slot.arr);
         }
@@ -18219,57 +18201,6 @@ pub const Transformer = struct {
         slot.rows = rows;
         return slot.arr;
     }
-
-    /// Int8-g32 side copy for a dense attention weight, built on first decode
-    /// use and cached by the weight's ctx pointer (an ineligible weight caches
-    /// its refusal so the probe runs once).
-    fn attnDqFor(self: *Transformer, w: mlx.mlx_array, sc: mlx.mlx_array) !?AttnDqCopy {
-        const key = @intFromPtr(w.ctx orelse return null);
-        if (self.attn_dq.get(key)) |slot| return slot;
-        const wsh = mlx.getShape(w);
-        if (!decodeAttnQuantEligible(wsh, mlx.mlx_array_dtype(w), sc.ctx != null)) {
-            try self.attn_dq.put(self.allocator, key, null);
-            log.debug("[decode-attn-quant] declined a projection: shape/dtype ineligible\n", .{});
-            return null;
-        }
-        const copy = (try buildAttnDqCopy(self.s, w)) orelse {
-            try self.attn_dq.put(self.allocator, key, null);
-            return null;
-        };
-        try self.attn_dq.put(self.allocator, key, copy);
-        if (!attn_dq_engaged) {
-            attn_dq_engaged = true;
-            log.info("[decode-attn-quant] engaged: dense attention projections -> int8 g32 side copies (decode-only, lossy; --no-decode-attn-quant restores dense)\n", .{});
-        }
-        return copy;
-    }
-
-    /// Attention projection with the decode-only requant fast path.
-    /// `decode_shape` is the caller's `batch == 1 and !is_prefill` — serial
-    /// decode AND spec-verify forwards route here (a verify that read dense
-    /// weights would score drafts against a different distribution than the
-    /// decode steps produced them from, making PLD-on vs PLD-off diverge at
-    /// temp 0); prefill and batched forwards keep the dense weight.
-    pub inline fn attnProj(self: *Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, decode_shape: bool) !mlx.mlx_array {
-        if (decode_shape and sc.ctx == null and decodeAttnQuantEnabled()) {
-            // A build failure falls back to the dense weight, never errors the
-            // request out.
-            if (self.attnDqFor(w, sc) catch null) |dq| {
-                return qmatmulBits(x, dq.w, dq.s, dq.b, dq.bits, dq.group_size, dq.mode, self.s);
-            }
-        }
-        return self.qmatmul(x, w, sc, bi);
-    }
-
-
-
-
-
-
-
-
-
-
 
     pub const GdnVerifyInputs = struct {
         qkv: mlx.mlx_array = .{},
@@ -22788,90 +22719,12 @@ fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp: Qua
         gate_qp.mode == up_qp.mode;
 }
 
-// ── Decode-only dense-attention requant (mlxfast native-affine class) ──
-//
-// A dense bf16/f16 attention projection reads its whole weight per decode
-// token at the DRAM wall; on Laguna (bf16 attention over nvfp4 experts) the
-// four projections are ~3 GB/token of a ~4 GB/token read. An INT8 group-32
-// affine side copy halves that traffic. LOSSY BY DESIGN — a real
-// requantization of weights the checkpoint ships dense, so this is a
-// user-facing toggle (--no-decode-attn-quant / app Settings), never a sanctioned
-// bit-identical class. Prefill, spec-verify and every other multi-token
-// forward keep the authoritative dense weight (a quality anchor: KV built by
-// prefill stays exact; only decode-step projections carry the perturbation).
-const AttnDqCopy = struct {
-    w: mlx.mlx_array, // packed codes, [out, in*bits/32] u32
-    s: mlx.mlx_array,
-    b: mlx.mlx_array, // null-ctx for nvfp4 (no biases by construction)
-    // The dispatch reads the copy's OWN geometry — a tail layer's nvfp4 copy
-    // and an early layer's int8 copy ride the same qmatmulBits call.
-    bits: u32 = 8,
-    group_size: u32 = 32,
-    mode: QuantMode = .affine,
-};
-
 const QkAngleSlot = struct {
     offset: c_int = -1,
     rd: c_int = 0,
     rows: c_int = 0,
     arr: mlx.mlx_array = .{ .ctx = null },
 };
-
-var attn_dq_engaged: bool = false;
-/// Set by the CLI (`--no-decode-attn-quant`) before any load; a transformer-level global so every serve path (headless
-/// included — the runHeadlessServe flag-eater class) sees one value.
-pub var decode_attn_quant_flag: ?bool = null;
-pub var decode_attn_quant_override: ?bool = null; // test seam
-var decode_attn_quant_cached: ?bool = null;
-
-/// Default ON (2026-07-29 characterization on Laguna XS: decode forward
-/// 13.285 -> 10.205 ms median, 3/3 paired boots both orders; greedy outputs
-/// across six code/reasoning prompts reached identical answers with
-/// wording-level divergence only). Flip together with the mirrored Swift
-/// `ServerOptions` default.
-pub const DECODE_ATTN_QUANT_DEFAULT = true;
-
-pub fn decodeAttnQuantEnabled() bool {
-    if (decode_attn_quant_override) |v| return v;
-    if (decode_attn_quant_cached) |v| return v;
-    const enabled = decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
-    decode_attn_quant_cached = enabled;
-    return enabled;
-}
-
-/// `attnProj` is reached only from the MoE/qwen4 forward, and not by its MLA or Gemma 4 arms.
-fn attnProjRouted(config: *const ModelConfig, moe_forward: bool) bool {
-    return moe_forward and !config.isMla() and !config.isGemma4Layers();
-}
-
-/// Whether decode-attn-quant has anything to requantize: a text-trunk attention
-/// projection shipped dense. Fully quantized packs decode exactly as without it.
-pub fn weightsHaveDenseAttnProj(weights: *const Weights) bool {
-    const projs = [_][]const u8{ ".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".o_proj.weight", ".q_k_v_proj.weight", ".wq_du.weight", ".wk_dv.weight", ".wv_dv.weight", ".wo_ud.weight", ".wr_du.weight" };
-    var it = weights.map.iterator();
-    while (it.next()) |e| {
-        const name = e.key_ptr.*;
-        if (std.mem.indexOf(u8, name, "attn") == null) continue;
-        if (std.mem.indexOf(u8, name, "vision") != null or std.mem.indexOf(u8, name, "visual") != null or std.mem.indexOf(u8, name, "audio") != null) continue;
-        for (projs) |suffix| {
-            if (!std.mem.endsWith(u8, name, suffix)) continue;
-            var buf: [512]u8 = undefined;
-            const scales = std.fmt.bufPrint(&buf, "{s}.scales", .{name[0 .. name.len - ".weight".len]}) catch break;
-            if (decodeAttnQuantEligible(mlx.getShape(e.value_ptr.*), mlx.mlx_array_dtype(e.value_ptr.*), weights.map.contains(scales))) return true;
-        }
-    }
-    return false;
-}
-
-/// Whether a loaded dense projection weight (pre-transposed [in, out]) can
-/// carry an INT8-g32 side copy. The conditions are the quantized dispatch's
-/// own: dense, a float dtype the requant helps, 2-D, in-dim in whole groups.
-fn decodeAttnQuantEligible(w_shape: []const c_int, dtype: mlx.mlx_dtype, has_scales: bool) bool {
-    if (has_scales) return false; // already quantized
-    if (dtype != .bfloat16 and dtype != .float16) return false;
-    if (w_shape.len != 2) return false;
-    return @rem(w_shape[0], 32) == 0;
-}
 
 // ── Fused decode QK-norm+RoPE (mlxfast 9e06de6 class) ──
 //
@@ -23859,47 +23712,6 @@ pub fn fusedQkNormRope256(
         log.info("[attn] fused QK-norm+RoPE (hd-256) engaged: hq={d} hk={d} S={d} rd={d}\n", .{ hq, hk, seq, rd });
     }
     return .{ oq, ok };
-}
-
-/// Quantize a dense pre-transposed [in, out] weight into an INT8-g32 affine
-/// side copy ([out, in] packed — served by `mlx_quantized_matmul` with
-/// transpose=true, same as any checkpoint-quantized linear). Materialized
-/// eagerly so the build never rides a token's graph.
-fn buildAttnDqCopy(s: mlx.mlx_stream, w: mlx.mlx_array) !?AttnDqCopy {
-    var wt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wt);
-    const perm = [_]c_int{ 1, 0 };
-    try mlx.check(mlx.mlx_transpose_axes(&wt, w, &perm, 2, s));
-    var wt_c = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wt_c);
-    try mlx.check(mlx.mlx_contiguous(&wt_c, wt, false, s));
-    var parts = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(parts);
-    try mlx.check(mlx.mlx_quantize(
-        &parts,
-        wt_c,
-        mlx.mlx_optional_int.some(32),
-        mlx.mlx_optional_int.some(8),
-        "affine",
-        .{ .ctx = null },
-        s,
-    ));
-    if (mlx.mlx_vector_array_size(parts) != 3) return null;
-    var copy = AttnDqCopy{
-        .w = mlx.mlx_array_new(),
-        .s = mlx.mlx_array_new(),
-        .b = mlx.mlx_array_new(),
-        .bits = 8,
-        .group_size = 32,
-        .mode = .affine,
-    };
-    try mlx.check(mlx.mlx_vector_array_get(&copy.w, parts, 0));
-    try mlx.check(mlx.mlx_vector_array_get(&copy.s, parts, 1));
-    try mlx.check(mlx.mlx_vector_array_get(&copy.b, parts, 2));
-    _ = mlx.mlx_array_eval(copy.w);
-    _ = mlx.mlx_array_eval(copy.s);
-    _ = mlx.mlx_array_eval(copy.b);
-    return copy;
 }
 
 /// `[n, 1, vocab]` bf16 rows holding each shortlist's exact logits at its ids and -inf elsewhere, so
@@ -44469,91 +44281,6 @@ test "dtypeTraceArm latches one trace per forward path" {
     try std.testing.expect(!mlx.dtypeTraceArm("moe"));
 }
 
-test "decode-attn-quant: eligibility is the dispatch's own conditions" {
-    const t = std.testing;
-    // Laguna o_proj shape, loaded pre-transposed [in, out].
-    try t.expect(decodeAttnQuantEligible(&.{ 8192, 2048 }, .bfloat16, false));
-    try t.expect(decodeAttnQuantEligible(&.{ 2048, 8192 }, .float16, false));
-    // Already quantized: the side copy would be a re-quantization of a
-    // requantization — decline.
-    try t.expect(!decodeAttnQuantEligible(&.{ 8192, 2048 }, .bfloat16, true));
-    // f32 dense weights stay put (VAE-class tensors; never attention).
-    try t.expect(!decodeAttnQuantEligible(&.{ 8192, 2048 }, .float32, false));
-    // Partial trailing group / non-matrix shapes decline.
-    try t.expect(!decodeAttnQuantEligible(&.{ 8190, 2048 }, .bfloat16, false));
-    try t.expect(!decodeAttnQuantEligible(&.{8192}, .bfloat16, false));
-}
-
-test "decode-attn-quant: ships ON (measured); the override seam reaches the gate" {
-    const t = std.testing;
-    // The shipped default is a single constant the Swift ServerOptions default
-    // mirrors — flip both together.
-    try t.expect(DECODE_ATTN_QUANT_DEFAULT == true);
-    decode_attn_quant_override = false;
-    defer decode_attn_quant_override = null;
-    try t.expect(!decodeAttnQuantEnabled());
-}
-
-test "decode-attn-quant: only the launch flag decides, never the environment" {
-    const t = std.testing;
-    const saved_flag = decode_attn_quant_flag;
-    defer {
-        decode_attn_quant_flag = saved_flag;
-        decode_attn_quant_cached = null;
-    }
-    _ = setenv("SUSHI_DECODE_ATTN_QUANT", "0", 1);
-    defer _ = unsetenv("SUSHI_DECODE_ATTN_QUANT");
-    decode_attn_quant_flag = null;
-    decode_attn_quant_cached = null;
-    try t.expect(decodeAttnQuantEnabled());
-    decode_attn_quant_flag = false;
-    decode_attn_quant_cached = null;
-    try t.expect(!decodeAttnQuantEnabled());
-    _ = setenv("SUSHI_DECODE_ATTN_QUANT", "1", 1);
-    decode_attn_quant_cached = null;
-    try t.expect(!decodeAttnQuantEnabled());
-}
-
-test "decode-attn-quant: int8 side copy tracks the dense projection (and is honestly lossy)" {
-    const s = mlx.gpuStream();
-    var prng = std.Random.DefaultPrng.init(0xDA9);
-    const rnd = prng.random();
-
-    // Dense pre-transposed [in, out] = [256, 192], decode row x = [1, 1, 256].
-    const w_shape = [_]c_int{ 256, 192 };
-    const w = try attn256RandBf16(rnd, &w_shape, s);
-    defer _ = mlx.mlx_array_free(w);
-    const x_shape = [_]c_int{ 1, 1, 256 };
-    const x = try attn256RandBf16(rnd, &x_shape, s);
-    defer _ = mlx.mlx_array_free(x);
-
-    var dense = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(dense);
-    try mlx.check(mlx.mlx_matmul(&dense, x, w, s));
-
-    const copy = (try buildAttnDqCopy(s, w)) orelse return error.SideCopyDeclined;
-    defer {
-        _ = mlx.mlx_array_free(copy.w);
-        _ = mlx.mlx_array_free(copy.s);
-        _ = mlx.mlx_array_free(copy.b);
-    }
-    try std.testing.expectEqual(@as(u32, 8), copy.bits);
-    try std.testing.expectEqual(@as(u32, 32), copy.group_size);
-    try std.testing.expect(copy.mode == QuantMode.affine);
-    const quant = try qmatmulBits(x, copy.w, copy.s, copy.b, copy.bits, copy.group_size, copy.mode, s);
-    defer _ = mlx.mlx_array_free(quant);
-
-    // A transposed or mis-grouped side copy produces garbage at ~output
-    // magnitude; int8-g32 error on a 256-wide dot is a couple of percent.
-    // |dense| here is ~4 (256 uniform(-.5,.5) products), so the band is a
-    // loose lossy band that still fails loudly on orientation bugs.
-    const max_diff = try attn256MaxDiff(dense, quant, s);
-    try std.testing.expect(max_diff < 0.15);
-    // And it must actually be the quantized path: bit-identical output
-    // would mean the hook silently dispatched the dense weight.
-    try std.testing.expect(max_diff > 0.0);
-}
-
 test "moe down+reduce fused: no worse than gatherQmv + multiply + sum vs fp32 truth (nvfp4 + affine)" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xD09E);
@@ -53690,41 +53417,6 @@ test "hc prefill: incompatible read writes immediately" {
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(h, expected, s));
         }
     }
-}
-
-test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text attention projection" {
-    const allocator = std.testing.allocator;
-    const s = mlx.gpuStream();
-    const put = struct {
-        fn add(w: *Weights, name: []const u8, dtype: mlx.mlx_dtype, st: mlx.mlx_stream) !void {
-            const shape = [_]c_int{ 64, 64 };
-            var arr = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_zeros(&arr, &shape, 2, dtype, st));
-            try w.map.put(try w.allocator.dupe(u8, name), arr);
-        }
-    }.add;
-
-    var quantized = Weights.init(allocator);
-    defer quantized.deinit();
-    try put(&quantized, "model.layers.0.self_attn.q_proj.weight", .uint32, s);
-    try put(&quantized, "model.layers.0.self_attn.q_proj.scales", .bfloat16, s);
-    try put(&quantized, "vision_tower.layers.0.self_attn.q_proj.weight", .bfloat16, s);
-    try std.testing.expect(!weightsHaveDenseAttnProj(&quantized));
-
-    var dense = Weights.init(allocator);
-    defer dense.deinit();
-    try put(&dense, "model.layers.3.self_attn.o_proj.weight", .bfloat16, s);
-    try std.testing.expect(weightsHaveDenseAttnProj(&dense));
-
-    try std.testing.expect(attnProjRouted(&.{ .model_type = "laguna" }, true));
-    try std.testing.expect(!attnProjRouted(&.{ .model_type = "llama" }, false));
-    try std.testing.expect(!attnProjRouted(&.{ .model_type = "gemma4" }, true));
-    try std.testing.expect(!attnProjRouted(&.{ .model_type = "bailing_hybrid", .mla_kv_lora_rank = 512 }, true));
-
-    var inkling = Weights.init(allocator);
-    defer inkling.deinit();
-    try put(&inkling, "model.layers.0.attn.wo_ud.weight", .bfloat16, s);
-    try std.testing.expect(weightsHaveDenseAttnProj(&inkling));
 }
 
 fn seBf16(bits: u16) f32 {

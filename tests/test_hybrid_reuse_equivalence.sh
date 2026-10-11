@@ -44,7 +44,7 @@ SERVER_PID=""   # seeded: the EXIT trap runs on the SKIP path too, before any se
 trap 'kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG"; true' EXIT
 
 "$BIN" --model "$MODEL" --serve --port "$PORT" --ctx-size 8192 \
-    --prefix-cache-entries 4 --ssm-checkpoint-stride 128 \
+    --prefix-cache-entries 4 \
     --log-level warn > "$LOG" 2>&1 &
 SERVER_PID=$!
 

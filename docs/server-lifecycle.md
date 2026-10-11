@@ -14,7 +14,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
 - `pull` takes top-level files, `mtp/` and GLM's `GLM-5.3-Flash-DFlash2/` assistant (the loader auto-detects that folder; a
   pull that skips it serves GLM with DFlash2 off, logged as `[glm-dflash] off: no assistant found`).
-- Headless and `--model` boots build their `ServerConfig` defaults from one `LaunchServe` (sampling, PLD,
+- Headless and `--model` boots build their `ServerConfig` defaults from one `LaunchServe` (sampling,
   context, timeout): a flag one mode parses and the other drops is the class. `--no-drafter`/`--drafter` reach both too.
 - **The embedded REPL uses in-process HTTP**: never fork `curl` from the resident engine for readiness checks or chat
   turns. Test `run` on a real TTY; a serving-only smoke test does not exercise its client.
@@ -71,7 +71,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   off|low|medium|xhigh, MiMo off or any level as on; `/think` alike); another word fails with the accepted list and a
   nonzero exit. Omission keeps the model default, one-shot and REPL alike. A model loaded on demand takes the word where it can, else keeps its own
   default ([server-http-apis](server-http-apis.md)).
-- `--fast`, MTP/KV settings, context, timeout, reasoning budgets, and sampling flags follow the serving policy, including
+- MTP/KV settings, context, timeout, reasoning budgets, and sampling flags follow the serving policy, including
   model-settings precedence. One-shot sampling retains its defaults: 100 output tokens, temperature 0, top-p 1, top-k 0.
 - `--stream` flushes the same reply incrementally; otherwise it buffers until success. Stdout contains only the reply,
   with reasoning in `<think>` tags; diagnostics go to stderr. HTTP/decode errors and incomplete streams exit nonzero.
@@ -117,25 +117,18 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 
 - **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`model_settings.pick`;
   `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`, `--mtp-typical/--mtp-tokenv3`,
-  `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`, `--think-penalty`, `--logit-bias-file`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
+  `--mtp-greedy-tail`, `--ssd-budget-gb`, `--preserve-thinking`, `--think-penalty`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
   `model-settings.json` key ([engine-mtp](engine-mtp.md#depth-range)).
 - **`--no-mtp-lookup` is launch-only too** (no `model-settings.json` key): it turns off the prompt-lookup drafts in MTP
-  rounds (Qwen, MiMo) and GLM DFlash2's lookup chains. Standalone PLD keeps `--pld`/`--no-pld`; neither implies the other.
-- **`--fast` is a flag profile, ranked between the flags and the file**: an explicit flag > `--fast` >
-  `model-settings.json` > the default, per key (`model_settings.pickLaunch`; the one table is
-  `model_settings.fast_preset`: MTP, typical acceptance, greedy tail, kv8). Its values report source `--fast` in the
-  load lines, `/props` and the boot line `[args] fast: ...`. It asks only for what applies: an SSD-streamed load drops
-  its MTP (`[mtp] off: unsupported under streaming (--fast)`, `MtpChoice.streamed`), where an explicit `--mtp` refuses (a Sushi EXL3 Qwen pack keeps its head instead).
+  rounds (Qwen, MiMo) and GLM DFlash2's lookup chains.
 - A flag that shapes a LOAD is retained on the Scheduler with its `*_explicit` bit (`ensureLoaded`'s cold-load
   `LoadRequest` is a SECOND site); read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. Each load logs its
   resolved value and source (`[kv-cache] kv8 (source); ctx N (source)`, `[mtp] on|off (source)`; `/props
   settings.mtp.source`). Guard: `tests/test_cold_load_launch_flags.sh`, `tests/test_model_settings.sh`.
 - MTP's default is ON for `qwen4_exp` and `mimo_v2` (GLM's MTP stays off; source `default`; `/props settings.mtp.default_on` true); the flag and
   the file can only turn it off, or on for an SSD-streamed pack.
-- `[pld] on|off (source)` and `/props settings.pld` report what a slot runs (`server.pldReport`): a module-wired arch
-  (qwen4_exp) reads `off (module spec wiring)` whatever `--pld` says, since `scheduler.specInitWiring` never runs it.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
   `mtp`, `mtp_acceptance`, `mtp_greedy_tail`, `ssd_budget_gb`, `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as

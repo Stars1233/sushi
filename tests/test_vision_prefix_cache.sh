@@ -25,7 +25,7 @@ pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level debug \
   --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefill-chunk 1024 \
-  --ssm-checkpoint-stride 1024 --ssm-checkpoint-max 8 > "$LOG" 2>&1 &
+  --ssm-checkpoint-max 8 > "$LOG" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 U="http://127.0.0.1:$PORT"

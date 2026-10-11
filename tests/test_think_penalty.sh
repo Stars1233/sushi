@@ -28,7 +28,7 @@ trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; wait 2>/dev/null' 
 start_server() { # $1 = arm name, $2 = extra flags
     LOG="$ARTIFACTS/server-$1.log"
     # shellcheck disable=SC2086
-    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --prefix-cache-entries 0 \
+    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-drafter --prefix-cache-entries 0 \
         --ctx-size 16384 --think-penalty "$LAMBDA" --log-level info $2 >"$LOG" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 400); do

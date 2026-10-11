@@ -51,8 +51,8 @@ body:
     id: model
     attributes:
       label: Model
-      description: Exact HF repo + quant, and any spec settings (MTP / PLD / drafter / kv-quant)
-      placeholder: "ddalcu/Qwen3.8-27B-MLX-Serve-8bit, MTP depth 6, PLD on"
+      description: Exact HF repo + quant, and any spec settings (MTP / drafter / kv-quant)
+      placeholder: "ddalcu/Qwen3.8-27B-MLX-Serve-8bit, MTP depth 6"
   - type: textarea
     id: what
     attributes:

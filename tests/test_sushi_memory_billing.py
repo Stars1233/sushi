@@ -63,7 +63,7 @@ def main():
         log_path = args.output / f"{label}.log"
         command = [str(binary), "serve", "--host", "127.0.0.1", "--port", str(run_port),
                    "--ctx-size", str(context), "--prefill-chunk", "512" if context < 1_000_000 else "2048",
-                   "--max-tokens", "8", "--prefix-cache-entries", "0", "--no-pld", "--no-drafter"]
+                   "--max-tokens", "8", "--prefix-cache-entries", "0", "--no-drafter"]
         command += ["--model", str(model)] if model else ["--model-dir", str(args.models)]
         command += list(flags)
         subprocess.run([str(lock), "acquire", owner], check=True)

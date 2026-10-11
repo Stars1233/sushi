@@ -151,11 +151,11 @@ pub fn mtpRefusal(expert_streaming: bool, mtp_requested: bool, head_loaded: bool
 }
 
 /// PURE: does this load stream its routed experts? A checkpoint with no resident
-/// arm always does; a capable one only when a cache or an SSD budget was asked for,
-/// so a quantized pack with neither loads resident.
-pub fn expertStreamingEngaged(capable: bool, required: bool, explicit_cache_bytes: u64, budget_bytes: u64) bool {
+/// arm always does; a capable one only when an SSD budget was asked for,
+/// so a quantized pack without one loads resident.
+pub fn expertStreamingEngaged(capable: bool, required: bool, budget_bytes: u64) bool {
     if (!capable) return false;
-    return required or explicit_cache_bytes > 0 or budget_bytes > 0;
+    return required or budget_bytes > 0;
 }
 
 pub const BudgetLedger = struct {
@@ -169,10 +169,6 @@ pub const BudgetLedger = struct {
     cache_bytes: u64,
     slots_per_layer: u16,
 };
-
-pub fn budgetOverriddenByExplicitCache(explicit_cache_bytes: u64, budget_bytes: u64) bool {
-    return explicit_cache_bytes > 0 and budget_bytes > 0;
-}
 
 /// The budget is the TOTAL resident target (GiB, the `--ssd-budget-gb` unit); the expert
 /// cache is what remains after trunk, MTP, the vision tower with its encode reserve, the
@@ -1961,14 +1957,13 @@ test "expert stream refuses MTP by name, at load and at request parse" {
 
 test "a capable checkpoint streams only when it must or when a budget was asked for" {
     const t = std.testing;
-    try t.expect(!expertStreamingEngaged(false, false, 0, 0));
-    try t.expect(!expertStreamingEngaged(false, true, 0, 60 << 30));
+    try t.expect(!expertStreamingEngaged(false, false, 0));
+    try t.expect(!expertStreamingEngaged(false, true, 60 << 30));
     // The dense HF checkpoint cannot load resident: it streams with no budget.
-    try t.expect(expertStreamingEngaged(true, true, 0, 0));
-    // A quantized pack with neither flag loads resident.
-    try t.expect(!expertStreamingEngaged(true, false, 0, 0));
-    try t.expect(expertStreamingEngaged(true, false, 0, 50 << 30));
-    try t.expect(expertStreamingEngaged(true, false, 60_000_000_000, 0));
+    try t.expect(expertStreamingEngaged(true, true, 0));
+    // A quantized pack with no budget loads resident.
+    try t.expect(!expertStreamingEngaged(true, false, 0));
+    try t.expect(expertStreamingEngaged(true, false, 50 << 30));
 }
 
 test "expert stream ssd budget ledger derives the cache and refuses by name" {
@@ -2002,10 +1997,6 @@ test "expert stream ssd budget ledger derives the cache and refuses by name" {
     const two = try budgetLedger(fixed + 2 * per_slot, trunk, 0, 0, 48, 512, 10, expert_bytes, bounce);
     try t.expectEqual(@as(u16, 2), two.slots_per_layer);
     try t.expectError(error.SsdBudgetBelowResident, budgetLedger(fixed + 2 * per_slot, trunk, 0, 1, 48, 512, 10, expert_bytes, bounce));
-
-    try t.expect(!budgetOverriddenByExplicitCache(0, 100 * GiB));
-    try t.expect(!budgetOverriddenByExplicitCache(60_000_000_000, 0));
-    try t.expect(budgetOverriddenByExplicitCache(60_000_000_000, 100 * GiB));
 }
 
 test "expert stream prefill peak bill covers a 501 expert union and k127 cache layer" {

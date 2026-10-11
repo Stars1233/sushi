@@ -9,7 +9,7 @@ const log = @import("log.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 
 /// Where a load's value for one key came from. A request's own field outranks all of them.
-pub const Source = enum { flag, fast, model_settings, default };
+pub const Source = enum { flag, model_settings, default };
 
 pub fn Pick(comptime T: type) type {
     return struct { value: T, source: Source };
@@ -25,7 +25,6 @@ pub fn pick(comptime T: type, flag: ?T, setting: ?T, default: T) Pick(T) {
 pub fn sourceLabel(source: Source, flag_name: []const u8) []const u8 {
     return switch (source) {
         .flag => flag_name,
-        .fast => "--fast",
         .model_settings => "model-settings.json",
         .default => "default",
     };
@@ -37,31 +36,12 @@ pub var preserve_thinking_flag: ?bool = null;
 
 /// `--think-penalty <lambda>`; null = not given. A request's `think_penalty` outranks it.
 pub var think_penalty_flag: ?f32 = null;
-pub var logit_bias_file_flag: ?[]const u8 = null;
 /// The largest think penalty any source may set, in logits.
 pub const think_penalty_max: f32 = 20;
 
 /// A launch value counts as a flag only when the operator passed it.
 pub fn launchFlag(comptime T: type, value: T, explicit: bool) ?T {
     return if (explicit) value else null;
-}
-
-/// What `--fast` turns on, as launch values; null = not part of it. A key takes part only where
-/// its resolver reads it through `pickLaunch`.
-pub const fast_preset: Override = .{
-    .mtp = true,
-    .mtp_acceptance = .{ .typical = .{ .delta = 0.2 } },
-    .mtp_greedy_tail = true,
-    .kv_quant = kv_quant.KVQuantConfig.affine(8),
-};
-
-/// `--fast` was given.
-pub var fast = false;
-
-/// `pick` for a key `--fast` may set: an explicit flag > `--fast` > model-settings.json > the default.
-pub fn pickLaunch(comptime T: type, comptime key: std.meta.FieldEnum(Override), flag: ?T, setting: ?T, default: T) Pick(T) {
-    if (flag == null and fast) if (@field(fast_preset, @tagName(key))) |v| return .{ .value = v, .source = .fast };
-    return pick(T, flag, setting, default);
 }
 
 /// The manual context: `--ctx-size` > `ctx_size` > auto. 0 = auto, i.e. not given, on both sides.
@@ -75,7 +55,7 @@ pub const MtpChoice = struct {
     source: Source,
 
     pub fn resolve(flag: ?bool, setting: ?bool, default: bool) MtpChoice {
-        const p = pickLaunch(bool, .mtp, flag, setting, default);
+        const p = pick(bool, flag, setting, default);
         return .{ .on = p.value, .source = p.source };
     }
 
@@ -91,11 +71,6 @@ pub const MtpChoice = struct {
 
     pub fn sourceName(self: MtpChoice) []const u8 {
         return sourceLabel(self.source, if (self.on) "--mtp" else "--no-mtp");
-    }
-
-    /// The choice for a load that streams its experts: `--fast` asks only for what applies, and MTP does not.
-    pub fn streamed(self: MtpChoice) MtpChoice {
-        return if (self.source == .fast) .{ .on = false, .source = .fast } else self;
     }
 };
 
@@ -390,32 +365,6 @@ test "an explicit --mtp-typical / --mtp-tokenv3 outranks the per-model mtp_accep
     const engine = pick(Mode, null, null, .exact);
     try t.expect(engine.value == .exact);
     try t.expectEqual(Source.default, engine.source);
-}
-
-test "pickLaunch: an explicit flag > --fast > model-settings.json > the default" {
-    const t = std.testing;
-    const saved = fast;
-    defer fast = saved;
-    const tail = fast_preset.mtp_greedy_tail.?;
-    fast = false;
-    try t.expectEqual(pick(bool, null, !tail, false), pickLaunch(bool, .mtp_greedy_tail, null, !tail, false));
-    fast = true;
-    try t.expectEqual(Pick(bool){ .value = tail, .source = .fast }, pickLaunch(bool, .mtp_greedy_tail, null, !tail, false));
-    try t.expectEqual(Pick(bool){ .value = tail, .source = .fast }, pickLaunch(bool, .mtp_greedy_tail, null, null, !tail));
-    try t.expectEqual(Pick(bool){ .value = !tail, .source = .flag }, pickLaunch(bool, .mtp_greedy_tail, !tail, tail, tail));
-    const m = MtpChoice.resolve(null, !fast_preset.mtp.?, true);
-    try t.expectEqualStrings("--fast", m.sourceName());
-    try t.expect(m.forced());
-}
-
-test "a streamed load drops only the MTP --fast asked for" {
-    const t = std.testing;
-    const dropped = (MtpChoice{ .on = true, .source = .fast }).streamed();
-    try t.expect(!dropped.on);
-    try t.expectEqualStrings("--fast", dropped.sourceName());
-    for ([_]Source{ .flag, .model_settings, .default }) |source| {
-        try t.expectEqual(MtpChoice{ .on = true, .source = source }, (MtpChoice{ .on = true, .source = source }).streamed());
-    }
 }
 
 test "model_settings: think_penalty is a non-negative number, anything else is unset" {

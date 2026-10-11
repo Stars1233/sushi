@@ -2,9 +2,7 @@
 . "$(dirname "$0")/private_cache.sh"
 # Tool-call boundary safety test for spec-decode.
 #
-# Send a streaming chat completion with `tools` AND `enable_pld:true`.
-# The auto-disable for tools should kick in (server log:
-# `pld=disabled (tools present)` or equivalent), and the streamed tool-call
+# Send a streaming chat completion with `tools`. The streamed tool-call
 # arguments must be valid JSON when concatenated, with no spec-drafted token
 # leakage (which would manifest as duplicate brace pairs, repeated keys, or
 # spurious tokens).
@@ -64,7 +62,7 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
 fi
 
 LOGFILE=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --pld "${DRAFTER_ARGS[@]}" --log-level info > "$LOGFILE" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" "${DRAFTER_ARGS[@]}" --log-level info > "$LOGFILE" 2>&1 &
 SERVER_PID=$!
 cleanup() {
     kill $SERVER_PID 2>/dev/null || true
@@ -221,9 +219,9 @@ except Exception as e:
     return 0
 }
 
-# ── Test A: streaming + tools + enable_pld:true ──
-echo "--- Test A: stream + tools + enable_pld:true ---"
-run_stream_toolcall "A pld+tools+stream" '{"enable_pld": true}' || true
+# ── Test A: streaming + tools ──
+echo "--- Test A: stream + tools ---"
+run_stream_toolcall "A tools+stream" '{}' || true
 echo
 
 # ── Test B: streaming + tools + enable_drafter:true (only when drafter loaded) ──

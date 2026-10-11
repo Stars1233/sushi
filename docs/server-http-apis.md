@@ -139,8 +139,7 @@ before reading a completed stream and requires clean EOF.
 
 ## Experimental logit bias
 
-`--logit-bias-file <path>` loads a JSON or CSV file at model load; the launch flag overrides the per-model
-`logit_bias_file` setting. The default is off. Each entry names exactly one `id`, exact vocabulary `token` string,
+The per-model `logit_bias_file` setting in `model-settings.json` loads a JSON or CSV file at model load. The default is off. Each entry names exactly one `id`, exact vocabulary `token` string,
 or `word`; words expand to single-token lower/capital spellings with and without a leading space. Split spellings
 are skipped and counted in the load log.
 
@@ -167,7 +166,7 @@ out-of-range biases return 400; `null` and `[]` mean no bias. `think_penalty: 0`
 Overlapping entries add. Sampling uses shifted logits; returned logprobs remain raw.
 
 Scoped vectors are prepared once per request on the inference thread. Active biases use the full target vocabulary
-head, including positive rewards. Serial, MTP, PLD and prompt-lookup rows apply the same prefix-dependent shifts;
+head, including positive rewards. Serial, MTP and prompt-lookup rows apply the same prefix-dependent shifts;
 streaming and non-streaming preserve the same generated tokens. Existing non-stream-only repetition-tail trimming
 can still shorten displayed loop-stop replies; `SUSHI_LOOP_TRIM=0` disables that presentation step for strict byte
 comparisons while retaining loop detection. The unchanged `--think-penalty` preset remains off by default.

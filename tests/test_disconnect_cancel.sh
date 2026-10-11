@@ -56,7 +56,7 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
 fi
 # Cancellation takes effect at a chunk boundary; auto-sized chunks can exceed
 # the entire 12s bound under GPU contention. Pin the workload, not a looser deadline.
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 32768 --prefill-chunk 512 --no-pld --metrics --log-level debug > "$LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 32768 --prefill-chunk 512 --metrics --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 

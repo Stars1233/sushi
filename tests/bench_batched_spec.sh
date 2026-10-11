@@ -9,7 +9,7 @@ MODEL="${BENCH_MODEL:?set BENCH_MODEL}"
 PORT=${1:-18820}; MAXTOK=${2:-256}; BASE="http://127.0.0.1:$PORT"
 BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"
 LOG=$(mktemp)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld ${SPEC_FLAGS:---mtp} --max-concurrent 4 --prefix-cache-entries 0 > "$LOG" 2>&1 &
+"$BINARY" --model "$MODEL" --serve --port "$PORT" ${SPEC_FLAGS:---mtp} --max-concurrent 4 --prefix-cache-entries 0 > "$LOG" 2>&1 &
 PID=$!; trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -f "$LOG"' EXIT
 for i in $(seq 1 120); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
 grep -E "Concurrency:|MTP|mtp" "$LOG" | head -3

@@ -85,7 +85,7 @@ pub const KVQuantConfig = struct {
     }
 };
 
-/// The KV scheme a load stores at, with its provenance: `--kv-quant` > `--fast` > per-model setting >
+/// The KV scheme a load stores at, with its provenance: `--kv-quant` > per-model setting >
 /// `KVQuantConfig.engine_default`. `launch` is the flag's value, or the default when unflagged.
 /// A request's own `kv_quant` outranks all of them.
 pub const KvCacheChoice = struct {
@@ -93,7 +93,7 @@ pub const KvCacheChoice = struct {
     source: model_settings.Source,
 
     pub fn resolve(setting: ?KVQuantConfig, launch: KVQuantConfig, launch_explicit: bool) KvCacheChoice {
-        const p = model_settings.pickLaunch(KVQuantConfig, .kv_quant, model_settings.launchFlag(KVQuantConfig, launch, launch_explicit), setting, launch);
+        const p = model_settings.pick(KVQuantConfig, model_settings.launchFlag(KVQuantConfig, launch, launch_explicit), setting, launch);
         return .{ .config = p.value, .source = p.source };
     }
 

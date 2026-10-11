@@ -35,9 +35,13 @@ start_server() {
     local arm="$1"
     local flag=--mtp
     [ "$arm" = serial ] && flag=--no-mtp
-    local bias_flags=(--think-penalty 1 --logit-bias-file "$ARTIFACTS/bias.$FORMAT")
-    [ "${LOGIT_BIAS_DISABLED:-0}" = 1 ] && bias_flags=(--think-penalty 0 --logit-bias-file "$ARTIFACTS/empty.json")
-    "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter \
+    local bias_flags=(--think-penalty 1) bias_file="$ARTIFACTS/bias.$FORMAT"
+    [ "${LOGIT_BIAS_DISABLED:-0}" = 1 ] && bias_flags=(--think-penalty 0) && bias_file="$ARTIFACTS/empty.json"
+    # The bias file is the model's `logit_bias_file` setting, read from a private HOME.
+    mkdir -p "$ARTIFACTS/home/.sushi"
+    python3 -c 'import json, sys; print(json.dumps({sys.argv[1]: {"logit_bias_file": sys.argv[2]}}))' "$MODEL" "$bias_file" \
+        >"$ARTIFACTS/home/.sushi/model-settings.json"
+    HOME="$ARTIFACTS/home" "$BIN" --model "$MODEL" --serve --port "$PORT" --no-drafter \
         --prefix-cache-entries 0 --ctx-size 16384 --log-level info "$flag" "${bias_flags[@]}" \
         >"$ARTIFACTS/server-$arm.log" 2>&1 &
     SERVER_PID=$!

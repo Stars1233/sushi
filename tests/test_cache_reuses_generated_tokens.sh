@@ -50,7 +50,7 @@ fi
 LOG=$(mktemp)
 echo "Starting sushi on port $PORT (log: $LOG)..."
 # `--log-level info` so the [cache] reusing line is captured (debug is too noisy).
-./zig-out/bin/sushi --model "$MODEL" --serve --port "$PORT" --no-pld \
+./zig-out/bin/sushi --model "$MODEL" --serve --port "$PORT" \
     --log-level info > "$LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -f "$LOG"' EXIT

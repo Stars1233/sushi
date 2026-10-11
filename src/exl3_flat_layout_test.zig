@@ -361,9 +361,8 @@ test "EXL3 streaming CPU config engages only with a budget and refuses MTP" {
     };
     try std.testing.expect(cfg.supportsExpertStreaming());
     try std.testing.expect(!cfg.expertStreamingRequired());
-    try std.testing.expect(!stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 0, 0));
-    try std.testing.expect(stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 0, 20 << 30));
-    try std.testing.expect(stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 1 << 30, 0));
+    try std.testing.expect(!stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 0));
+    try std.testing.expect(stream.expertStreamingEngaged(cfg.supportsExpertStreaming(), cfg.expertStreamingRequired(), 20 << 30));
     try std.testing.expect(stream.mtpRefusal(true, true, false) != null);
     try std.testing.expectEqual(stream.MtpUnderStreaming.keep, stream.mtpUnderStreaming(true, false, false, true));
 }

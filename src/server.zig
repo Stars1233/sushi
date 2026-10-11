@@ -23,7 +23,6 @@ const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
 const responses_mod = @import("responses.zig");
-const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const kv_disk_writer = @import("kv_disk_writer.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -483,36 +482,6 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
-/// Adaptive spec-decode gate threshold. Per-request, we score the prompt's
-/// 3-gram repetition density; if `score < spec_gate_threshold` AND the user
-/// did not explicitly set the flag, PLD/drafter are disabled for this request.
-///
-/// Empirically tuned (Qwen3.5 BPE, 24-300 token prompts):
-///   - "creative story" / "write an essay" prompts:                    0.000
-///   - 82-token echo-heavy code rename:                                0.013
-///   - 155-token JS-translation w/ many `add/sub/mul/div` repetitions: 0.128
-/// The plan started from 0.15 but BPE tokenization fragments echo-heavy
-/// content enough that even strong echo cases land in the 0.01–0.10 range.
-/// 0.01 cleanly separates "any repetition at all" (PLD likely helps) from
-/// "pure novel" (PLD overhead-only). Re-tune by sweeping `enable_pld` on/off
-/// across an echo-heavy vs novel-content prompt set and picking the threshold
-/// that maximizes (echo_speedup / novel_overhead).
-const spec_gate_threshold: f32 = 0.01;
-
-/// MTP-vs-PLD coexistence routing. When a model has BOTH a trained MTP head and
-/// PLD available for a request, the DEFAULT is the MTP head — it holds ~93%+
-/// per-draft on novel AND echo content and never risks PLD's runtime acceptance
-/// gate degrading to plain decode. Only a DOMINANT-echo prompt (score >= this)
-/// is handed to PLD, whose long n-gram drafts then reliably emit more tokens per
-/// verify forward than the depth-1 head.
-///
-/// The bar is deliberately high. Measured Qwen3.6-27B 4-bit: at ngram-score
-/// 0.055 PLD is a coin flip — a long whole-file reproduction sustains ~4.3
-/// accepted/round (48 tok/s) but a shorter one collapses below the 50% runtime
-/// gate and falls back to plain decode (~29 tok/s, WORSE than the head's 40).
-/// The score is computed on the PROMPT and can't see which way the GENERATION
-/// will go, so anything below a clearly-dominant-echo score routes to the robust
-/// head (40-42 tok/s, reliable). User `enable_mtp` in the body overrides.
 
 // Plan 05: drafter state moved to `LoadedModel` (per-model `drafter`,
 // `drafter_block_size`, `drafter_path`). The previous module-level
@@ -588,14 +557,6 @@ pub const ServerConfig = struct {
     /// Default reasoning budget in tokens (-1 = unlimited).
     /// `--reasoning-budget N`. Per-request body fields override.
     default_reasoning_budget: i32 = -1,
-    /// Default PLD enabled state. Per-request `enable_pld` JSON overrides.
-    default_enable_pld: bool = false,
-    /// Whether `default_enable_pld` came from `--pld`/`--no-pld` (`pldReport`).
-    pld_explicit: bool = true,
-    /// Maximum draft tokens proposed per PLD step.
-    default_pld_draft_len: u32 = 5,
-    /// N-gram match key length for PLD.
-    default_pld_key_len: u32 = 3,
     /// docs/kv-quant-perf.md Phase 2: how quantized-KV requests READ the
     /// cache at decode. The per-request `kv_attn_mode` body field
     /// ("dense"/"fused") outranks it. Only takes
@@ -657,22 +618,6 @@ fn mtpHeadDefaultOn(config: *const model_mod.ModelConfig) bool {
     const choice = mtpChoiceFor(config);
     if (choice.forced()) return true;
     return choice.on and model_mod.isServedArch(config.model_type) and (!config.expert_streaming or config.stream_mtp_head);
-}
-
-const PldReport = struct { on: bool, source: []const u8 };
-
-/// `lm` null = no model known yet: the flag or the engine default alone.
-fn pldReportFor(lm: ?*LoadedModel) PldReport {
-    const t = if (lm) |m| m.transformer else null;
-    return pldReport(server_config.default_enable_pld, server_config.pld_explicit, if (t) |x| x.moduleSpecWiring() else false);
-}
-
-/// What a slot runs when a request leaves out `enable_pld`, and why, as the load line and `/props` name it.
-fn pldReport(enable: bool, explicit: bool, module_spec: bool) PldReport {
-    // `scheduler.specInitWiring` never runs PLD on a module-wired arch (qwen4_exp), flag or not.
-    if (module_spec) return .{ .on = false, .source = "module spec wiring" };
-    const choice = model_settings.pick(bool, model_settings.launchFlag(bool, enable, explicit), null, true);
-    return .{ .on = choice.value, .source = model_settings.sourceLabel(choice.source, if (choice.value) "--pld" else "--no-pld") };
 }
 
 /// Explicit launch choice, available to memory bills before Scheduler.init returns.
@@ -1163,9 +1108,10 @@ fn diskBytesFor(config: *const model_mod.ModelConfig) u64 {
 /// `generate.effectiveSsmCheckpointStride`), so MoE prefill is never
 /// over-chunked at any prompt length while non-MoE keeps the fine stride.
 /// The always-on end-of-prompt snapshot preserves append-growth multi-turn
-/// reuse for MoE regardless. Raise this (e.g. 512/1024) to also coarsen the
-/// non-MoE path; set 0 to disable (hybrid models then bypass the hot cache).
-pub var ssm_checkpoint_stride: u32 = 256;
+/// reuse for MoE regardless. 0 disables (hybrid models then bypass the hot cache);
+/// only tests move it off the default.
+pub const SSM_CHECKPOINT_STRIDE_DEFAULT: u32 = 256;
+pub var ssm_checkpoint_stride: u32 = SSM_CHECKPOINT_STRIDE_DEFAULT;
 
 /// Phase 1: cap on the number of checkpoints retained per request. Snapshots
 /// past this drop the oldest (front of list) to keep memory bounded on very
@@ -1185,87 +1131,6 @@ test "effectiveSsmCheckpointStride: zero capacity disables both tiers, RAM-off p
     try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, false, 4 << 30));
     try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 32, false, 0));
     try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32, true, 0));
-}
-
-/// PLD request defaults carried as ONE value, so a `ServerConfig` builder
-/// cannot thread the enable bit and forget the two lengths beside it.
-///
-/// That is exactly how this broke: `runHeadlessServe` hand-rolled all three
-/// as `false`/`5`/`3` literals, so no `--pld*` flag reached a headless
-/// request. Threading `enable` alone fixed a third of it and left
-/// `--pld-draft-len` / `--pld-key-len` silently dropped — and headless is
-/// the mode the Swift app ALWAYS launches (`--serve --model-dir`, no
-/// `--model`), passing all three flags on every boot. Single chokepoint for
-/// every ServerConfig builder; `effectiveSsmCheckpointStride` above plays
-/// the same role for LoadParams.
-///
-/// Serve paths whose decode never routes through the PLD-capable generator
-/// take `.off`: the field is dead weight there,
-/// and saying so once beats five hand-written `false`s that read like a
-/// decision but drift like a typo.
-pub const PldDefaults = struct {
-    enable: bool,
-    draft_len: u32,
-    key_len: u32,
-    /// Whether `enable` came from `--pld`/`--no-pld` rather than the engine default.
-    explicit: bool = true,
-
-    /// Embedded-engine and media-gen serve paths — PLD is unreachable.
-    pub const off: PldDefaults = .{ .enable = false, .draft_len = 5, .key_len = 3 };
-
-    /// Text-gen serve paths: the CLI's values verbatim, no reinterpretation.
-    /// `--no-pld` arrives as `enable == false` and the lengths ride along
-    /// unused, so flipping PLD back on later cannot resurrect stale numbers.
-    pub fn fromCli(enable: bool, draft_len: u32, key_len: u32) PldDefaults {
-        return .{ .enable = enable, .draft_len = draft_len, .key_len = key_len };
-    }
-};
-
-test "PldDefaults: CLI lengths survive alongside the enable bit" {
-    // The regression: `enable` reached headless while the lengths stayed at
-    // the 5/3 literals. All three travel together or the class is back.
-    const cli = PldDefaults.fromCli(true, 8, 4);
-    try std.testing.expect(cli.enable);
-    try std.testing.expectEqual(@as(u32, 8), cli.draft_len);
-    try std.testing.expectEqual(@as(u32, 4), cli.key_len);
-
-    // --no-pld carries its lengths unchanged rather than snapping to defaults.
-    const disabled = PldDefaults.fromCli(false, 8, 4);
-    try std.testing.expect(!disabled.enable);
-    try std.testing.expectEqual(@as(u32, 8), disabled.draft_len);
-
-    // The non-text serve paths stay pinned to the historical literals.
-    try std.testing.expect(!PldDefaults.off.enable);
-    try std.testing.expectEqual(@as(u32, 5), PldDefaults.off.draft_len);
-    try std.testing.expectEqual(@as(u32, 3), PldDefaults.off.key_len);
-}
-
-test "PLD reports what a slot runs: the engine default, --pld, --no-pld, or off on a module-wired arch" {
-    const t = std.testing;
-    const dflt = pldReport(true, false, false);
-    try t.expect(dflt.on);
-    try t.expectEqualStrings("default", dflt.source);
-    try t.expectEqualStrings("--pld", pldReport(true, true, false).source);
-    const off = pldReport(false, true, false);
-    try t.expect(!off.on);
-    try t.expectEqualStrings("--no-pld", off.source);
-    const module = pldReport(true, true, true);
-    try t.expect(!module.on);
-    try t.expectEqualStrings("module spec wiring", module.source);
-}
-
-test "PldDefaults: ServerConfig built from it reports the CLI values" {
-    // Pins the wiring, not just the struct: a ServerConfig fed from
-    // `fromCli` must expose the CLI numbers on the exact fields every
-    // request path and the boot banner read.
-    const cfg = ServerConfig{
-        .default_enable_pld = PldDefaults.fromCli(true, 8, 4).enable,
-        .default_pld_draft_len = PldDefaults.fromCli(true, 8, 4).draft_len,
-        .default_pld_key_len = PldDefaults.fromCli(true, 8, 4).key_len,
-    };
-    try std.testing.expect(cfg.default_enable_pld);
-    try std.testing.expectEqual(@as(u32, 8), cfg.default_pld_draft_len);
-    try std.testing.expectEqual(@as(u32, 4), cfg.default_pld_key_len);
 }
 
 /// LRU capacity of the per-LoadedModel chat-template tokenize cache. Small
@@ -1288,25 +1153,8 @@ pub fn parseOnOff(word: []const u8) ?bool {
 /// guard checks before enabling.
 pub var max_concurrent: u32 = 1;
 
-/// Issue #117: operator ceiling on per-input embedding length, in TOKENS.
-/// 0 = auto (bound only by the loaded model's declared context window). Set
-/// via `--embedding-max-length N`. Over-limit inputs earn a structured 400
-/// naming the input index, its token count and the effective limit — never a
-/// silent truncation (the Python-server `max_length=512` class). Applies to
-/// the embedding route (/v1/embeddings → `handleEmbeddings`).
-pub var embedding_max_length: u32 = 0;
-
-/// Effective per-input embedding token ceiling: the tighter of the operator
-/// flag and the model's declared window (0 on either side = no bound from
-/// that side; 0 result = unbounded). A flag above the model's window clamps
-/// to the window — a 512-position BERT never accepts a 4096 override.
-pub fn embedEffectiveLimit(flag: u32, model_max: u32) u32 {
-    if (flag == 0) return model_max;
-    if (model_max == 0) return flag;
-    return @min(flag, model_max);
-}
-
-/// Overflow 400 body text: names the offending input INDEX and both counts,
+/// Overflow 400 body text (an embedding input past the model's declared window;
+/// never a silent truncation, the Python-server `max_length=512` class): names the offending input INDEX and both counts,
 /// because the client can only fix what it can see (the contextOverflowMessage
 /// principle). bufPrint failure falls back to the bare sentence rather than
 /// sending no body (the media-gen fixed-buffer class).
@@ -2219,8 +2067,6 @@ pub fn serve(
     if (launchMaxTokensDefault() > 0) {
         log.info("default max_tokens for omitted requests: {d}\n", .{launchMaxTokensDefault()});
     }
-    const pld = pldReportFor(scheduler.registry.resolveEntry("") catch null);
-    log.info("[pld] {s} ({s}); draft_len={d}, key_len={d}; default for new requests\n", .{ if (pld.on) "on" else "off", pld.source, server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (scheduler.dflash != null) {
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
@@ -3051,12 +2897,6 @@ pub fn wiredLimitMbForBudget(budget_bytes: u64, kv_bytes: u64) u64 {
     return (budget_bytes +| kv_bytes +| (MB - 1)) / MB;
 }
 
-pub fn parseExpertCacheGb(raw: []const u8) error{InvalidExpertCacheGb}!u64 {
-    const gb = std.fmt.parseInt(u64, raw, 10) catch return error.InvalidExpertCacheGb;
-    if (gb == 0 or gb > 360) return error.InvalidExpertCacheGb;
-    return std.math.mul(u64, gb, 1_000_000_000) catch return error.InvalidExpertCacheGb;
-}
-
 /// `--wired-margin-gib` in bytes: what stays unplanned under a raised wired limit.
 pub var wired_limit_margin_bytes: u64 = WIRED_LIMIT_MARGIN_BYTES;
 
@@ -3157,7 +2997,7 @@ pub fn mlxCacheLimitBytes(total_ram: u64) u64 {
 /// Impure wrapper: apply the cap to the live MLX allocator. Called ONCE from
 /// `main()`, above every subcommand branch — not per serve path, because a
 /// hand-rolled per-path config is exactly how `runHeadlessServe` (the mode the
-/// app always launches) came to silently eat the `--pld*` flags.
+/// app always launches) came to silently eat launch flags.
 ///
 /// Never RAISES a tighter existing cap.
 pub fn applyMlxCacheLimit() void {
@@ -4841,13 +4681,6 @@ test "ssd budget parses GiB and admits against the wired limit" {
     try t.expect(!ssdBudgetAdmits(100 * GiB, 8 * GiB, 96 * GiB));
     try t.expectEqual(@as(u64, 110_592), wiredLimitMbForBudget(100 * GiB, 8 * GiB));
     try t.expectEqual(@as(u64, 1), wiredLimitMbForBudget(1, 0));
-}
-
-test "expert cache GB parser is decimal bounded and named" {
-    try std.testing.expectEqual(@as(u64, 60_000_000_000), try parseExpertCacheGb("60"));
-    try std.testing.expectError(error.InvalidExpertCacheGb, parseExpertCacheGb("0"));
-    try std.testing.expectError(error.InvalidExpertCacheGb, parseExpertCacheGb("361"));
-    try std.testing.expectError(error.InvalidExpertCacheGb, parseExpertCacheGb("60.5"));
 }
 
 /// A stand-in for the deployed long-context pack: qwen3_5-shaped GDN+MoE trunk with a QSA
@@ -7607,7 +7440,7 @@ fn renderModelEntry(
         // can discover the limit instead of learning it from a 400. null for
         // models with no embedding capability; 0 = embedding-capable, unbounded.
         const embed_limit_str = if (config.hasEmbeddingCapability())
-            try std.fmt.allocPrint(allocator, "{d}", .{embedEffectiveLimit(embedding_max_length, config.max_position_embeddings)})
+            try std.fmt.allocPrint(allocator, "{d}", .{config.max_position_embeddings})
         else
             try allocator.dupe(u8, "null");
         defer allocator.free(embed_limit_str);
@@ -8219,7 +8052,6 @@ const PropsSettings = struct {
     kv_quant: []const u8,
     kv_cache: transformer_mod.KvCacheChoice = .{ .config = transformer_mod.KVQuantConfig.engine_default, .source = .default },
     kv_attn_mode: KvAttnMode,
-    decode_attn_quant: bool,
     prefill_chunk: usize,
     prefill_decode_share: f32 = 0,
     mtp_loaded: bool,
@@ -8234,8 +8066,6 @@ const PropsSettings = struct {
     /// 0 = no ceiling.
     max_mtp_ctx: u32,
     drafter: []const u8,
-    pld: PldDefaults,
-    pld_source: []const u8 = "default",
     max_concurrent: u32,
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
@@ -8256,7 +8086,6 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const kv_cache = kvCacheFor(config);
     const kv = kv_cache.config;
     const acceptance = generate_mod.mtpAcceptanceFor(config.mtp_acceptance_override);
-    const pld = pldReportFor(lm);
     // This model's own tier, the four numbers from one publish.
     const disk = lm.disk_stats.snapshot();
     return .{
@@ -8264,7 +8093,6 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .kv_quant = if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_cache = kv_cache,
         .kv_attn_mode = server_config.kv_attn_mode,
-        .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
         .mtp_loaded = mtpCapable(lm),
@@ -8277,8 +8105,6 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else "none",
-        .pld = .{ .enable = pld.on, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
-        .pld_source = pld.source,
         .max_concurrent = max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_ram_enabled = prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
@@ -8304,19 +8130,17 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
     };
     var vision_buf: [160]u8 = undefined;
     const vision = try std.fmt.bufPrint(&vision_buf, "{{\"loaded\":{},\"source\":\"{s}\",\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, st.vision.source, st.vision.tower_bytes, st.vision.encode_bytes });
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"source\":\"{s}\",\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_cache\":{{\"scheme\":\"{s}\",\"source\":\"{s}\"}},\"kv_attn_mode\":\"{s}\",\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":\"{s}\",\"acceptance_source\":\"{s}\",\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"greedy_tail_source\":\"{s}\",\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_entries\":{d}}},\"vision\":{s}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                st.kv_cache.label(),
         st.kv_cache.sourceName(),                   @tagName(st.kv_attn_mode),
-        st.decode_attn_quant,                       st.prefill_chunk,
+        st.prefill_chunk,
         st.mtp_loaded,                              st.mtp_default_on,
         st.mtp_choice.sourceName(),                 st.mtp_acceptance_source,
         mtp_acceptance_mod.name(st.mtp_acceptance), param,
         st.mtp_greedy_tail.value,                   model_settings.sourceLabel(st.mtp_greedy_tail.source, "--mtp-greedy-tail"),
         st.mtp_depth,                               st.mtp_adaptive,
         st.max_mtp_ctx,                             st.drafter,
-        st.pld.enable,                              st.pld_source,
-        st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
         st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
         st.prefix_cache_disk_bytes,                 st.prefix_cache_disk_used_bytes,
@@ -8599,7 +8423,7 @@ fn handleEmbeddings(
     // Issue #117: enforce the effective per-input token ceiling BEFORE the
     // forward pass — the server owns the exact tokenizer, so the counts here
     // are authoritative. Over-limit is an explicit 400, never truncation.
-    const embed_limit = embedEffectiveLimit(embedding_max_length, config.max_position_embeddings);
+    const embed_limit = config.max_position_embeddings;
     if (embed_limit > 0) {
         for (seqs.items, 0..) |ids, idx| {
             if (ids.len > embed_limit) {
@@ -9418,39 +9242,13 @@ fn handleChatCompletions(
     const kv_quant_override = parseKvQuantOverride(root);
     const kv_attn_explicit = parseKvAttnExplicit(root);
 
-    // Parse enable_pld: per-request override of the --pld default.
-    //
-    // `pld_explicit_in_json` records whether the request body had `enable_pld`
-    // as an explicit field (vs falling back to the server default). The
-    // adaptive gate (later, after prompt is tokenized) only disables flags
-    // that came from the default — explicit user overrides are honored even
-    // on novel content.
-    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
-    // Tools do NOT disable PLD: tool-pattern detection operates on emitted
-    // text and is agnostic to how many tokens a decode step yields, and
-    // agent traffic (tool results echoed into edits) is PLD's best workload.
-    // The original blanket gate predated streaming PLD + scheduler slots;
-    // equivalence with tools is pinned by tests/test_pld_tools.sh.
-    //
-    // PLD on hybrid SSM models (LFM2.5, Nemotron-H) works once the SSM
-    // snapshot/restore paths handle null ssm_state correctly — see
-    // `ssmSnapshot`/`ssmRestore` in transformer.zig.
-    if (enable_pld) log.info("  pld=enabled (draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
-
     // Parse enable_drafter: per-request override of the --drafter default.
     // Auto-disabled when:
     //   - the server didn't load a drafter (`default_drafter == null`)
     //   - logprobs are requested (drafter doesn't expose realized log-probs)
-    //   - hybrid SSM architecture (same SSM-state issue as PLD; drafter would
-    //     hit it on the verify forward).
-    // Tools do NOT disable the drafter (same reasoning as PLD above).
-    // Priority: drafter > PLD > regular. When drafter wins, force PLD off
-    // so logs / state stay consistent.
-    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
+    //   - hybrid SSM architecture (the drafter would hit the SSM-state issue on
+    //     the verify forward).
+    // Tools do NOT disable the drafter.
     // Plan 05: per-model drafter — when a drafter is loaded for this model,
     // requests default to ON unless the target is MoE (where verify-forward
     // routing penalty overwhelms the win). Per-request `enable_drafter` JSON
@@ -9473,9 +9271,8 @@ fn handleChatCompletions(
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
     // sidecar only loads when it binds to this trunk; MoE mirrors the
-    // drafter caution). Priority DFlash > MTP > gemma drafter > PLD at
-    // dispatch (`requestSpecModes`). NOT
-    // subject to the n-gram spec gate below — the trained head holds ~73%
+    // drafter caution). Priority DFlash > MTP at
+    // dispatch (`requestSpecModes`). The trained head holds ~73%
     // per-draft acceptance even on fully novel content.
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
@@ -9492,10 +9289,6 @@ fn handleChatCompletions(
         enable_mtp = false;
     }
     if (enable_drafter) {
-        if (enable_pld) {
-            log.info("  pld=disabled (drafter takes priority for this request)\n", .{});
-            enable_pld = false;
-        }
         log.info("  drafter=enabled (block_size={d})\n", .{lm.drafter_block_size});
     }
 
@@ -9603,45 +9396,6 @@ fn handleChatCompletions(
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
-    // ── Adaptive spec-decode gating ──
-    //
-    // PLD and drafter both pay a per-step overhead (lookup + verify forward
-    // for PLD; drafter forwards + verify forward for drafter) that only pays
-    // off on echo-heavy content. On novel content, the verify forward is wasted
-    // work — the bench shows drafter at 0.55× on creative content and PLD at
-    // 0.91× on LFM2.5-350M heavy-echo. To make the default-on flip safe we
-    // gate per-request on the prompt's n-gram repetition score.
-    //
-    // Rule: if the score (= ratio of distinct 3-grams that recur in the prompt)
-    // is below `spec_gate_threshold` AND the user did not explicitly set the
-    // flag in the JSON, disable PLD/drafter for this request. Explicit user
-    // overrides are honored — if you `enable_pld:true` on novel content, you
-    // get PLD even though it's likely a perf loss; user knows best.
-    if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
-        const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0; // on error, don't gate
-        log.info("  spec-gate: ngram-score={d:.3} (threshold={d:.3})\n", .{ score, spec_gate_threshold });
-        if (score < spec_gate_threshold) {
-            if (enable_pld and !pld_explicit_in_json) {
-                log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
-                enable_pld = false;
-            }
-            // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
-            // verifies at worst), strictly better evidence than a prompt-time heuristic
-            // that cannot see output echo — and llmprobe/bench bodies cannot
-            // carry enable_drafter:true. The gemma cross-attention drafter
-            // (0.55x measured on novel) keeps the gate.
-            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
-                log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
-                enable_drafter = false;
-            }
-        }
-        // The n-gram score never routes MTP to PLD: it cannot separate output
-        // that will echo verbatim (PLD's win) from repetitive-looking agent
-        // context (where PLD flaps and runtime-disables). MTP wins whenever
-        // loaded; force PLD with enable_pld:true + enable_mtp:false.
-    }
-
     // Prompt caching: reuse KV cache for shared prefix.
     // Force invalidation when images are present — image tokens have identical IDs
     // but different vision embeddings, so prefix matching would reuse stale features.
@@ -9717,13 +9471,13 @@ fn handleChatCompletions(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9840,23 +9594,13 @@ fn handleCompletions(
         break :blk false;
     } else false;
 
-    // Spec-decode flags (mirror chat-completions). FIM / code-completion
-    // prompts are echo-heavy, so the old hardcoded enable_pld/enable_drafter
-    // = false at submit left real speedups unused on this endpoint
-    // (tests/test_completions_spec.sh).
-    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
-    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
+    // Spec-decode flags (mirror chat-completions).
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
         lm.dflash != null;
     if (enable_drafter and lm.dflash == null) enable_drafter = false;
     if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
-    if (enable_drafter and enable_pld) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     if (expert_stream_mod.mtpRefusal(config.expert_streaming, if (root.get("enable_mtp")) |v| (v == .bool and v.bool) else false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
@@ -9908,31 +9652,6 @@ fn handleCompletions(
     // Check if attention computation would exceed GPU memory.
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, false, enable_mtp)) return;
 
-    // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
-    // (low 3-gram repetition) skip PLD/drafter unless explicitly requested.
-    if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
-        const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0; // on error, don't gate
-        log.info("  spec-gate: ngram-score={d:.3} (threshold={d:.3})\n", .{ score, spec_gate_threshold });
-        if (score < spec_gate_threshold) {
-            if (enable_pld and !pld_explicit_in_json) {
-                log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
-                enable_pld = false;
-            }
-            // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
-            // verifies at worst), strictly better evidence than a prompt-time heuristic
-            // that cannot see output echo — and llmprobe/bench bodies cannot
-            // carry enable_drafter:true. The gemma cross-attention drafter
-            // (0.55x measured on novel) keeps the gate.
-            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
-                log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
-                enable_drafter = false;
-            }
-        }
-        // MTP wins whenever loaded; the n-gram score never routes it to PLD
-        // (see the chat-completions site).
-    }
-
     const eos_slice = requestEosSlice(config, root);
     var sampling = generate_mod.SamplingParams{
         .temperature = temperature,
@@ -9951,12 +9670,12 @@ fn handleCompletions(
     sampling.think_penalty.biases = request_bias;
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -9975,7 +9694,6 @@ fn handleNonStreamingCompletion(
     skip_special: bool,
     stop_sequences: []const []const u8,
     model_name: []const u8,
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
@@ -9985,16 +9703,15 @@ fn handleNonStreamingCompletion(
 ) !void {
     var timer = Stopwatch.init(stream.io);
 
-    // Spec dispatch: `requestSpecModes` (DFlash > MTP > drafter > PLD).
+    // Spec dispatch: `requestSpecModes` (DFlash > MTP).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
-    const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, null, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special });
+    var result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, null, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special });
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -10066,7 +9783,6 @@ fn handleStreamingCompletion(
     stop_sequences: []const []const u8,
     model_name: []const u8,
     include_usage: bool,
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
@@ -10078,8 +9794,7 @@ fn handleStreamingCompletion(
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
-    if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
@@ -10098,7 +9813,6 @@ fn handleStreamingCompletion(
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = getTimeoutNs(),
-        .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
@@ -10106,8 +9820,6 @@ fn handleStreamingCompletion(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .pld_draft_len = server_config.default_pld_draft_len,
-        .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
@@ -10381,7 +10093,6 @@ fn nonStreamingViaScheduler(
     cached_tokens: u32,
     has_tools: bool,
     enable_thinking: bool,
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
@@ -10411,7 +10122,6 @@ fn nonStreamingViaScheduler(
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = timeout_ns,
-        .enable_pld = enable_pld,
         .enable_drafter = enable_drafter and (lm.dflash != null),
         .dflash = if (enable_drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
@@ -10419,8 +10129,6 @@ fn nonStreamingViaScheduler(
         .enable_mtp = enable_mtp and mtpCapable(lm),
         .mtp = if (enable_mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .pld_draft_len = server_config.default_pld_draft_len,
-        .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
@@ -10611,7 +10319,6 @@ fn handleNonStreamingGeneration(
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
@@ -10634,16 +10341,15 @@ fn handleNonStreamingGeneration(
 
     var timer = Stopwatch.init(stream.io);
 
-    // Speculative-decoding dispatch (priority: drafter > PLD > regular).
+    // Speculative-decoding dispatch (priority: DFlash > MTP > regular).
     //   1. Drafter wins if loaded AND requested AND no logprobs (drafter
     //      cannot expose realized log-probs from the draft side).
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
-    const use_pld = spec.use_pld;
 
     // Transfer vision ownership into the slot via the scheduler.
     const slot_ve: ?mlx.mlx_array = blk: {
@@ -10652,7 +10358,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences });
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences });
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
@@ -10884,21 +10590,19 @@ fn handleNonStreamingGeneration(
 }
 
 /// Token-stream adapter that drives the streaming SSE state machine the same
-/// way regardless of whether speculative decoding (PLD / drafter) is on. Each
+/// way regardless of whether speculative decoding (drafter / MTP) is on. Each
 /// `next()` call yields exactly one token (or null on EOS / max_tokens), so
 /// the per-token state machine in `handleStreamingGeneration` /
 /// `handleAnthropicStreaming` / `handleResponses` does not need to know
-/// anything about multi-token batches that PLD and drafter emit per step.
+/// anything about multi-token batches that the drafter and MTP emit per step.
 ///
-/// EOS-in-batch behavior matches the non-streaming `generatePld` /
-/// `generateDrafter`: the stop token is NOT yielded — the loop just
+/// EOS-in-batch behavior: the stop token is NOT yielded — the loop just
 /// terminates. This keeps tokens leaking past EOS impossible regardless of
 /// where in an N-token batch the EOS lands.
 ///
-/// `pld_drop_buf` is a heap-owned pending buffer (PLD can yield up to
-/// `1+max_draft_len`=16 tokens per step; drafter yields up to `block_size`).
-/// Caller must `deinit`.
-const StreamMode = enum { regular, pld, drafter, mtp };
+/// `pending_buf` is a heap-owned pending buffer (the drafter yields up to
+/// `block_size` tokens per step). Caller must `deinit`.
+const StreamMode = enum { regular, drafter, mtp };
 /// Source of streamed tokens. Either a legacy Generator (single-slot mlx on
 /// the calling thread) or a Scheduler Slot (mlx on the scheduler's inference
 /// thread, this thread reads via waitNext). `next()` yields one token id at
@@ -10910,11 +10614,9 @@ const StreamingTokenStream = struct {
     gen: ?*Generator = null,
     slot: ?*scheduler_mod.Slot = null,
     mode: StreamMode,
-    pld_draft_len: u32 = 0,
-    pld_key_len: u32 = 0,
     eos_token_ids: []const u32,
     /// Pending tokens from a multi-token speculative step (legacy path only).
-    /// Drained one at a time before the next call to nextPld / nextDrafter.
+    /// Drained one at a time before the next call to nextDflash / nextMtp.
     pending_buf: std.ArrayList(u32) = .empty,
     pending_idx: usize = 0,
     finished: bool = false,
@@ -10937,19 +10639,9 @@ const StreamingTokenStream = struct {
     prefill_ns: u64 = 0,
     decode_ns: u64 = 0,
 
-    fn init(gen: *Generator, mode: StreamMode, pld_draft_len: u32, pld_key_len: u32, eos: []const u32) StreamingTokenStream {
-        return .{
-            .gen = gen,
-            .mode = mode,
-            .pld_draft_len = pld_draft_len,
-            .pld_key_len = pld_key_len,
-            .eos_token_ids = eos,
-        };
-    }
-
     /// Phase A2-streaming: build a token stream backed by a scheduler Slot.
     /// `mode` is recorded for telemetry but doesn't drive next()'s dispatch
-    /// (the scheduler's inference thread already routed PLD/drafter inside
+    /// (the scheduler's inference thread already routed drafter/MTP inside
     /// runSingleDecodeTick — this side just drains the resulting token ring).
     fn initFromSlot(slot: *scheduler_mod.Slot, mode: StreamMode, eos: []const u32) StreamingTokenStream {
         return .{
@@ -11009,7 +10701,7 @@ const StreamingTokenStream = struct {
     /// Mirrors the contract of `Generator.next` for the regular path.
     fn next(self: *StreamingTokenStream, allocator: std.mem.Allocator) !?u32 {
         // Scheduler path: drain the slot's output ring one token at a time.
-        // The inference thread already handled regular/PLD/drafter dispatch
+        // The inference thread already handled regular/drafter/MTP dispatch
         // via runSingleDecodeTick; we just consume what it pushed.
         if (self.slot) |s| {
             if (self.finished) return null;
@@ -11023,7 +10715,7 @@ const StreamingTokenStream = struct {
             }
         }
         // Drain any pending tokens from a previous speculative step FIRST,
-        // before honoring `self.finished`. The PLD/drafter branches set
+        // before honoring `self.finished`. The drafter/MTP branches set
         // `self.finished = true` mid-batch when an EOS lands at index > 0;
         // tokens *before* that EOS were pushed to pending_buf and must still
         // flush before we terminate. Skipping the drain here would silently
@@ -11046,38 +10738,6 @@ const StreamingTokenStream = struct {
         const gen = self.gen.?;
         switch (self.mode) {
             .regular => return gen.next(allocator),
-            .pld => {
-                const r = (try gen.nextPld(allocator, self.pld_draft_len, self.pld_key_len)) orelse return null;
-                defer allocator.free(r.tokens);
-                if (r.tokens.len == 0) {
-                    self.finished = true;
-                    return null;
-                }
-                // Walk tokens in order, stopping at the first EOS (and not
-                // emitting it) — matches `generatePld`.
-                var first_idx: usize = 0;
-                while (first_idx < r.tokens.len and generate_mod.isEosId(r.tokens[first_idx], self.eos_token_ids)) : (first_idx += 1) {}
-                if (first_idx >= r.tokens.len) {
-                    gen.done = true;
-                    gen.finish_reason = "stop";
-                    self.finished = true;
-                    return null;
-                }
-                const first_tok = r.tokens[first_idx];
-                // Append the remaining (non-EOS-prefixed) tokens to pending,
-                // stopping at the first EOS in the tail.
-                var i: usize = first_idx + 1;
-                while (i < r.tokens.len) : (i += 1) {
-                    if (generate_mod.isEosId(r.tokens[i], self.eos_token_ids)) {
-                        gen.done = true;
-                        gen.finish_reason = "stop";
-                        self.finished = true;
-                        break;
-                    }
-                    try self.pending_buf.append(allocator, r.tokens[i]);
-                }
-                return first_tok;
-            },
             .mtp => {
                 // Mirror the drafter branch — `nextMtp` returns the same
                 // `{tokens, accepted_tokens}` shape.
@@ -11109,7 +10769,7 @@ const StreamingTokenStream = struct {
                 return first_tok;
             },
             .drafter => {
-                // Mirror the PLD branch — `nextDflash` returns the same
+                // Mirror the MTP branch — `nextDflash` returns the same
                 // `{tokens, accepted_tokens}` shape (full accept yields
                 // `block_size` tokens, partial accept yields `1+j`). Walk the
                 // batch, stop at the first EOS, push the rest into pending.
@@ -11149,7 +10809,7 @@ const StreamingTokenStream = struct {
 /// `handleNonStreamingGeneration` so streaming and non-streaming pick the
 /// same path for the same inputs.
 ///
-/// Priority: drafter > PLD > regular (matches the non-streaming dispatch in
+/// Priority: DFlash > MTP > regular (matches the non-streaming dispatch in
 /// `handleNonStreamingGeneration`). The same per-mode disable rules (no
 /// logprobs, no grammar constraint, no hybrid SSM for drafter) apply at the
 /// request-entry parse site; `pickStreamMode` re-enforces them defensively
@@ -11167,10 +10827,10 @@ pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) 
     return has_hybrid_layers and !dflash_loaded;
 }
 
-pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
+pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool };
 
 /// The ONE request-level spec dispatch, shared by every surface x stream /
-/// non-stream. Priority: DFlash > MTP > gemma drafter > PLD, mirroring
+/// non-stream. Priority: DFlash > MTP, mirroring
 /// `scheduler.specInitWiring`. A loaded DFlash sidecar is an explicit choice
 /// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
 /// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
@@ -11179,7 +10839,6 @@ pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool
 /// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
 /// already applied at every surface's parse site.
 pub fn requestSpecModes(
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     dflash_loaded: bool,
@@ -11195,12 +10854,10 @@ pub fn requestSpecModes(
     return .{
         .use_mtp = use_mtp,
         .use_drafter = use_drafter,
-        .use_pld = !use_mtp and !use_drafter and spec_ok and enable_pld,
     };
 }
 
 fn pickStreamMode(
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     dflash_loaded: bool,
@@ -11208,35 +10865,33 @@ fn pickStreamMode(
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
-    const r = requestSpecModes(enable_pld, enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
+    const r = requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, has_constraint, logprobs_n);
     if (r.use_mtp) return .mtp;
     if (r.use_drafter) return .drafter;
-    if (r.use_pld) return .pld;
     return .regular;
 }
 
-test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head; the gemma drafter does not" {
+test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head" {
     // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
-    var r = requestSpecModes(true, true, true, true, true, false, 0);
-    try std.testing.expect(r.use_drafter and !r.use_mtp and !r.use_pld);
-    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, true, false, 0));
-    // gemma drafter + mtp -> MTP keeps its rank.
-    r = requestSpecModes(true, true, true, false, true, false, 0);
+    var r = requestSpecModes(true, true, true, true, false, 0);
+    try std.testing.expect(r.use_drafter and !r.use_mtp);
+    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, false, 0));
+    // No sidecar loaded -> MTP keeps its rank.
+    r = requestSpecModes(true, true, false, true, false, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
-    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, false, true, false, 0));
+    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, false, true, false, 0));
     // enable_drafter:false (or the parse-site hybrid veto) hands the round back to MTP.
-    r = requestSpecModes(true, false, true, true, true, false, 0);
+    r = requestSpecModes(false, true, true, true, false, 0);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
     // logprobs / grammar disable every spec mode, dflash included.
-    r = requestSpecModes(true, true, true, true, true, false, 3);
-    try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
-    r = requestSpecModes(true, true, true, true, true, true, 0);
-    try std.testing.expect(!r.use_mtp and !r.use_drafter and !r.use_pld);
-    // No sidecar loaded -> MTP; nothing loaded -> PLD.
-    r = requestSpecModes(true, true, true, false, true, false, 0);
-    try std.testing.expect(r.use_mtp and !r.use_drafter);
-    r = requestSpecModes(true, true, true, false, false, false, 0);
-    try std.testing.expect(r.use_pld and !r.use_mtp and !r.use_drafter);
+    r = requestSpecModes(true, true, true, true, false, 3);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter);
+    r = requestSpecModes(true, true, true, true, true, 0);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter);
+    // Nothing loaded -> regular decode.
+    r = requestSpecModes(true, true, false, false, false, 0);
+    try std.testing.expect(!r.use_mtp and !r.use_drafter);
+    try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, false, 0));
 }
 
 fn handleStreamingGeneration(
@@ -11261,7 +10916,6 @@ fn handleStreamingGeneration(
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
@@ -11298,13 +10952,12 @@ fn handleStreamingGeneration(
     const prompt_opened_think = promptOpensThink(allocator, tok, prompt_ids);
     const opens_think = prompt_opened_think;
 
-    // Pick the speculative-decoding mode (regular / PLD / drafter). The
+    // Pick the speculative-decoding mode (regular / drafter / MTP). The
     // per-token state machine below is driven by `StreamingTokenStream`,
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
-    if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), logprobs_n);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
@@ -11330,7 +10983,6 @@ fn handleStreamingGeneration(
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = getTimeoutNs(),
-        .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
@@ -11338,8 +10990,6 @@ fn handleStreamingGeneration(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .pld_draft_len = server_config.default_pld_draft_len,
-        .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
@@ -11450,7 +11100,7 @@ fn handleStreamingGeneration(
     var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
 
     // Generate tokens via the adapter — yields one decoded token id per call
-    // regardless of whether the underlying decode is regular, PLD, or drafter.
+    // regardless of whether the underlying decode is regular, MTP, or drafter.
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
         if (stopped) break;
@@ -13349,9 +12999,9 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.InsufficientMemory => .{ .type = "out_of_memory", .message = insufficient_free_memory_message },
         error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads qwen4_exp (Qwen3.8-Flash-Next), mimo_v2 (MiMo-V2.6-Flash), and glm5_next (GLM-5.3-Flash)." },
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (qwen4_exp or mimo_v2)." },
-        error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --expert-cache-gb or free memory." },
+        error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "The requested expert cache, full-union workspace, bounce buffers, resident trunk, and serving state do not fit under the GPU memory ceiling. Lower --ssd-budget-gb or free memory." },
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
-        error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = "This checkpoint streams its experts from SSD and needs a resident budget: set this model's \"ssd_budget_gb\" in model-settings.json, or launch with --ssd-budget-gb <n> (or --expert-cache-gb <n>)." },
+        error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = "This checkpoint streams its experts from SSD and needs a resident budget: set this model's \"ssd_budget_gb\" in model-settings.json, or launch with --ssd-budget-gb <n>." },
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards. For MiMo, repack the checkpoint first; raw per-expert HF shards cannot be streamed directly." },
         error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
         error.ExpertLayoutUnsupported => .{ .type = "expert_layout_unsupported", .message = "This checkpoint's routed experts are not a pack layout this build can load. An EXL3 pack's expert_quant names format exl3, a k, and codebook mcg or mul1; re-convert the pack." },
@@ -16107,17 +15757,7 @@ fn handleAnthropicMessages(
     const kv_quant_override = parseKvQuantOverride(root);
     const kv_attn_explicit = parseKvAttnExplicit(root);
 
-    // Per-request PLD override (mirror chat-completions behavior: tools and
-    // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
-    // runtime acceptance gate handle the rest).
-    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
-
     // Drafter: same disable rules as chat-completions parse site.
-    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
     const lm_default_enable_drafter: bool = lm.dflash != null;
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
@@ -16251,29 +15891,6 @@ fn handleAnthropicMessages(
     defer allocator.free(prompt_ids);
     enable_mtp = admitMtpForCtx(enable_mtp, prompt_ids.len);
 
-    // Adaptive spec-decode gate (Anthropic path; mirrors chat-completions).
-    if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
-        const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0;
-        if (score < spec_gate_threshold) {
-            if (enable_pld and !pld_explicit_in_json) {
-                log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
-                enable_pld = false;
-            }
-            // A DFlash drafter is exempt: its runtime yield gate disables on
-            // REALIZED acceptance after `DFLASH_GATE_WARMUP` rounds (8 wasted
-            // verifies at worst), strictly better evidence than a prompt-time heuristic
-            // that cannot see output echo — and llmprobe/bench bodies cannot
-            // carry enable_drafter:true. The gemma cross-attention drafter
-            // (0.55x measured on novel) keeps the gate.
-            if (enable_drafter and !drafter_explicit_in_json and lm.dflash == null) {
-                log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
-                enable_drafter = false;
-            }
-        }
-        // MTP wins whenever loaded; the n-gram score never routes it to PLD
-        // (see the chat-completions site).
-    }
-
     // Context size enforcement
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
@@ -16351,12 +15968,12 @@ fn handleAnthropicMessages(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -16384,7 +16001,6 @@ fn handleAnthropicNonStreaming(
     enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
@@ -16408,11 +16024,10 @@ fn handleAnthropicNonStreaming(
     var timer = Stopwatch.init(stream.io);
 
     // Speculative decoding dispatch — same `requestSpecModes` as
-    // chat-completions (DFlash > MTP > drafter > PLD).
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
+    // chat-completions (DFlash > MTP).
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
-    const use_pld = spec.use_pld;
 
     // Anthropic responses never carry logprobs (the API doesn't expose
     // them). Vision-bearing requests transfer ownership of `ve_local` into
@@ -16426,7 +16041,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences });
+    const result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences });
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -16644,7 +16259,6 @@ fn handleAnthropicStreaming(
     enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
-    enable_pld: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
@@ -16667,12 +16281,11 @@ fn handleAnthropicStreaming(
     var ve_local = vision_embeddings;
     defer if (ve_local) |arr| disposeVision(arr);
 
-    // Pick speculative-decoding mode (regular / PLD / drafter). The token-
+    // Pick speculative-decoding mode (regular / drafter / MTP). The token-
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
-    if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), generate_mod.draftsRefused(sampling), 0);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
 
@@ -16694,7 +16307,6 @@ fn handleAnthropicStreaming(
         .eos_token_ids = eos_token_ids,
         .max_tokens = max_tokens,
         .timeout_ns = getTimeoutNs(),
-        .enable_pld = stream_mode == .pld,
         .enable_drafter = stream_mode == .drafter,
         .dflash = if (stream_mode == .drafter) lm.dflash else null,
         .drafter_block_size = lm.drafter_block_size,
@@ -16702,8 +16314,6 @@ fn handleAnthropicStreaming(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .pld_draft_len = server_config.default_pld_draft_len,
-        .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
@@ -18167,18 +17777,8 @@ fn handleResponsesInner(
 
     // Wave 1.A: per-request KV-quant override (Responses path mirror).
 
-    // Per-request PLD override for the Responses path. Mirror the
-    // chat-completions auto-disable logic exactly so the same prompt picks
-    // the same path on /v1/chat/completions and /v1/responses.
-    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
-    var enable_pld_resp: bool = if (root.get("enable_pld")) |v|
-        (v == .bool and v.bool)
-    else
-        server_config.default_enable_pld;
-
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
-    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
     const lm_default_enable_drafter_resp: bool = lm.dflash != null;
     var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
@@ -18187,31 +17787,10 @@ fn handleResponsesInner(
     if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
     if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
 
-    // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
-    // Anthropic). Score the full prompt's 3-gram repetition; novel content
-    // (low score) skips PLD/drafter unless the user explicitly opted in.
-    if ((enable_pld_resp and !pld_explicit_in_json) or (enable_drafter_resp and !drafter_explicit_in_json)) {
-        const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0;
-        if (score < spec_gate_threshold) {
-            if (enable_pld_resp and !pld_explicit_in_json) {
-                log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
-                enable_pld_resp = false;
-            }
-            // DFlash exemption — same rule as the other three surfaces.
-            if (enable_drafter_resp and !drafter_explicit_in_json and lm.dflash == null) {
-                log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
-                enable_drafter_resp = false;
-            }
-        }
-        // MTP wins whenever loaded; the n-gram score never routes it to PLD
-        // (see the chat-completions site).
-    }
-
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
-        if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
+        const stream_mode = pickStreamMode(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
 
@@ -18235,7 +17814,6 @@ fn handleResponsesInner(
             .eos_token_ids = eos_slice,
             .max_tokens = effective_max_tokens,
             .timeout_ns = getTimeoutNs(),
-            .enable_pld = stream_mode == .pld,
             .enable_drafter = stream_mode == .drafter,
                 .dflash = if (stream_mode == .drafter) lm.dflash else null,
             .drafter_block_size = lm.drafter_block_size,
@@ -18250,8 +17828,6 @@ fn handleResponsesInner(
             .mrope_pos = slot_mrope_resp.pos,
             .mrope_total = slot_mrope_resp.total,
             .mrope_delta = slot_mrope_resp.delta,
-            .pld_draft_len = server_config.default_pld_draft_len,
-            .pld_key_len = server_config.default_pld_key_len,
             .kv_attn_fused = resolveKvAttnFused(config, kv_attn_explicit, prompt_ids.len, kv_quant_override),
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
@@ -18540,18 +18116,17 @@ fn handleResponsesInner(
         };
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
-        // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
+        // > drafter) so /v1/responses gets the same speedup as /v1/chat/completions.
+        const spec = requestSpecModes(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, generate_mod.draftsRefused(sampling), 0);
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
-        const use_pld = spec.use_pld;
         // Transfer vision ownership into the slot.
         const slot_ve_ns = req_media.embeddings;
         req_media.embeddings = null;
         const slot_mrope_ns = req_media.mrope;
         req_media.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences.items });
+        result = try nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, kv_attn_explicit, stream, .{ .stops = stop_sequences.items });
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -21032,7 +20607,7 @@ test "queryModel: GET /props?model=<id> routes to that model, percent-decoded" {
 }
 
 test "settingsPropsJson: /props names the vision choice and a streamed tower's bill" {
-    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 2048, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .vision = .{ .loaded = true, .source = "--vision", .tower_bytes = 493_389_824, .encode_bytes = 5_000_000_000 } });
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .prefill_chunk = 2048, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .vision = .{ .loaded = true, .source = "--vision", .tower_bytes = 493_389_824, .encode_bytes = 5_000_000_000 } });
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
     const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, frag);
@@ -21052,7 +20627,6 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
         .kv_quant = "4",
         .kv_cache = transformer_mod.KvCacheChoice.resolve(transformer_mod.KVQuantConfig.affine(4), transformer_mod.KVQuantConfig.engine_default, false),
         .kv_attn_mode = .auto,
-        .decode_attn_quant = true,
         .prefill_chunk = 8192,
         .mtp_loaded = true,
         .mtp_default_on = true,
@@ -21063,8 +20637,6 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
         .mtp_adaptive = true,
         .max_mtp_ctx = 32768,
         .drafter = "none",
-        .pld = .{ .enable = false, .draft_len = 5, .key_len = 3 },
-        .pld_source = "--no-pld",
         .max_concurrent = 4,
         .prefix_cache_mem_bytes = 2048,
         .prefix_cache_disk_bytes = 0,
@@ -21083,7 +20655,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqualStrings("kv4", kv_cache.get("scheme").?.string);
     try testing.expectEqualStrings("model-settings.json", kv_cache.get("source").?.string);
     try testing.expectEqualStrings("auto", st.get("kv_attn_mode").?.string);
-    try testing.expect(st.get("decode_attn_quant").?.bool);
+    try testing.expect(st.get("decode_attn_quant") == null);
     const mtp = st.get("mtp").?.object;
     try testing.expect(mtp.get("default_on").?.bool);
     try testing.expectEqualStrings("--mtp", mtp.get("source").?.string);
@@ -21091,13 +20663,11 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqualStrings("tokenv3", mtp.get("acceptance").?.string);
     try testing.expectApproxEqAbs(@as(f64, 0.95), mtp.get("acceptance_param").?.float, 1e-6);
     try testing.expectEqual(@as(i64, 32768), mtp.get("max_ctx").?.integer);
-    const pld = st.get("pld").?.object;
-    try testing.expect(!pld.get("default_on").?.bool);
-    try testing.expectEqualStrings("--no-pld", pld.get("source").?.string);
+    try testing.expect(st.get("pld") == null);
     try testing.expectEqual(@as(i64, 4), st.get("max_concurrent").?.integer);
     try testing.expect(st.get("prefix_cache").?.object.get("ram_enabled").?.bool);
 
-    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_ram_enabled = false });
+    const used = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 20 << 30, .prefix_cache_disk_used_bytes = 3 << 30, .prefix_cache_disk_entries = 5, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(used);
     var up = try std.json.parseFromSlice(std.json.Value, testing.allocator, used[",\"settings\":".len..], .{});
     defer up.deinit();
@@ -21106,7 +20676,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     try testing.expectEqual(@as(i64, 3 << 30), pc.get("disk_used_bytes").?.integer);
     try testing.expectEqual(@as(i64, 5), pc.get("disk_entries").?.integer);
 
-    const exact = try settingsPropsJson(testing.allocator, .{ .engine = "llama", .kv_quant = "q4", .kv_attn_mode = .dense, .decode_attn_quant = false, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
+    const exact = try settingsPropsJson(testing.allocator, .{ .engine = "llama", .kv_quant = "q4", .kv_attn_mode = .dense, .prefill_chunk = 4096, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 3, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "dflash", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 4096, .prefix_cache_ram_enabled = false });
     defer testing.allocator.free(exact);
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
     defer ep.deinit();
@@ -21116,8 +20686,8 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
 }
 
 test "settingsPropsJson: /props names the greedy tail and where it came from" {
-    for ([_]model_settings.Pick(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag }, .{ .value = true, .source = .fast } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail", "--fast" }) |tail, source| {
-        const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
+    for ([_]model_settings.Pick(bool){ .{ .value = false, .source = .default }, .{ .value = true, .source = .model_settings }, .{ .value = true, .source = .flag } }, [_][]const u8{ "default", "model-settings.json", "--mtp-greedy-tail" }) |tail, source| {
+        const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "8", .kv_attn_mode = .auto, .prefill_chunk = 8192, .mtp_loaded = true, .mtp_default_on = true, .mtp_acceptance = .exact, .mtp_greedy_tail = tail, .mtp_depth = 0, .mtp_adaptive = true, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 1, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0 });
         defer testing.allocator.free(frag);
         var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
         defer parsed.deinit();
@@ -22151,19 +21721,6 @@ test "isStatusRoute: only /props reaches the shared release" {
     try std.testing.expect(!isStatusRoute("POST", "/props"));
 }
 
-test "embedEffectiveLimit: tighter of flag and model window; zeros mean unbounded" {
-    // Auto (no flag): the model's window rules; a windowless model is unbounded.
-    try std.testing.expectEqual(@as(u32, 512), embedEffectiveLimit(0, 512));
-    try std.testing.expectEqual(@as(u32, 0), embedEffectiveLimit(0, 0));
-    // Operator override: enforced when tighter…
-    try std.testing.expectEqual(@as(u32, 1024), embedEffectiveLimit(1024, 32768));
-    // …and clamped to the model's declared window when looser — a 512-position
-    // BERT never accepts a 4096 override (issue #117 acceptance case).
-    try std.testing.expectEqual(@as(u32, 512), embedEffectiveLimit(4096, 512));
-    // Flag against a windowless model still binds.
-    try std.testing.expectEqual(@as(u32, 2048), embedEffectiveLimit(2048, 0));
-}
-
 test "embedOverflowMessage: names the input index and both counts" {
     var buf: [160]u8 = undefined;
     const msg = embedOverflowMessage(&buf, 3, 1301, 1024);
@@ -22545,7 +22102,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
 
 test "prefillMemoryNeeded: every prefill peak the box measured, re-derived for the conv_state compaction" {
     // Peak GPU bytes above steady state for ONE request on a clean boot
-    // (`--prefix-cache-entries 0 --no-mtp --no-drafter --no-pld`, /props
+    // (`--prefix-cache-entries 0 --no-mtp --no-drafter`, /props
     // peak_bytes minus active_bytes, M4 Max, 2026-08-14) — byte-identical
     // across repeat boots, so these are exact figures, not samples. An
     // estimate BELOW a peak we have actually seen is the case that ends in an
@@ -25918,7 +25475,7 @@ test "a request renders with its own preserve_thinking and leaves the model's co
 }
 
 test "settingsPropsJson: /props reports the prefill decode share" {
-    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .kv_attn_mode = .auto, .decode_attn_quant = false, .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .pld = PldDefaults.off, .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
+    const frag = try settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .kv_attn_mode = .auto, .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_acceptance = .exact, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
     defer testing.allocator.free(frag);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
     defer parsed.deinit();

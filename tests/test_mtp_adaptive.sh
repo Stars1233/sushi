@@ -130,12 +130,12 @@ start_server() { # $1 = log path, $2 = value for SUSHI_MTP_ADAPTIVE_SERIAL ("" =
         SUSHI_ROUND_COST_PERSIST=0 SUSHI_MTP_TRACE=1 \
         SUSHI_MTP_ADAPTIVE_SERIAL="$adapt" \
         "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" \
             --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
     else
         SUSHI_ROUND_COST_PERSIST=0 SUSHI_MTP_TRACE=1 \
         "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" \
             --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
     fi
     SERVER_PID=$!
@@ -317,7 +317,7 @@ require_free_port
 : > "$LOG_C"
 HOME="$ISO_HOME" SUSHI_MTP_TRACE=1 SUSHI_ROUND_COST_PERSIST=1 \
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-    --no-mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+    --no-mtp --kv-quant 8 --ctx-size "$CTX_SIZE" \
     --prefix-cache-entries 2 --log-level info >"$LOG_C" 2>&1 &
 SERVER_PID=$!
 c_model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')

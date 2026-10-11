@@ -35,7 +35,6 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 
 const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 
-var expert_cache_bytes: u64 = 0;
 var ssd_budget_bytes: u64 = 0;
 // Serve-mode default for requests that omit max_tokens (0 = flag not given).
 var serve_default_max_tokens: u32 = 0;
@@ -133,9 +132,6 @@ fn printUsage(io: std.Io) void {
         \\                      e.g. '{"text_config":{"rope_parameters":{"rope_type":
         \\                      "yarn","factor":4.0,"original_max_position_embeddings":
         \\                      262144},"max_position_embeddings":1048576}}'
-        \\  --embedding-max-length <n>  Per-input token ceiling for /v1/embeddings
-        \\                      (default auto = the model's declared window; over-limit
-        \\                      inputs get a 400 naming index/count/limit, never truncation)
         \\  --prompt, -p <text> Run one prompt and exit (also with run <model>)
         \\  --stream            Stream tokens as they are generated (with --prompt)
         \\  --max-tokens <n>    Max tokens to generate (default: 100); in --serve
@@ -155,7 +151,6 @@ fn printUsage(io: std.Io) void {
         \\                      keep every turn's thinking (on, the template default)
         \\                      or only the latest user turn's (off). Request
         \\                      chat_template_kwargs > this flag > model-settings.json
-        \\  --logit-bias-file <path> Experimental JSON/CSV scoped token penalties and rewards.
         \\  --think-penalty <f> Lower the logits of ~50 overthinking markers ("Wait",
         \\                      "But", "Alternatively", ...) by f inside the reasoning
         \\                      span (default 0 = off). Request think_penalty > this
@@ -172,15 +167,6 @@ fn printUsage(io: std.Io) void {
         \\                        MLX allocates); use this if a load you know fits
         \\                        is being refused. A genuine over-commit can
         \\                        hard-crash the server.
-        \\  --pld               Enable Prompt Lookup Decoding (default: ON).
-        \\                        Model-agnostic speculative decoding via n-gram
-        \\                        matches in the prompt + generated tokens. Big
-        \\                        wins on echo-heavy workloads (code editing, RAG,
-        \\                        agentic loops). Adaptive prompt-time gate
-        \\                        auto-disables it on novel content. Pass
-        \\                        --no-pld to force-disable.
-        \\  --no-pld            Force-disable standalone Prompt Lookup Decoding
-        \\                        (the lookups inside MTP rounds stay on).
         \\  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
         \\                        rounds and GLM DFlash2 (default: ON); standalone
         \\                        PLD (--pld/--no-pld) is unaffected.
@@ -197,16 +183,6 @@ fn printUsage(io: std.Io) void {
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV). No effect on MiMo, whose
         \\                        heads keep a dense sliding window.
-        \\  --no-decode-attn-quant
-        \\                      Serve decode from quantized side copies of
-        \\                      DENSE (bf16/f16) attention projection weights:
-        \\                      INT8 group-32. Cuts their per-token weight
-        \\                      read by half on models that ship dense
-        \\                      attention.
-        \\                      LOSSY: a real requantization, applied to
-        \\                      decode/verify steps only; prefill keeps the
-        \\                      dense weights. Default ON; --no-… restores
-        \\                      exact dense decode.
         \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
         \\                        (default 1). Every depth the planner picks
         \\                        stays inside --mtp-min-depth..--mtp-max-depth;
@@ -239,7 +215,7 @@ fn printUsage(io: std.Io) void {
         \\                        GENERATES past it switches mid-flight. The
         \\                        bound is inclusive (<n> itself still drafts)
         \\                        and it outranks `enable_mtp:true` in the
-        \\                        request body. MTP only — PLD is unaffected.
+        \\                        request body.
         \\  --qwen-gdn <fp32|bf16>
         \\                      Qwen only: store its GatedDeltaNet recurrent
         \\                      state in fp32 between tokens (default bf16). A
@@ -283,18 +259,6 @@ fn printUsage(io: std.Io) void {
         \\                        (SUSHI_PREFIX_CACHE_DIR) and are restored
         \\                        across restarts instead of recomputed. 0/off
         \\                        disables.
-        \\  --ssm-checkpoint-stride <n>
-        \\                      Hybrid SSM architectures only (Qwen3.8-Flash-Next's
-        \\                        GDN layers): capture an SSM/conv state checkpoint every
-        \\                        <n> tokens during chunked prefill, so a later
-        \\                        request sharing a prefix can restore mid-prompt
-        \\                        instead of re-prefilling (default: 256). 0
-        \\                        disables capture — hybrid models then bypass the
-        \\                        hot prefix cache entirely. On MoE targets the
-        \\                        effective stride is raised to the prefill chunk,
-        \\                        because each checkpoint forces a chunk boundary
-        \\                        and every extra chunk re-streams the expert
-        \\                        weights; see --prefill-chunk.
         \\  --ssm-checkpoint-max <n>
         \\                      Cap on SSM checkpoints retained per cache entry
         \\                        (default: 16). The first stride-aligned position
@@ -312,15 +276,11 @@ fn printUsage(io: std.Io) void {
         \\                        is at least (1 - n) x the missed one's. 0..0.6;
         \\                        0.3 is a mild setting. A sigmoid router (MiMo)
         \\                        compares sigmoid probabilities.
-        \\  --expert-cache-gb <n>
-        \\                      Stream routed experts from SSD (Sushi pack or
-        \\                        source checkpoint) with a decimal-GB cache.
         \\  --ssd-budget-gb <n> Stream routed experts from SSD (Sushi pack or
         \\                        source checkpoint) with a
         \\                        TOTAL resident target of <n> GiB; the expert
         \\                        cache is what is left after the trunk, the
         \\                        prefill union and the fill buffers.
-        \\                        --expert-cache-gb wins when both are given.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -385,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
     // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
     // above every subcommand branch — a per-serve-path call is how
     // `runHeadlessServe` (the mode the app always launches) silently ate the
-    // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
+    // launch flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
     // Resolve lazily-cached env reads on the main thread before other threads exist.
@@ -506,10 +466,6 @@ pub fn main(init: std.process.Init) !void {
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
     var vision = false;
-    var enable_pld = true; // Prompt Lookup Decoding (on by default; --no-pld to disable)
-    var pld_explicit = false;
-    var pld_draft_len: u32 = 5;
-    var pld_key_len: u32 = 3;
     var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
@@ -641,15 +597,6 @@ pub fn main(init: std.process.Init) !void {
             }
             model_mod.setConfigOverrides(args[i]);
             log.info("[args] config-overrides: {s}\n", .{args[i]});
-        } else if (std.mem.eql(u8, args[i], "--embedding-max-length") and i + 1 < args.len) {
-            i += 1;
-            // Module global (like --max-concurrent): every serve path reads it,
-            // so a hand-rolled ServerConfig can't eat it (the runHeadlessServe
-            // class). "auto" = 0 = bound only by the model's declared window.
-            server_mod.embedding_max_length = if (std.mem.eql(u8, args[i], "auto"))
-                0
-            else
-                try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout = try std.fmt.parseInt(u32, args[i], 10);
@@ -661,22 +608,10 @@ pub fn main(init: std.process.Init) !void {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
-        } else if (std.mem.eql(u8, args[i], "--pld")) {
-            enable_pld = true;
-            pld_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
             server_mod.g_tool_autocorrect = false;
         } else if (cli_mod.isNoMtpLookupFlag(args[i])) {
             generate_mod.mtp_lookup_disabled = true;
-        } else if (std.mem.eql(u8, args[i], "--no-pld")) {
-            enable_pld = false;
-            pld_explicit = true;
-        } else if (std.mem.eql(u8, args[i], "--pld-draft-len") and i + 1 < args.len) {
-            i += 1;
-            pld_draft_len = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, args[i], "--pld-key-len") and i + 1 < args.len) {
-            i += 1;
-            pld_key_len = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--drafter") and i + 1 < args.len) {
             i += 1;
             drafter_dir = args[i];
@@ -718,8 +653,6 @@ pub fn main(init: std.process.Init) !void {
             mtp_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
-        } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
-            transformer_mod.decode_attn_quant_flag = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             i += 1;
@@ -737,8 +670,6 @@ pub fn main(init: std.process.Init) !void {
             mtp_tokenv3_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--mtp-greedy-tail")) {
             generate_mod.mtp_greedy_tail_explicit = true;
-        } else if (std.mem.eql(u8, args[i], "--fast")) {
-            model_settings_mod.fast = true;
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
@@ -799,9 +730,6 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             server_mod.prefix_cache_disk_explicit = true;
-        } else if (std.mem.eql(u8, args[i], "--logit-bias-file") and i + 1 < args.len) {
-            i += 1;
-            model_settings_mod.logit_bias_file_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--think-penalty") and i + 1 < args.len) {
             i += 1;
             const lambda = std.fmt.parseFloat(f32, args[i]) catch -1;
@@ -816,13 +744,6 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--preserve-thinking: expected on or off; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-stride") and i + 1 < args.len) {
-            // Phase 1 (perf-plan): per-position SSM/conv state snapshots during
-            // chunked prefill enable multi-turn warm reuse on hybrid SSM
-            // architectures. 0 disables (legacy behavior: hybrid bypasses the
-            // hot prefix cache); default 128.
-            i += 1;
-            server_mod.ssm_checkpoint_stride = std.fmt.parseInt(u32, args[i], 10) catch 128;
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
@@ -905,12 +826,6 @@ pub fn main(init: std.process.Init) !void {
             kv_quant_explicit = true;
             kv_quant_config = transformer_mod.KVQuantConfig.fromJsonValue(.{ .string = args[i] }) orelse {
                 log.err("--kv-quant: expected one of {{16, 8, 4}} (16 = BF16, also `off`); got '{s}'\n", .{args[i]});
-                std.process.exit(1);
-            };
-        } else if (std.mem.eql(u8, args[i], "--expert-cache-gb") and i + 1 < args.len) {
-            i += 1;
-            expert_cache_bytes = server_mod.parseExpertCacheGb(args[i]) catch {
-                log.err("--expert-cache-gb: expected an integer in 1..360; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--ssd-budget-gb") and i + 1 < args.len) {
@@ -1133,13 +1048,6 @@ pub fn main(init: std.process.Init) !void {
     try mlx.check(mlx.mlx_version(&ver));
     log.info("sushi {s} (MLX {s})\n", .{ VERSION, mlx.mlx_string_data(ver) });
 
-    // Every text-gen serve path takes the PLD defaults from this ONE value —
-    // see `server.PldDefaults`. Built after arg parsing so it can't capture a
-    // pre-flag default, and passed whole so a path can't honor `--pld` while
-    // dropping the two lengths next to it (which is precisely what headless
-    // mode did).
-    var cli_pld = server_mod.PldDefaults.fromCli(enable_pld, pld_draft_len, pld_key_len);
-    cli_pld.explicit = pld_explicit;
     const launch_serve = LaunchServe{
         .ctx_size = ctx_size,
         .timeout = timeout,
@@ -1148,7 +1056,6 @@ pub fn main(init: std.process.Init) !void {
         .temperature = if (temp_explicit) temperature else null,
         .top_p = top_p_flag,
         .top_k = top_k_flag,
-        .pld = cli_pld,
     };
 
     // Echo the resolved arguments — makes drafter/target mismatches obvious
@@ -1174,19 +1081,6 @@ pub fn main(init: std.process.Init) !void {
     } else switch (kv_quant_config.scheme) {
         .off => log.info("[args] kv-quant: off\n", .{}),
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
-    }
-    if (model_settings_mod.fast) {
-        // The launch layer only: a model's own settings resolve at its load.
-        const mtp = model_settings_mod.MtpChoice.resolve(model_settings_mod.launchFlag(bool, enable_mtp, mtp_explicit), null, true);
-        const acceptance = generate_mod.mtpAcceptanceFor(null);
-        const tail = generate_mod.mtpGreedyTailFor(null);
-        const kv = transformer_mod.KvCacheChoice.resolve(null, kv_quant_config, kv_quant_explicit);
-        log.info("[args] fast: mtp {s} ({s}); acceptance {s} ({s}); greedy tail {s} ({s}); {s} ({s})\n", .{
-            mtp.label(),                           mtp.sourceName(),
-            mtp_acceptance.name(acceptance.value), model_settings_mod.sourceLabel(acceptance.source, model_settings_mod.acceptanceFlagName(acceptance.value)),
-            if (tail.value) "on" else "off",       model_settings_mod.sourceLabel(tail.source, "--mtp-greedy-tail"),
-            kv.label(),                            kv.sourceName(),
-        });
     }
 
     // Set GPU as default
@@ -1434,7 +1328,6 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
             .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
-            .expert_cache_bytes = expert_cache_bytes,
             .ssd_budget_bytes = ssd_budget_bytes,
             .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
             .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
@@ -1451,7 +1344,7 @@ pub fn main(init: std.process.Init) !void {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
         if (config.expertStreamingRequired()) {
-            log.err("This checkpoint requires expert streaming. Use `run <model>` or `--serve` with --ssd-budget-gb or --expert-cache-gb.\n", .{});
+            log.err("This checkpoint requires expert streaming. Use `run <model>` or `--serve` with --ssd-budget-gb.\n", .{});
             return error.ExpertStreamingRequired;
         }
         log.info("Loading weights...\n", .{});
@@ -1619,7 +1512,6 @@ const LaunchServe = struct {
     temperature: ?f32,
     top_p: ?f32,
     top_k: ?u32,
-    pld: server_mod.PldDefaults,
 
     fn serverConfig(self: LaunchServe) server_mod.ServerConfig {
         return .{
@@ -1630,10 +1522,6 @@ const LaunchServe = struct {
             .default_temperature = self.temperature,
             .default_top_p = self.top_p,
             .default_top_k = self.top_k,
-            .default_enable_pld = self.pld.enable,
-            .pld_explicit = self.pld.explicit,
-            .default_pld_draft_len = self.pld.draft_len,
-            .default_pld_key_len = self.pld.key_len,
         };
     }
 };
@@ -1744,7 +1632,6 @@ fn runHeadlessServe(
         .prefix_cache_mem_resolver = server_mod.prefixCacheMemForLoad,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
         .prefix_cache_disk_resolver = server_mod.prefixCacheDiskForLoad,
-        .expert_cache_bytes = expert_cache_bytes,
         .ssd_budget_bytes = ssd_budget_bytes,
         .expert_cache_fit_resolver = server_mod.expertCacheFitForLoad,
         .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity, server_mod.prefix_cache_ram_enabled, server_mod.prefix_cache_disk_bytes),
@@ -1803,15 +1690,12 @@ test "both boot modes build their server defaults from the same launch flags" {
         .temperature = 0.3,
         .top_p = 0.8,
         .top_k = 20,
-        .pld = server_mod.PldDefaults.fromCli(true, 7, 4),
     };
     const cfg = launch.serverConfig();
     try std.testing.expectEqual(@as(?f32, 0.3), cfg.default_temperature);
     try std.testing.expectEqual(@as(?f32, 0.8), cfg.default_top_p);
     try std.testing.expectEqual(@as(?u32, 20), cfg.default_top_k);
     try std.testing.expectEqual(@as(u32, 4096), cfg.default_max_tokens);
-    try std.testing.expectEqual(@as(u32, 7), cfg.default_pld_draft_len);
-    try std.testing.expectEqual(@as(u32, 4), cfg.default_pld_key_len);
     try std.testing.expectEqual(@as(u32, 32768), cfg.max_context_size);
 
     var unset = launch;

@@ -210,16 +210,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Prompt lookup decoding
 
-- **A PLD verify is MTP's verify** (`ctx.verify_rows`, drafts capped at `MIMO_VERIFY_ROWS_MAX` - 1 = 7): every
+- **A lookup verify is MTP's verify** (`ctx.verify_rows`, drafts capped at `MIMO_VERIFY_ROWS_MAX` - 1 = 7): every
   row reads the packed cache as its own decode tick would, a partial accept truncates, and no `KVCache.snapshot` is
-  taken, so greedy PLD is serial byte for byte. The prefill-shaped verify it replaced declined the fused kernel below
-  16 rows, rebuilt every global layer's whole cache dense, copied the cache on every write under the snapshot and
-  re-forwarded partial accepts.
-- MTP outranks PLD (`server.requestSpecModes`), so PLD runs only on requests without MTP; an MTP request copies its
-  context through prompt lookup inside the round instead ([engine-mtp](engine-mtp.md#lookup)).
-- PLD stays on by default: it pays on echo workloads (a code edit that echoes the context). The prompt n-gram gate
-  passes ordinary prompts too (score 0.16-0.32 against 0.01), so the runtime yield and per-draft gates are what bound
-  the loss on text that does not echo.
+  taken, so a greedy lookup round is serial byte for byte. An MTP request copies its context through prompt lookup
+  inside the round ([engine-mtp](engine-mtp.md#lookup)). The standalone PLD decoder is gone with its `--pld` flags.
 
 <a id="vision"></a>
 ## Vision (MiMo-ViT)

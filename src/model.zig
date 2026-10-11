@@ -5599,8 +5599,8 @@ test "MiMo EXL3 streaming CPU accepts budgets and preserves the resident default
     const c = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 48, .first_k_dense_replace = 1, .num_experts = 256, .num_experts_per_tok = 8, .hidden_size = 4096, .moe_intermediate_size = 2048, .expert_layout = .exl3_k4 };
     try testing.expect(c.supportsExpertStreaming());
     try testing.expectEqual(@as(u32, 47), c.expertLayerCount());
-    try testing.expect(!stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0, 0));
-    try testing.expect(stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0, 20 << 30));
+    try testing.expect(!stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 0));
+    try testing.expect(stream.expertStreamingEngaged(c.supportsExpertStreaming(), c.expertStreamingRequired(), 20 << 30));
     try testing.expectEqual(stream.MtpUnderStreaming.refuse, stream.mtpUnderStreaming(true, false, false, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_settings, stream.mtpUnderStreaming(true, true, false, false));
     try testing.expectEqual(stream.MtpUnderStreaming.drop_default, stream.mtpUnderStreaming(true, false, true, false));

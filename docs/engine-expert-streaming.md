@@ -1,4 +1,4 @@
-# Engine: expert streaming (`--ssd-budget-gb` / `--expert-cache-gb` / per-model `ssd_budget_gb`)
+# Engine: expert streaming (`--ssd-budget-gb` / per-model `ssd_budget_gb`)
 
 How a checkpoint whose routed experts do not fit in memory is served from SSD: the budget ledger, the per-layer LRU,
 the zero-copy slab I/O and the correctness bars. Read this before touching `src/expert_stream.zig`,
@@ -88,8 +88,8 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 - `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a TOTAL resident
   target of N GiB = trunk + MTP + vision tower (under `--vision`) + the all-experts union workspace + selected slab +
-  bounce; the remainder is a uniform per-layer LRU. `--expert-cache-gb` overrides (decimal GB of expert cache).
-- Precedence: `--expert-cache-gb` > `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming all three.
+  bounce; the remainder is a uniform per-layer LRU.
+- Precedence: `--ssd-budget-gb` > setting > `ExpertStreamingRequired` 503 naming both.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
   rung against free memory; a pinned chunk is priced as given; an explicit

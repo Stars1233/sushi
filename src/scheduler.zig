@@ -158,7 +158,6 @@ pub const LoadParams = struct {
     /// Sizes the SSD budget for this model and logs the `Allocating` line (`server.prefixCacheDiskForLoad`);
     /// takes the cache directory. Null = `prefix_cache_disk_bytes` as given (tests).
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget = null,
-    expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -196,8 +195,8 @@ pub const LoadParams = struct {
 /// deinit); a `submit` that fails hands it to the inference thread to free.
 pub const SubmitParams = struct {
     prompt_ids: []const u32,
-    /// Full original prompt for PLD lookup. When null, defaults to
-    /// `prompt_ids` (PLD's lookup table = full_prompt + generated).
+    /// Full original prompt for the MTP lookup. When null, defaults to
+    /// `prompt_ids` (the lookup table = full_prompt + generated).
     full_prompt: ?[]const u32 = null,
     cached_tokens: u32 = 0,
     has_tools: bool = false,
@@ -208,7 +207,6 @@ pub const SubmitParams = struct {
     eos_token_ids: []const u32,
     max_tokens: u32,
     timeout_ns: u64 = 0,
-    enable_pld: bool = false,
     enable_drafter: bool = false,
     /// DFlash assistant for this model. Rides the SAME `enable_drafter`
     /// request switch (a model loads at most ONE of drafter/dflash);
@@ -220,8 +218,6 @@ pub const SubmitParams = struct {
     mtp: ?generate_mod.MtpHeadRef = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
-    pld_draft_len: u32 = 5,
-    pld_key_len: u32 = 3,
     /// Phase 2 (Plan ricky): route SDPA through `kv_quant.quantAttention`
     /// instead of dequant + dense SDPA. No effect when the cache scheme
     /// isn't `.affine`. Default false → unchanged behavior.
@@ -472,7 +468,6 @@ pub const Slot = struct {
     timeout_ns: u64,
     has_tools: bool,
     enable_thinking: bool,
-    enable_pld: bool,
     enable_drafter: bool,
     dflash: ?*DflashModel,
     drafter_block_size: u32,
@@ -480,8 +475,6 @@ pub const Slot = struct {
     allow_batch_mtp: bool,
     mtp: ?generate_mod.MtpHeadRef,
     mtp_depth: u32,
-    pld_draft_len: u32,
-    pld_key_len: u32,
     /// Phase 2 (Plan ricky): see SubmitParams.kv_attn_fused.
     kv_attn_fused: bool,
     cached_tokens: u32,
@@ -684,7 +677,6 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .enable_thinking = params.enable_thinking,
-            .enable_pld = params.enable_pld,
             // An external drafter does not carry M-RoPE positions for image tokens.
             .enable_drafter = assistantSidecarEnabledForRequest(
                 params.enable_drafter,
@@ -696,8 +688,6 @@ pub const Slot = struct {
             .allow_batch_mtp = params.allow_batch_mtp,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
-            .pld_draft_len = params.pld_draft_len,
-            .pld_key_len = params.pld_key_len,
             .kv_attn_fused = params.kv_attn_fused,
             .cached_tokens = params.cached_tokens,
             .logprobs_n = params.logprobs_n,
@@ -1169,7 +1159,6 @@ pub const LoadRequest = struct {
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
     prefix_cache_disk_bytes: u64 = 0,
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget = null,
-    expert_cache_bytes: u64 = 0,
     ssd_budget_bytes: u64 = 0,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void = null,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
@@ -1266,7 +1255,6 @@ pub const Scheduler = struct {
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
     prefix_cache_disk_resolver: ?*const fn (*model_mod.ModelConfig, []const u8, u64) ?kv_disk_cache.DefaultDiskBudget,
-    expert_cache_bytes: u64,
     ssd_budget_bytes: u64,
     expert_cache_fit_resolver: ?*const fn (*const model_mod.ModelConfig, u64) anyerror!void,
     ssm_checkpoint_stride: u32,
@@ -1474,7 +1462,6 @@ pub const Scheduler = struct {
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
             .prefix_cache_disk_resolver = params.prefix_cache_disk_resolver,
-            .expert_cache_bytes = params.expert_cache_bytes,
             .ssd_budget_bytes = params.ssd_budget_bytes,
             .expert_cache_fit_resolver = params.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
@@ -1860,10 +1847,9 @@ pub const Scheduler = struct {
         const streaming_gate_bytes: ?u64 = if (expert_stream_mod.expertStreamingEngaged(
             owned.config.supportsExpertStreaming(),
             owned.config.expertStreamingRequired(),
-            self.expert_cache_bytes,
             settings_budget,
         )) blk: {
-            if (self.expert_cache_bytes == 0 and settings_budget == 0) return error.ExpertStreamingRequired;
+            if (settings_budget == 0) return error.ExpertStreamingRequired;
             const mtp = mtpChoiceFor(self.mtp_enabled, self.mtp_explicit, owned.config);
             const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(self.io, self.allocator, owned.config, entry.path));
             switch (verdict) {
@@ -1872,7 +1858,7 @@ pub const Scheduler = struct {
                 .drop_settings => owned.config.mtp_override = false,
                 .drop_default, .off => {},
             }
-            const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, self.expert_cache_bytes, settings_budget, coldLoadVision(owned.config, true));
+            const plan = try planExpertStreaming(self.io, self.allocator, owned.config, entry.path, settings_budget, coldLoadVision(owned.config, true));
             break :blk streamedLoadRequirementBytes(plan.split.trunk +| plan.split.mtp +| plan.split.vision, plan.cache.cache_bytes, plan.cache.prefill_peak_bytes, plan.cache.bounce_bytes);
         } else if (owned.config.isGlm5())
             try glmColdLoadBillBytes(self.io, self.allocator, owned.config, entry.path, coldLoadVision(owned.config, false), self.no_drafter, coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path))
@@ -1979,7 +1965,6 @@ pub const Scheduler = struct {
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
             .prefix_cache_disk_resolver = self.prefix_cache_disk_resolver,
-            .expert_cache_bytes = self.expert_cache_bytes,
             .ssd_budget_bytes = self.ssd_budget_bytes,
             .expert_cache_fit_resolver = self.expert_cache_fit_resolver,
             .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
@@ -2178,35 +2163,17 @@ pub const Scheduler = struct {
     /// Does this slot's next decode tick actually run the regular (non-speculative)
     /// path? The slot's `enable_*` flags carry the REQUEST's wish; `specTickMode` is
     /// the authoritative dispatch answer, and a generator can also have turned spec
-    /// off at runtime. Reading the armed flags here vetoed batched decode for any
-    /// slot whose prompt merely n-gram-scored high enough to ARM PLD, even after
-    /// PLD's own yield gate had disabled itself — neither speculation nor batching
-    /// (measured 2.4x on concurrent GDN decode). Same class as "a guard that shapes
-    /// INIT options does not bind DISPATCH".
+    /// off at runtime. Same class as "a guard that shapes INIT options does not bind DISPATCH".
     fn slotTicksRegular(slot: *const Slot) bool {
         if (Planner.enabled() and slot.planner_force_plain) return true;
-        const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_pld or slot.enable_drafter or slot.enable_mtp);
+        const gen = if (slot.legacy_gen) |*g| g else return !(slot.enable_drafter or slot.enable_mtp);
         // A runtime-disabled generator is already ticking regular, so batching it
         // dispatches what it was going to dispatch anyway.
-        //
-        // The POLICY this encodes, which is deliberate and not free: `nextPld`'s
-        // periodic re-enable check (`SPEC_REENABLE_INTERVAL`) lives on the serial
-        // path, and the batched tick never calls it. So a slot whose PLD yield
-        // gate disabled itself stays disabled for as long as it keeps company —
-        // even if its tail later turns into the file/tool echo PLD is best at.
-        // That is the right trade at N>1 (the batched kernel reads the weight set
-        // once for the whole group, which beats one slot's lookup wins) and it
-        // self-corrects: a SOLO slot never reaches the batched path, so the
-        // re-enable check resumes the moment concurrency drops back to one.
-        // Pinned by `a spec_disabled_runtime slot is batchable, and that is the
-        // documented trade` below — flip either half deliberately, not by accident.
         return gen.spec_disabled_runtime or specTickMode(
             slot.enable_mtp,
             gen.mtp != null,
             slot.enable_drafter,
             gen.dflash != null,
-            slot.enable_pld,
-            gen.pld_enabled,
         ) == .regular;
     }
 
@@ -2680,17 +2647,15 @@ fn loadMimoHeads(sch: *Scheduler, model_dir: []const u8, config: *const ModelCon
     return ptr;
 }
 
-/// A load's MTP decision: `--mtp`/`--no-mtp` > `--fast` > the per-model `mtp` > on.
+/// A load's MTP decision: `--mtp`/`--no-mtp` > the per-model `mtp` > on.
 pub fn mtpChoiceFor(mtp_enabled: bool, mtp_explicit: bool, config: *const ModelConfig) model_settings.MtpChoice {
-    const choice = model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, true);
-    return if (config.expert_streaming) choice.streamed() else choice;
+    return model_settings.MtpChoice.resolve(model_settings.launchFlag(bool, mtp_enabled, mtp_explicit), config.mtp_override, true);
 }
 
 /// The streaming gate's verdict on a load's MTP choice (`expert_stream.mtpUnderStreaming`). The gate
 /// runs before the load marks its config streamed.
 fn mtpStreamingVerdict(choice: model_settings.MtpChoice, head_supported: bool) expert_stream_mod.MtpUnderStreaming {
-    const c = choice.streamed();
-    return expert_stream_mod.mtpUnderStreaming(c.on, c.source == .model_settings, c.source == .default, head_supported);
+    return expert_stream_mod.mtpUnderStreaming(choice.on, choice.source == .model_settings, choice.source == .default, head_supported);
 }
 
 fn streamedHeadSupportedAt(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8) bool {
@@ -2713,7 +2678,7 @@ test "a streamed load drops only the engine-default MTP, never an asked-for one"
     try testing.expect(!mtpDefaultOffUnderStreaming(.{ .on = false, .source = .default }, true, false));
 }
 
-/// What a load line and `/props` read for the four keys `--fast` sets, under the launch globals.
+/// What a load line and `/props` read for the MTP, acceptance, greedy-tail and KV keys, under the launch globals.
 const LaunchPicks = struct {
     mtp: model_settings.MtpChoice,
     acceptance: model_settings.Pick(mtp_acceptance_mod.Mode),
@@ -2731,14 +2696,12 @@ const LaunchPicks = struct {
 };
 
 const LaunchGlobals = struct {
-    fast: bool,
     acceptance: mtp_acceptance_mod.Mode,
     acceptance_explicit: bool,
     greedy_tail_explicit: bool,
 
     fn save() LaunchGlobals {
         return .{
-            .fast = model_settings.fast,
             .acceptance = generate_mod.mtp_acceptance_default,
             .acceptance_explicit = generate_mod.mtp_acceptance_explicit,
             .greedy_tail_explicit = generate_mod.mtp_greedy_tail_explicit,
@@ -2746,49 +2709,35 @@ const LaunchGlobals = struct {
     }
 
     fn restore(self: LaunchGlobals) void {
-        model_settings.fast = self.fast;
         generate_mod.mtp_acceptance_default = self.acceptance;
         generate_mod.mtp_acceptance_explicit = self.acceptance_explicit;
         generate_mod.mtp_greedy_tail_explicit = self.greedy_tail_explicit;
     }
 };
 
-test "--fast: its preset, named --fast, outranks model-settings.json; an explicit flag outranks --fast; no --fast, no change" {
+test "an explicit launch flag outranks model-settings.json for MTP, acceptance, greedy tail and KV" {
     const saved = LaunchGlobals.save();
     defer saved.restore();
-    (LaunchGlobals{ .fast = false, .acceptance = .exact, .acceptance_explicit = false, .greedy_tail_explicit = false }).restore();
-    const p = model_settings.fast_preset;
+    (LaunchGlobals{ .acceptance = .exact, .acceptance_explicit = false, .greedy_tail_explicit = false }).restore();
     var file = ModelConfig{};
-    file.mtp_override = !p.mtp.?;
+    file.mtp_override = false;
     file.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
-    file.mtp_greedy_tail_override = !p.mtp_greedy_tail.?;
+    file.mtp_greedy_tail_override = true;
     file.kv_quant_override = .dense;
 
-    const unfast = LaunchPicks.of(null, null, &file);
-    try testing.expectEqual(!p.mtp.?, unfast.mtp.on);
-    try testing.expectEqual(model_settings.Source.model_settings, unfast.mtp.source);
-    try testing.expectEqual(model_settings.Source.model_settings, unfast.acceptance.source);
-    try testing.expectEqual(model_settings.Pick(bool){ .value = !p.mtp_greedy_tail.?, .source = .model_settings }, unfast.greedy_tail);
-    try testing.expectEqualStrings("model-settings.json", unfast.kv.sourceName());
-
-    model_settings.fast = true;
-    for ([_]ModelConfig{ .{}, file }) |cfg| {
-        const got = LaunchPicks.of(null, null, &cfg);
-        try testing.expectEqual(p.mtp.?, got.mtp.on);
-        try testing.expectEqualStrings("--fast", got.mtp.sourceName());
-        try testing.expect(std.meta.eql(p.mtp_acceptance.?, got.acceptance.value));
-        try testing.expectEqualStrings("--fast", model_settings.sourceLabel(got.acceptance.source, model_settings.acceptanceFlagName(got.acceptance.value)));
-        try testing.expectEqual(model_settings.Pick(bool){ .value = p.mtp_greedy_tail.?, .source = .fast }, got.greedy_tail);
-        try testing.expectEqual(p.kv_quant.?, got.kv.config);
-        try testing.expectEqualStrings("--fast", got.kv.sourceName());
-    }
+    const unflagged = LaunchPicks.of(null, null, &file);
+    try testing.expect(!unflagged.mtp.on);
+    try testing.expectEqual(model_settings.Source.model_settings, unflagged.mtp.source);
+    try testing.expectEqual(model_settings.Source.model_settings, unflagged.acceptance.source);
+    try testing.expectEqual(model_settings.Pick(bool){ .value = true, .source = .model_settings }, unflagged.greedy_tail);
+    try testing.expectEqualStrings("model-settings.json", unflagged.kv.sourceName());
 
     generate_mod.mtp_acceptance_default = .{ .typical = .{ .delta = 0.1 } };
     generate_mod.mtp_acceptance_explicit = true;
     generate_mod.mtp_greedy_tail_explicit = true;
-    const flagged = LaunchPicks.of(false, transformer_mod.KVQuantConfig.affine(4), &file);
-    try testing.expect(!flagged.mtp.on);
-    try testing.expectEqualStrings("--no-mtp", flagged.mtp.sourceName());
+    const flagged = LaunchPicks.of(true, transformer_mod.KVQuantConfig.affine(4), &file);
+    try testing.expect(flagged.mtp.on);
+    try testing.expectEqualStrings("--mtp", flagged.mtp.sourceName());
     try testing.expectEqual(@as(f32, 0.1), flagged.acceptance.value.typical.delta);
     try testing.expectEqual(model_settings.Source.flag, flagged.acceptance.source);
     try testing.expectEqual(model_settings.Source.flag, flagged.greedy_tail.source);
@@ -2796,22 +2745,12 @@ test "--fast: its preset, named --fast, outranks model-settings.json; an explici
     try testing.expectEqualStrings("--kv-quant", flagged.kv.sourceName());
 }
 
-test "--fast drops its MTP on a streamed load, before and after the load marks it streamed; an explicit --mtp keeps the head" {
-    const saved = LaunchGlobals.save();
-    defer saved.restore();
-    model_settings.fast = true;
-    const gate = mtpChoiceFor(true, false, &ModelConfig{});
-    try testing.expect(gate.on);
-    try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.off, mtpStreamingVerdict(gate, true));
-    var streamed = ModelConfig{};
-    streamed.expert_streaming = true;
-    const loaded = mtpChoiceFor(true, false, &streamed);
-    try testing.expect(!loaded.on);
-    try testing.expectEqualStrings("--fast", loaded.sourceName());
-    try testing.expect(!loaded.forced());
+test "an explicit --mtp keeps the head on a streamed load, or refuses when it cannot" {
     const asked = mtpChoiceFor(true, true, &ModelConfig{});
     try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.keep, mtpStreamingVerdict(asked, true));
     try testing.expectEqual(expert_stream_mod.MtpUnderStreaming.refuse, mtpStreamingVerdict(asked, false));
+    var streamed = ModelConfig{};
+    streamed.expert_streaming = true;
     try testing.expect(mtpChoiceFor(true, true, &streamed).on);
 }
 
@@ -2822,7 +2761,7 @@ pub const SsdBudgetChoice = struct {
 };
 
 /// The launch flag wins over the per-model setting; a non-streaming model ignores the
-/// setting (warned once). `--expert-cache-gb` is decided earlier, in `resolveExpertCache`.
+/// setting (warned once).
 pub fn resolveSsdBudget(flag_bytes: u64, setting_gb: u32, streaming: bool) SsdBudgetChoice {
     if (!streaming) return .{ .bytes = 0, .from_setting = false, .setting_ignored = setting_gb > 0 };
     if (flag_bytes > 0) return .{ .bytes = flag_bytes, .from_setting = false, .setting_ignored = false };
@@ -2900,7 +2839,7 @@ pub const StreamingPlan = struct {
 
 /// What the pack's tower costs a streamed load: its weights in the budget, its largest image
 /// encode beside it. Slot counts come from the ssd-budget ledger: `slots_without` 0 = no
-/// ledger (`--expert-cache-gb`), `slots_with` null = the budget cannot hold the tower.
+/// ledger, `slots_with` null = the budget cannot hold the tower.
 pub const VisionCost = struct {
     on: bool = false,
     tower_bytes: u64 = 0,
@@ -2911,7 +2850,7 @@ pub const VisionCost = struct {
 
 /// The ONE streamed-load plan, read by the serving load, its registry gate and `kld`: the
 /// on-disk layout, what stays resident, and the expert cache the budget leaves.
-pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, explicit_cache_bytes: u64, budget_bytes: u64, vision: bool) !StreamingPlan {
+pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig, model_dir: []const u8, budget_bytes: u64, vision: bool) !StreamingPlan {
     const geometry = config.expertGeometry();
     var streamed = config.*;
     streamed.expert_layout = try expert_stream_mod.quant.streamingLayoutOfDir(allocator, io, config.model_type, model_dir, geometry.layers, geometry.first_moe_layer);
@@ -2924,7 +2863,7 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
     const per_expert = try expert_stream_mod.expertBytesFor(allocator, model_dir, geometry, streamed.expert_layout);
-    const picked = resolveStreamedVision(explicit_cache_bytes, budget_bytes, config, split, per_expert, vision) catch |err| {
+    const picked = resolveStreamedVision(budget_bytes, config, split, per_expert, vision) catch |err| {
         if (err == error.SsdBudgetBelowVision) log.err("[vision] --ssd-budget-gb {d} cannot hold the vision tower ({d:.2} GB) beside two expert slots per layer; raise the budget or drop --vision\n", .{
             budget_bytes >> 30,
             @as(f64, @floatFromInt(split.vision)) / 1e9,
@@ -2938,12 +2877,12 @@ pub fn planExpertStreaming(io: std.Io, allocator: std.mem.Allocator, config: *co
 
 /// PURE: the expert cache with the pack's tower (`split.vision`) kept or left off, and what
 /// keeping it costs. Asked for on a budget that cannot hold it, it is refused by name.
-pub fn resolveStreamedVision(explicit_bytes: u64, budget_bytes: u64, config: *const ModelConfig, split: model_mod.ResidentSplit, per_expert: u64, want: bool) !struct { resolved: ExpertCacheResolution, cost: VisionCost } {
+pub fn resolveStreamedVision(budget_bytes: u64, config: *const ModelConfig, split: model_mod.ResidentSplit, per_expert: u64, want: bool) !struct { resolved: ExpertCacheResolution, cost: VisionCost } {
     var text = split;
     text.vision = 0;
-    const without = try resolveExpertCache(explicit_bytes, budget_bytes, config, text, config.stream_mtp_head, per_expert);
+    const without = try resolveExpertCache(budget_bytes, config, text, config.stream_mtp_head, per_expert);
     if (split.vision == 0) return .{ .resolved = without, .cost = .{} };
-    const with: ?ExpertCacheResolution = resolveExpertCache(explicit_bytes, budget_bytes, config, split, config.stream_mtp_head, per_expert) catch |err| switch (err) {
+    const with: ?ExpertCacheResolution = resolveExpertCache(budget_bytes, config, split, config.stream_mtp_head, per_expert) catch |err| switch (err) {
         error.SsdBudgetBelowResident => null,
         else => return err,
     };
@@ -3002,24 +2941,19 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
 pub const ExpertCacheResolution = struct {
     cache_bytes: u64,
     ledger: ?expert_stream_mod.BudgetLedger,
-    overridden: bool,
 };
 
-/// PURE: the expert-cache byte budget for this load. `--expert-cache-gb` wins outright;
-/// otherwise `--ssd-budget-gb` is a TOTAL resident target and the cache is what is left of it
+/// PURE: the expert-cache byte budget for this load. `--ssd-budget-gb` is a TOTAL resident target and the cache is what is left of it
 /// after the resident trunk, the MTP head (only when it stays resident), the vision tower the
 /// split carries, the whole-layer prefill union, the selected-expert slab and the fill bounce buffers.
 pub fn resolveExpertCache(
-    explicit_bytes: u64,
     budget_bytes: u64,
     config: *const model_mod.ModelConfig,
     split: model_mod.ResidentSplit,
     mtp_resident: bool,
     per_expert: u64,
 ) !ExpertCacheResolution {
-    const overridden = expert_stream_mod.budgetOverriddenByExplicitCache(explicit_bytes, budget_bytes);
-    if (explicit_bytes > 0 or budget_bytes == 0)
-        return .{ .cache_bytes = explicit_bytes, .ledger = null, .overridden = overridden };
+    if (budget_bytes == 0) return .{ .cache_bytes = 0, .ledger = null };
     const ledger = try expert_stream_mod.budgetLedger(
         budget_bytes,
         split.trunk,
@@ -3031,7 +2965,7 @@ pub fn resolveExpertCache(
         per_expert,
         expert_stream_mod.BOUNCE_BYTES,
     );
-    return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger, .overridden = false };
+    return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger };
 }
 
 /// The 2-bit lm_head copy a MiMo source trunk keeps, resident or streamed: the heads draft on it
@@ -3065,7 +2999,7 @@ test "mimo_v2 expert cache budget excludes the dense prefix" {
         .num_experts_per_tok = 2,
     };
     const fixed = per_expert + 8 * per_expert + 2 * per_expert + expert_stream_mod.BOUNCE_BYTES;
-    const result = try resolveExpertCache(0, fixed + 9 * per_expert, &config, .{ .trunk = per_expert, .mtp = 0 }, false, per_expert);
+    const result = try resolveExpertCache(fixed + 9 * per_expert, &config, .{ .trunk = per_expert, .mtp = 0 }, false, per_expert);
     try std.testing.expectEqual(@as(u16, 3), result.ledger.?.slots_per_layer);
     try std.testing.expectEqual(9 * per_expert, result.cache_bytes);
 }
@@ -3484,7 +3418,7 @@ test "coldLoadDrafterDir: --no-drafter wins, an explicit --drafter belongs to it
     try testing.expectEqualStrings("", coldLoadDrafterDir(false, "/m", "", "/m"));
 }
 
-test "the expert cache resolves from --ssd-budget-gb unless --expert-cache-gb is explicit" {
+test "the expert cache resolves from --ssd-budget-gb" {
     const t = testing;
     var cfg = model_mod.ModelConfig{};
     cfg.num_hidden_layers = 48;
@@ -3496,25 +3430,19 @@ test "the expert cache resolves from --ssd-budget-gb unless --expert-cache-gb is
     const GiB: u64 = 1 << 30;
     const fused: u64 = 9_830_400;
 
-    const from_budget = try resolveExpertCache(0, 60 * GiB, &cfg, split, false, fused);
+    const from_budget = try resolveExpertCache(60 * GiB, &cfg, split, false, fused);
     try t.expect(from_budget.ledger != null);
     try t.expectEqual(@as(u16, 103), from_budget.ledger.?.slots_per_layer);
     try t.expectEqual(from_budget.ledger.?.cache_bytes, from_budget.cache_bytes);
-    try t.expect(!from_budget.overridden);
 
-    const with_mtp = try resolveExpertCache(0, 60 * GiB, &cfg, split, true, fused);
+    const with_mtp = try resolveExpertCache(60 * GiB, &cfg, split, true, fused);
     try t.expectEqual(@as(u16, 92), with_mtp.ledger.?.slots_per_layer);
 
-    const explicit = try resolveExpertCache(60_000_000_000, 60 * GiB, &cfg, split, false, fused);
-    try t.expectEqual(@as(u64, 60_000_000_000), explicit.cache_bytes);
-    try t.expect(explicit.ledger == null);
-    try t.expect(explicit.overridden);
+    const no_budget = try resolveExpertCache(0, &cfg, split, false, fused);
+    try t.expectEqual(@as(u64, 0), no_budget.cache_bytes);
+    try t.expect(no_budget.ledger == null);
 
-    const no_budget = try resolveExpertCache(60_000_000_000, 0, &cfg, split, false, fused);
-    try t.expectEqual(@as(u64, 60_000_000_000), no_budget.cache_bytes);
-    try t.expect(!no_budget.overridden);
-
-    try t.expectError(error.SsdBudgetBelowResident, resolveExpertCache(0, 14 * GiB, &cfg, split, false, fused));
+    try t.expectError(error.SsdBudgetBelowResident, resolveExpertCache(14 * GiB, &cfg, split, false, fused));
 }
 
 test "streamed vision: the tower comes out of the ssd budget only when asked, refused by name when it does not fit" {
@@ -3541,10 +3469,10 @@ test "streamed vision: the tower comes out of the ssd budget only when asked, re
     const encode = @import("server.zig").largestImageEncodeBytes(&cfg);
     try t.expect(encode > 0);
 
-    const off = try resolveStreamedVision(0, 60 * GiB, &cfg, split, fused, false);
+    const off = try resolveStreamedVision(60 * GiB, &cfg, split, fused, false);
     try t.expect(!off.cost.on);
     try t.expectEqual(@as(u64, 0), off.resolved.ledger.?.vision_bytes);
-    const on = try resolveStreamedVision(0, 60 * GiB, &cfg, split, fused, true);
+    const on = try resolveStreamedVision(60 * GiB, &cfg, split, fused, true);
     try t.expect(on.cost.on);
     try t.expectEqual(split.vision, on.resolved.ledger.?.vision_bytes);
     try t.expectEqual(encode, on.cost.encode_bytes);
@@ -3556,17 +3484,13 @@ test "streamed vision: the tower comes out of the ssd budget only when asked, re
 
     const fixed = split.trunk + 522 * fused + expert_stream_mod.BOUNCE_BYTES;
     const tight = fixed + 2 * 48 * fused;
-    try t.expectEqual(@as(?u16, null), (try resolveStreamedVision(0, tight, &cfg, split, fused, false)).cost.slots_with);
-    try t.expectError(error.SsdBudgetBelowVision, resolveStreamedVision(0, tight, &cfg, split, fused, true));
-    try t.expectError(error.SsdBudgetBelowResident, resolveStreamedVision(0, 14 * GiB, &cfg, split, fused, true));
+    try t.expectEqual(@as(?u16, null), (try resolveStreamedVision(tight, &cfg, split, fused, false)).cost.slots_with);
+    try t.expectError(error.SsdBudgetBelowVision, resolveStreamedVision(tight, &cfg, split, fused, true));
+    try t.expectError(error.SsdBudgetBelowResident, resolveStreamedVision(14 * GiB, &cfg, split, fused, true));
 
-    // --expert-cache-gb sizes the cache itself; the tower is resident beside it.
-    const explicit = try resolveStreamedVision(60_000_000_000, 0, &cfg, split, fused, true);
-    try t.expect(explicit.cost.on);
-    try t.expectEqual(@as(u64, 60_000_000_000), explicit.resolved.cache_bytes);
     var bare = split;
     bare.vision = 0;
-    try t.expect(!(try resolveStreamedVision(0, 60 * GiB, &cfg, bare, fused, true)).cost.on);
+    try t.expect(!(try resolveStreamedVision(60 * GiB, &cfg, bare, fused, true)).cost.on);
 }
 
 test "the vision load line names its source, and what --vision would cost a streamed load" {
@@ -3622,11 +3546,8 @@ test "the ssd budget falls back to the per-model setting, and a non-streaming mo
     cfg.hidden_size = 2560;
     cfg.moe_intermediate_size = 640;
     const split = model_mod.ResidentSplit{ .trunk = 9_900_000_000, .mtp = 5_200_000_000 };
-    const via_setting = try resolveExpertCache(0, resolveSsdBudget(0, 60, true).bytes, &cfg, split, false, 9_830_400);
+    const via_setting = try resolveExpertCache(resolveSsdBudget(0, 60, true).bytes, &cfg, split, false, 9_830_400);
     try t.expectEqual(@as(u16, 103), via_setting.ledger.?.slots_per_layer);
-    const cache_flag = try resolveExpertCache(60_000_000_000, resolveSsdBudget(0, 60, true).bytes, &cfg, split, false, 9_830_400);
-    try t.expectEqual(@as(u64, 60_000_000_000), cache_flag.cache_bytes);
-    try t.expect(cache_flag.overridden);
 }
 
 test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the per-model setting warns" {
@@ -3654,7 +3575,6 @@ test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the p
     try t.expect(!expert_stream_mod.expertStreamingEngaged(
         moe.supportsExpertStreaming(),
         moe.expertStreamingRequired(),
-        60_000_000_000,
         from_flag.bytes,
     ));
     try t.expect(!moe.expert_streaming);
@@ -3665,7 +3585,6 @@ test "a non-qwen4 checkpoint never engages streaming: the flag is dropped, the p
     try t.expect(expert_stream_mod.expertStreamingEngaged(
         q4.supportsExpertStreaming(),
         q4.expertStreamingRequired(),
-        0,
         resolveSsdBudget(0, q4.ssd_budget_gb_override, q4.supportsExpertStreaming()).bytes,
     ));
 }
@@ -3688,7 +3607,7 @@ test "EXL3 streaming CPU settings budget engages the EXL3 loader" {
     const budget = resolveSsdBudget(0, q4.ssd_budget_gb_override, q4.supportsExpertStreaming());
     try t.expect(!budget.setting_ignored);
     try t.expectEqual(@as(u64, 60 << 30), budget.bytes);
-    try t.expect(expert_stream_mod.expertStreamingEngaged(q4.supportsExpertStreaming(), q4.expertStreamingRequired(), 0, budget.bytes));
+    try t.expect(expert_stream_mod.expertStreamingEngaged(q4.supportsExpertStreaming(), q4.expertStreamingRequired(), budget.bytes));
 }
 
 test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
@@ -3704,9 +3623,9 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
         "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
         "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
-        "no_drafter",                "prefix_cache_mem_resolver", "expert_cache_bytes",
-        "expert_cache_fit_resolver", "ssd_budget_bytes",          "kv_quant_explicit",
-        "mtp_explicit",              "prefix_cache_disk_resolver",
+        "no_drafter",                "prefix_cache_mem_resolver", "expert_cache_fit_resolver",
+        "ssd_budget_bytes",          "kv_quant_explicit",         "mtp_explicit",
+        "prefix_cache_disk_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -4019,7 +3938,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const streamed = expert_stream_mod.expertStreamingEngaged(
         params.config.supportsExpertStreaming(),
         params.config.expertStreamingRequired(),
-        params.expert_cache_bytes,
         streaming_budget.bytes,
     );
     const vision_choice = visionChoiceFor(params.config, streamed);
@@ -4027,9 +3945,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var vision_cost: VisionCost = .{};
     if (streamed) {
         const budget = streaming_budget;
-        if (params.expert_cache_bytes == 0 and budget.bytes == 0) return error.ExpertStreamingRequired;
+        if (budget.bytes == 0) return error.ExpertStreamingRequired;
         const mtp = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config);
-        if (mtp.source == .fast) log.info("[mtp] off: unsupported under streaming (--fast)\n", .{});
         const verdict = mtpStreamingVerdict(mtp, streamedHeadSupportedAt(sch.io, sch.allocator, params.config, params.model_dir));
         switch (verdict) {
             .refuse => {
@@ -4048,13 +3965,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         if (budget.from_setting)
             log.info("[expert-stream] ssd budget {d} GiB from model-settings.json\n", .{budget.bytes >> 30});
-        const plan = try planExpertStreaming(sch.io, sch.allocator, params.config, params.model_dir, params.expert_cache_bytes, budget.bytes, load_vision);
+        const plan = try planExpertStreaming(sch.io, sch.allocator, params.config, params.model_dir, budget.bytes, load_vision);
         vision_cost = plan.vision;
         load_vision = plan.vision.on;
-        if (plan.resolved.overridden)
-            log.info("[expert-stream] --expert-cache-gb overrides --ssd-budget-gb: cache {d:.2} GB\n", .{
-                @as(f64, @floatFromInt(plan.resolved.cache_bytes)) / 1e9,
-            });
         if (plan.resolved.ledger) |led| log.info("[expert-stream] ssd budget {d} GiB: trunk {d:.2} GB, mtp {d:.2} GB, vision {d:.2} GB, workspace {d:.2} GB, selected {d:.2} GB, bounce {d:.2} GB -> expert cache {d:.2} GB = {d} slots/layer\n", .{
             led.budget_bytes >> 30,
             @as(f64, @floatFromInt(led.trunk_bytes)) / 1e9,
@@ -6272,8 +6185,6 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
         gen.mtp != null,
         slot.enable_drafter,
         gen.dflash != null,
-        slot.enable_pld,
-        gen.pld_enabled,
     );
     const ids = gen.generated_ids.items;
     const decoded: ?[]u8 = if (slot.model.tokenizer) |tok|
@@ -6904,13 +6815,11 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         slot.mtp != null,
         slot.enable_drafter,
         slot.dflash != null,
-        slot.enable_pld,
     );
     const use_mtp = wiring.use_mtp;
     const use_dflash = wiring.use_dflash or glmNativeDflashArmed(slot.model.config.?.isGlm5(), slot.enable_drafter, slot.dflash != null, slot.sampling, slot.logprobs_n);
-    const use_pld = wiring.use_pld;
-    log.debug("[spec-wiring] mtp={} dflash={} pld={} (slot: drafter_flag={} dflash_handle={})\n", .{
-        use_mtp,             use_dflash,          use_pld,
+    log.debug("[spec-wiring] mtp={} dflash={} (slot: drafter_flag={} dflash_handle={})\n", .{
+        use_mtp,             use_dflash,
         slot.enable_drafter, slot.dflash != null,
     });
 
@@ -7220,7 +7129,6 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         sampling,
         slot.eos_token_ids,
         .{
-            .pld_enabled = use_pld,
             .drafter_block_size = slot.drafter_block_size,
             .dflash_enabled = use_dflash,
             .dflash = if (use_dflash) slot.dflash else null,
@@ -7245,8 +7153,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // Regular path: skip the lazy preforward so cache.step lands at
             // exactly prompt_len with t1 NOT in cache. Generator.next's
             // transition shim sync-forwards [t1] on the first decode call.
-            // PLD/drafter/MTP init paths already skip preforward unconditionally.
-            .skip_lazy_preforward = !use_pld and !use_mtp and !use_dflash,
+            // DFlash/MTP init paths already skip preforward unconditionally.
+            .skip_lazy_preforward = !use_mtp and !use_dflash,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
@@ -7572,7 +7480,6 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
 pub const SpecInitWiring = struct {
     use_mtp: bool,
     use_dflash: bool,
-    use_pld: bool,
 };
 
 /// Per-site spec gating for one slot, as a pure function.
@@ -7589,24 +7496,19 @@ pub fn specInitWiring(
     has_mtp: bool,
     enable_drafter: bool,
     has_dflash: bool,
-    enable_pld: bool,
 ) SpecInitWiring {
     if (owns_module_state) return .{
         // A module-owned arch that CAN rewind its state across a verify runs
-        // its own MTP head like any other target. PLD and the drafters
-        // stay off regardless: the drafters need a bound sidecar (DflashModel
-        // .bind refuses these archs anyway), and PLD's win case is
-        // echo-shaped traffic the n-gram gate rarely opens on a
-        // head this cheap — neither has been measured on this family, and an
-        // unmeasured spec mode is worse than none. Image requests ride the
+        // its own MTP head like any other target. The drafters stay off
+        // regardless: they need a bound sidecar (DflashModel
+        // .bind refuses these archs anyway). Image requests ride the
         // head too: `qwen4MtpForward` takes the slot's M-RoPE table.
         .use_mtp = module_spec_rollback and enable_mtp and has_mtp,
         .use_dflash = false,
-        .use_pld = false,
     };
     // enable_drafter is the request-level "assistant sidecar" switch for BOTH
     // sidecar kinds; the loader guarantees at most one of drafter/dflash is
-    // loaded per model. Priority: dflash > MTP > PLD — a
+    // loaded per model. Priority: dflash > MTP — a
     // loaded DFlash sidecar is an explicit choice (`--drafter` or the pack's
     // own `drafter/`) while the MTP head ships with the checkpoint;
     // `--no-drafter` (or `enable_drafter:false`) hands the round back to MTP.
@@ -7615,7 +7517,6 @@ pub fn specInitWiring(
     return .{
         .use_mtp = use_mtp,
         .use_dflash = use_dflash,
-        .use_pld = !use_mtp and !use_dflash and enable_pld,
     };
 }
 
@@ -7643,30 +7544,23 @@ test "assistant sidecar is refused for image requests" {
 }
 
 /// Which spec mode a decode tick drives for a slot.
-pub const SpecTickMode = enum { mtp, dflash, pld, regular };
+pub const SpecTickMode = enum { mtp, dflash, regular };
 
 /// Pure decode-tick dispatch decision. The slot flags carry the REQUEST's
 /// wish; the generator-side values carry what `Generator.initWithOptions`
-/// actually armed. Every arm must require BOTH: dispatching on the slot flag
-/// alone put PLD verify forwards through a trunk init had disarmed — mtp/drafter
-/// had their generator-state conjunct (`gen.mtp != null`), model-less PLD did
-/// not, so runPrefill's `use_pld=false` shaped init options while every tick
-/// still called `gen.nextPld`.
+/// actually armed. Every arm must require BOTH.
 pub fn specTickMode(
     slot_enable_mtp: bool,
     gen_has_mtp: bool,
     slot_enable_drafter: bool,
     gen_has_dflash: bool,
-    slot_enable_pld: bool,
-    gen_pld_enabled: bool,
 ) SpecTickMode {
     if (slot_enable_drafter and gen_has_dflash) return .dflash;
     if (slot_enable_mtp and gen_has_mtp) return .mtp;
-    if (slot_enable_pld and gen_pld_enabled) return .pld;
     return .regular;
 }
 
-/// Drive one Generator step (regular / PLD / drafter) and push emitted
+/// Drive one Generator step (regular / DFlash / MTP) and push emitted
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
 /// stopping the slot but NOT being emitted.
@@ -7859,17 +7753,12 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     if (slot.model.transformer) |xfm| try xfm.ssmGroupRelease(&slot.ctx);
 
     // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
-    // generators handle the disabled fallback internally, and `nextPld`'s
-    // disabled branch is also where the mid-request RE-ENABLE check lives
-    // (bypassing it pinned PLD off for the rest of the request even when the
-    // generated tail turned echo-heavy).
+    // generators handle the disabled fallback internally.
     const tick_mode: SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundFired(gen)) .regular else specTickMode(
         slot.enable_mtp,
         gen.mtp != null,
         slot.enable_drafter,
         gen.dflash != null,
-        slot.enable_pld,
-        gen.pld_enabled,
     );
     if (tick_mode == .mtp) {
         gen.mtp_group_cap = 0;
@@ -7885,17 +7774,6 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
     if (tick_mode == .dflash) {
         const result = try gen.nextDflash(slot.allocator);
-        if (result == null) {
-            finishSlot(sch, slot, gen.finish_reason);
-            return;
-        }
-        defer slot.allocator.free(result.?.tokens);
-        publishSpeculativeBlock(sch, slot, gen, result.?.tokens);
-        return;
-    }
-
-    if (tick_mode == .pld) {
-        const result = try gen.nextPld(slot.allocator, slot.pld_draft_len, slot.pld_key_len);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
             return;
@@ -8209,7 +8087,7 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
         if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
         calls += 1;
         try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
-            std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
+            std.mem.indexOf(u8, line, ", false, false, use_drafter") != null);
     }
     try testing.expectEqual(@as(usize, 4), calls);
 }
@@ -8241,7 +8119,7 @@ fn slotMimoMtpCrowdable(slot: *const Slot) bool {
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedMimoDecode()) return false;
-    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null, slot.enable_pld, gen.pld_enabled) == .mtp;
+    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }
 
 /// Step costs of a grouped GLM forward in ms (rows ubench, glm5-arch#concurrency): fixed, per
@@ -8301,7 +8179,7 @@ fn slotMtpGroupable(slot: *const Slot) bool {
     if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
     const t = slot.model.transformer orelse return false;
     if (!t.supportsBatchedGdnDecode()) return false;
-    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null, slot.enable_pld, gen.pld_enabled) == .mtp;
+    return specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;
 }
 
 const Planner = @import("mtp_group_planner.zig");
@@ -9919,39 +9797,16 @@ test "a GDN trunk is batchable AND is not clamped by the server's concurrency ga
     try testing.expect(configBatchesDecode(&cfg));
 }
 
-test "a spec_disabled_runtime slot is batchable, and that is the documented trade" {
-    // `slotTicksRegular` admits a generator whose speculation turned itself off
-    // at runtime. That is what recovered the throughput (9.6 -> 12.4 tok/s per
-    // stream on 4 concurrent 5.5k prompts), and it costs something real: the
-    // batched tick does not call `nextPld`, so its periodic re-enable check
-    // cannot run while the slot is batched. Both halves are load-bearing, so
-    // both are stated here — if the re-enable check ever moves onto the batched
-    // path, or the clause is dropped, this is the note to revisit.
-    const src = @embedFile("scheduler.zig");
-    const hs = std.mem.indexOf(u8, src, "fn slotTicksRegular(") orelse return error.MissingHelper;
-    const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
-    const hbody = src[hs..he];
-    // The clause that admits it...
-    try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime or") != null);
-    // ...and the trade it makes, written down where it is made.
-    try testing.expect(std.mem.indexOf(u8, hbody, "re-enable check") != null);
-    try testing.expect(std.mem.indexOf(u8, hbody, "SOLO slot never reaches the batched path") != null);
-}
-
 test "the batched gate reads DISPATCH, not the armed spec flags" {
-    // A prompt that merely n-gram-scores high enough to ARM PLD used to veto
-    // batched decode forever, even after PLD's own yield gate disabled itself
-    // at runtime: neither speculation nor batching (9.7 vs 14.3 tok/s per
-    // stream, 4 concurrent 4232-token prompts on Qwen3.5-4B). The armed flags
-    // are the REQUEST's wish; specTickMode is what the tick actually
-    // dispatches, and spec_disabled_runtime is what recovered the throughput.
+    // The armed flags are the REQUEST's wish; specTickMode is what the tick actually
+    // dispatches, and spec_disabled_runtime is what recovered the throughput of a
+    // slot whose speculation turned itself off.
     const src = @embedFile("scheduler.zig");
     const start = std.mem.indexOf(u8, src, "fn batchVerdict(self: *const Scheduler") orelse return error.MissingBatchable;
     const end = std.mem.indexOfPos(u8, src, start + 1, "\n    }\n") orelse return error.MissingBatchableEnd;
     const body = src[start..end];
     try testing.expect(std.mem.indexOf(u8, body, "slotTicksRegular(slot)") != null);
     // No armed-flag read may come back into the gate.
-    try testing.expect(std.mem.indexOf(u8, body, "slot.enable_pld") == null);
     try testing.expect(std.mem.indexOf(u8, body, "slot.enable_drafter") == null);
     try testing.expect(std.mem.indexOf(u8, body, "slot.enable_mtp") == null);
 
@@ -9965,8 +9820,8 @@ test "the batched gate reads DISPATCH, not the armed spec flags" {
 
     // The dispatch answer itself: a live MTP slot never ticks regular, an
     // unarmed one always does.
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, true, true));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, true, false, true, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false));
 }
 
 test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not model" {
@@ -10571,76 +10426,70 @@ test "specInitWiring: a module-owned arch only gets the spec modes it can roll b
     // draft and the shell's snapshot/truncate run over an EMPTY entries array.
     // The predicate is per-ARCH CAPABILITY (`moduleStateSpecRollback`), not ownership.
     // Args: (owns_module_state, module_spec_rollback,
-    //        enable_mtp, has_mtp, enable_drafter, has_drafter, has_dflash,
-    //        enable_pld)
+    //        enable_mtp, has_mtp, enable_drafter, has_dflash)
 
-    // Plain arch: today's precedence, unchanged.
+    // Plain arch: MTP wins over a missing sidecar.
     {
-        const w = specInitWiring(false, false, true, true, true, false, true);
-        try testing.expect(w.use_mtp and !w.use_dflash and !w.use_pld);
-    }
-    {
-        const w = specInitWiring(false, false, false, false, false, false, true);
-        try testing.expect(!w.use_mtp and w.use_pld);
+        const w = specInitWiring(false, false, true, true, true, false);
+        try testing.expect(w.use_mtp and !w.use_dflash);
     }
     // A flag with no loaded handle never arms.
     {
-        const w = specInitWiring(false, false, true, false, false, false, false);
-        try testing.expect(!w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(false, false, true, false, false, false);
+        try testing.expect(!w.use_mtp and !w.use_dflash);
     }
 
-    // DFlash rides the enable_drafter switch: dflash > MTP > drafter > PLD.
+    // DFlash rides the enable_drafter switch: dflash > MTP.
     {
-        const w = specInitWiring(false, false, false, false, true, true, true);
-        try testing.expect(!w.use_mtp and w.use_dflash and !w.use_pld);
+        const w = specInitWiring(false, false, false, false, true, true);
+        try testing.expect(!w.use_mtp and w.use_dflash);
     }
     // A loaded drafter outranks the checkpoint's own MTP head: the sidecar
     // is an explicit choice (`--drafter` or the in-dir `drafter/`), the head
     // ships with every pack; `--no-drafter` restores MTP by not loading it.
     {
-        const w = specInitWiring(false, false, true, true, true, true, true);
-        try testing.expect(w.use_dflash and !w.use_mtp and !w.use_pld);
+        const w = specInitWiring(false, false, true, true, true, true);
+        try testing.expect(w.use_dflash and !w.use_mtp);
     }
     // enable_drafter:false on the request hands the round back to MTP.
     {
-        const w = specInitWiring(false, false, true, true, false, true, true);
+        const w = specInitWiring(false, false, true, true, false, true);
         try testing.expect(w.use_mtp and !w.use_dflash);
     }
-    // enable_drafter:false opts BOTH sidecar kinds out.
+    // enable_drafter:false opts the sidecar out.
     {
-        const w = specInitWiring(false, false, false, false, false, true, true);
-        try testing.expect(!w.use_dflash and w.use_pld);
+        const w = specInitWiring(false, false, false, false, false, true);
+        try testing.expect(!w.use_dflash);
     }
 
     // Module-owned with NO rollback: everything off.
     {
-        const w = specInitWiring(true, false, true, true, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(true, false, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_dflash);
     }
 
     // Module-owned WITH rollback: its own MTP head arms; the shell
     // spec modes stay off because none has been measured on this family.
     {
-        const w = specInitWiring(true, true, true, true, true, true, true);
-        try testing.expect(w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(true, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_dflash);
     }
     // Rollback capability alone never arms a head that is not loaded.
     {
-        const w = specInitWiring(true, true, true, false, true, true, true);
-        try testing.expect(!w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(true, true, true, false, true, true);
+        try testing.expect(!w.use_mtp and !w.use_dflash);
     }
     // ...nor one the request opted out of.
     {
-        const w = specInitWiring(true, true, false, true, true, false, true);
+        const w = specInitWiring(true, true, false, true, true, false);
         try testing.expect(!w.use_mtp);
     }
     // An image request keeps the head (the qwen4 head takes the slot's
     // M-RoPE table); the drafters stay off.
     {
-        const w = specInitWiring(true, true, true, true, true, true, true);
-        try testing.expect(w.use_mtp and !w.use_dflash and !w.use_pld);
+        const w = specInitWiring(true, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_dflash);
     }
-
 }
 
 test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
@@ -10649,7 +10498,7 @@ test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
     const src = @embedFile("scheduler.zig");
     // Keyed on the call site's own bindings, not on a `specInitWiring(` prefix
     // this test's own arms would satisfy.
-    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_pld = wiring" ++ ".use_pld;" }) |needle| {
+    inline for (.{"const use_mtp = wiring" ++ ".use_mtp;"}) |needle| {
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
     }
     // The exclusion must come from the shared predicate, not a new arch list.
@@ -10675,44 +10524,22 @@ test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained
 }
 
 test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {
-    // runPrefill's per-site guard can compute use_pld=false and wire it into
-    // Generator init options; a decode tick dispatching on `slot.enable_pld`
-    // alone would still call `gen.nextPld`. mtp/drafter are saved by their
-    // generator-state conjunct (`gen.mtp != null`); PLD has no model handle,
-    // so its conjunct must be the generator's post-init `pld_enabled`.
-
-    // Slot wants PLD, generator was NOT armed (chokepoint or per-site guard
-    // flipped it off) → the tick must run the regular path.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false));
-    // Slot wants PLD and init armed it → PLD runs.
-    try testing.expectEqual(SpecTickMode.pld, specTickMode(false, false, false, false, true, true));
-    // Generator armed but the slot never asked (stale generator state must
-    // not resurrect spec either) → regular.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true));
-
-    // mtp/drafter keep their existing both-sides contract.
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false));
-
-    // Priority: MTP > drafter > PLD (the spec-dispatch rule).
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, false, true, true));
-
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false));
+    // mtp and dflash each need the slot's wish AND the generator's handle.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false));
     // Generator armed but the request opted enable_mtp off → serial.
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, true, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false));
 
-    // DFlash: slot's enable_drafter + generator's dflash handle; outranks the
-    // gemma drafter AND the MTP head (a loaded sidecar is the explicit
-    // choice). Generator handle alone never resurrects it,
-    // and a dflash generator with the slot flag off stays regular (the
-    // specTickMode both-sides contract) — or MTP when that is armed.
-    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, false, false));
-    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true, false, false));
-    try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, true, false, false));
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, true, false, false));
-    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, true, false, false));
+    // DFlash: slot's enable_drafter + generator's dflash handle; outranks the MTP
+    // head (a loaded sidecar is the explicit choice). A generator handle alone never
+    // resurrects it, and a dflash generator with the slot flag off stays regular, or
+    // MTP when that is armed.
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(false, false, true, true));
+    try testing.expectEqual(SpecTickMode.dflash, specTickMode(true, true, true, true));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, true));
 }
 
 test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
@@ -10906,13 +10733,11 @@ test "MiMo crowded MTP takes an eligible slot" {
     gen.mtp_serial_left = 0;
     gen.mtp_serial_exit = .none;
     gen.dflash = null;
-    gen.pld_enabled = false;
     var slot: Slot = undefined;
     slot.model = &model;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
     slot.enable_drafter = false;
-    slot.enable_pld = false;
     slot.sampling = .{};
     slot.logprobs_n = 0;
     try testing.expect(slotMimoMtpCrowdable(&slot));
@@ -10931,7 +10756,6 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.mtp_cache = .{ .qwen = undefined };
     gen.has_last_hidden = true;
     gen.dflash = null;
-    gen.pld_enabled = false;
     gen.done = false;
     gen.sampling = .{};
     gen.logprobs_n = 1;
@@ -10941,7 +10765,6 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
     slot.enable_drafter = false;
-    slot.enable_pld = false;
     slot.finished = false;
     slot.error_code = null;
     defer if (slot.error_code) |code| testing.allocator.free(code);
@@ -11241,13 +11064,13 @@ test "every real streamed pack and source on this box plans a streamed load" {
         const path = try @import("test_models.zig").packPath(&path_buf, case.name);
         var config = model_mod.parseConfig(t.io, t.allocator, path) catch continue;
         defer config.deinit(t.allocator);
-        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, 0, 60 << 30, false);
+        const plan = try planExpertStreaming(t.io, t.allocator, &config, path, 60 << 30, false);
         try t.expectEqual(case.layout, plan.layout);
         try t.expect(plan.cache.slots_per_layer > 1);
         try t.expect(plan.split.trunk > 0 and plan.split.trunk < 40 << 30);
         try t.expectEqual(@as(u64, 0), plan.split.vision);
         try t.expectEqual(case.tower, plan.vision.tower_bytes);
-        const seen = try planExpertStreaming(t.io, t.allocator, &config, path, 0, 60 << 30, true);
+        const seen = try planExpertStreaming(t.io, t.allocator, &config, path, 60 << 30, true);
         try t.expectEqual(case.tower, seen.split.vision);
         try t.expectEqual(plan.split.trunk, seen.split.trunk);
         try t.expectEqual(seen.vision.slots_with.?, seen.cache.slots_per_layer);
@@ -12656,7 +12479,6 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     sch.registry = reg;
     sch.io = io;
     sch.allocator = testing.allocator;
-    sch.expert_cache_bytes = 0;
     sch.ssd_budget_bytes = 0;
     sch.mtp_enabled = true;
     sch.mtp_explicit = false;

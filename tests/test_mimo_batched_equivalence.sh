@@ -58,7 +58,7 @@ for i, a in enumerate(asks):
     open(f"{work}/p{i}.json", "w").write(s)
 PY
 
-"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --kv-quant 8 --no-mtp --no-pld \
+"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --kv-quant 8 --no-mtp \
     --max-concurrent 5 --prefix-cache-entries 0 --log-level info > "$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 900); do
@@ -128,7 +128,7 @@ PYCODE
 kill "$SERVER_PID" 2>/dev/null
 wait "$SERVER_PID" 2>/dev/null
 LOG="$WORK/server-mtp.log"
-"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --kv-quant 8 --mtp --no-pld --metrics \
+"$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --kv-quant 8 --mtp --metrics \
     --max-concurrent 5 --prefix-cache-entries 0 --log-level info > "$LOG" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 900); do

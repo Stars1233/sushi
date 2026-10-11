@@ -72,7 +72,7 @@ echo "── #47: pre-flight refusal must exit cleanly (no SIGSEGV) ──"
 
 # Run WITHOUT the bypass so the pre-flight fires. The model never loads (refused
 # on the apparent 80 GB weights), so this returns within a couple seconds.
-"$BINARY" --model "$FAKE" --serve --port "$PORT" --no-pld --log-level info > "$LOG" 2>&1
+"$BINARY" --model "$FAKE" --serve --port "$PORT" --log-level info > "$LOG" 2>&1
 CODE=$?
 
 # 139 = 128 + SIGSEGV(11) — the bug. Any non-139 (clean error exit, typically 1)
