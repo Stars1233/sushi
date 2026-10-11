@@ -99,7 +99,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 ## Decode (one evaluation per token, submitted every four layers)
 
 - Async4 is bit-identical to synchronous layers but may hold two cache generations.
-- KDA QKV in one dispatch over the three resident A6/A8 banks (restricted port of oMLX `multi_qmv`; a concatenated
+- KDA QKV in one dispatch over the three resident A5/A6/A8 banks (restricted port of oMLX `multi_qmv`; a concatenated
   bank copy would cost 3.29 GiB), then the fused one-token body: conv, BF16 SiLU, L2, per-channel forget gate, delta
   recurrence, gated output norm. Its unary math variants are chosen by probe at first use.
 - Router: FP32 GEMV with sigmoid and correction, then stable top-8 and unbiased normalization (two dispatches; BF16
@@ -121,13 +121,20 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 
 ## DFlash2 verification
 
-- **Prepared three-row inputs**: large A6 projections reuse the input's original BF16 group sums and exact
+- **Stored widths**: every affine kernel below and the decode QKV serve A5, A6 and A8 g128, each in MLX `qmv_fast`'s
+  own order for that width (A5: sixteen values per lane in two 5-byte packs, K steps by 512, so K % 512 == 0). A
+  width a kernel declines falls back to one stock qmv per row, which reads the bank once per row
+  ([A5 trunk](glm5-perf.md#glm-a5-verify)). One-shot load lines name each path a pack reaches: `[glm] copy-free QKV
+  engaged (A5g128)`, `[glm-dflash] coefficient hoist rows engaged`, `[glm-dflash] affine row tiles engaged`.
+  A6 dense-once and the MLA prefill head batches stay A6-only: the head batch changes numerics, so an A5 arm needs
+  its own KLD gate. `SUSHI_GLM_QMM_UBENCH=1` times serial rows, hoist and row tiles per width at the trunk shapes.
+- **Prepared three-row inputs**: large A5/A6 projections reuse the input's original BF16 group sums and exact
   power-of-two coefficients across output tiles. HC expansion emits both the rounded residual and its FP32
   normalized view for the next collapse. The default NAX three-row path uses two-layer asynchronous groups;
   explicit schedules and other widths are unchanged. Together these save
   [3.5–3.9% versus the dev2 baseline](glm5-perf.md#glm-three-prepared-input), below the additional 5% target.
 
-- **Three-row MLA value and normalization**: on the NAX path, the A6 value bank reuses its weights across all
+- **Three-row MLA value and normalization**: on the NAX path, the A5/A6 value bank reuses its weights across all
   three rows, and HC collapse emits the normalized branch input directly. The latter preserves the intermediate
   BF16 value and native RMS reduction order. Together with expert reuse/tiling, measured verification is
   [5.25–5.98% lower verification time](glm5-perf.md#glm-three-value-norm) than `f40fa548`; draft depth is unchanged.
@@ -158,7 +165,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
   state before evaluating, so MLX appends in place; a buffer the committed request still shares is copied whole,
   reservation included (BF16, 200K-row reservation: replay 10.3 → 1.3–2.1 ms per round, decode 26.7 → 30.15 tok/s,
   `194351a3`). A failure after the hand-over leaves the request failed.
-- **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order. The A6
+- **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order. The A5/A6
   three/four-row specialization uses complete row tiles and two outputs per SIMD subgroup, reducing per-thread
   accumulators. Combined with batched FP32 attention, verification takes about 11% less time on M5 Max with
   Sushi-2.5bpw/A4 g64 ([measurement](glm5-perf.md#glm-verify-final)). Retained BF16 KDA projections run as column
@@ -273,6 +280,8 @@ Decode and verify:
   -5% serial before the 1-4 row SIMD32 collapse; on top of it 0 to +2% at B=1-4, 8K (`de867e94`).
 - Joined QKV dispatch (3–4 rows: +0.7–3.0%; later over the three hoisted A6 banks: −0.57%, 6/11): noise.
 - Raw A6 four-product unpack: +1.3% (5/11). A6 hoist on the output projection: −2.8%, 7/11, drifting.
+- An A5 hoist that holds all 24 coefficients of both packs at once: about 2x the serial rows. The served A5 hoist takes
+  one pack at a time ([measurement](glm5-perf.md#glm-a5-verify)).
 - Per-node packed NAX decode attention: +23–60%, 0/6 in all nine cases. Shared-factor split-8 merge: +2–5%.
 - Short-row NAX index scorer (M128/K128/C2048): +14%, 0/11. Four-subgroup scalar scorer: 0.83% slower paired.
   Shared-prefix three-query scoring: +18%, 1/22.

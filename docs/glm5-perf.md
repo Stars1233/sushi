@@ -300,6 +300,35 @@ Bounding readout saved about 1.1 ms of drafting, but N3 still lost on the longer
 three-row default remains; the faster four-row verifier also serves existing lookup chains and mixed-request ticks.
 The N3 policy/readout experiment and benchmark switches were removed from production code.
 
+<a id="glm-a5-verify"></a>
+## GLM DFlash2: A5 trunk takes the row tiles, hoist and decode QKV
+
+2026-10-11, M5 Max 128 GB, GLM-5.3-Flash-Sushi-2bpw (A5 g128 trunk, A6 `lm_head`, K2 MCG W14 experts) against
+Sushi-2.4bpw (A6 g128 trunk). Before this change every 5-bit verify projection ran one stock qmv per row. Old binary
+= `57b7ec5e` (SHA256 prefix `915ff17920c65f41`), new = this change on `57b7ec5e` (`a2a6b8f914e01593`), both ReleaseFast.
+`sushi --serve` defaults (kv8 latent, A4 g64 DFlash2 from the pack), llmprobe 0.6.16 `--bench-only` default rungs,
+plus two greedy requests per boot. `taskpolicy -a`, GPU lock per boot, QUIET window (no `zig`/`clang` running),
+maximum fans, 3 min between boots, one boot per arm in the order shown.
+Verify is the median `glm_round_ms verify` over the 36–37 requests of each boot.
+
+| Arm | Power | Decode tok/s | Spec predictable / novel | Ladder ~4.2k / 8.3k / 16.3k | Verify ms/round |
+|---|---|---:|---:|---:|---:|
+| Sushi-2bpw, old | battery 94% | 45.4 (41.6–45.6) | 58.0 / 37.5 | 41.0 / 41.9 / 40.8 | 49.58 |
+| Sushi-2bpw, new | battery 85%, then AC | 53.3 (51.4–54.6) | 64.7 / 36.9 | 41.1 / 42.2 / 45.0 | 45.10 |
+| Sushi-2.4bpw, new (A6 path unchanged) | AC | 50.2 (46.9–50.2) | 60.2 / 37.7 | 46.7 / 47.8 / 44.4 | 44.60 |
+
+- Decode +17% on the same pack. At the 8.3k and 16.3k rungs, verify per round is 47.06 / 46.33 ms against 2.4bpw's
+  45.82 / 45.64 (old 2bpw: about 51.6). The ~512 rung is left out: new-2bpw's request there slowed every phase about
+  2.5x during the battery-to-AC switch, the untouched draft included (10.83 vs 4.12 ms).
+- The owner's recorded 2.4bpw run (`8896da54` era, the same llmprobe, rungs 2k–32k) read decode 54 (50.7–54.2), spec
+  65.2 / 41.9. Its ladder rungs differ from these, so only the headline cells compare.
+- Engagement in the new 2bpw log: `[glm] copy-free QKV engaged (A5g128)`, `[glm-dflash] coefficient hoist rows engaged
+  (A5g128)`, `[glm-dflash] affine row tiles engaged (A5g128)`. The A6 lines come from `lm_head`. Both greedy answers
+  matched the old binary byte for byte in every 2bpw boot.
+- Component, `SUSHI_GLM_QMM_UBENCH` (3 rows, 12 distinct banks per arm, lock, not a quiet window): 8192x4096 serial
+  stock 0.104 ms, A5 hoist 0.0645, A5 row tiles 0.078 (A6 hoist 0.089); 4096x16384 0.210 / 0.130 / 0.146. An A5
+  hoist holding all 24 coefficients at once ran 0.191 ms, slower than the serial rows.
+
 <a id="glm-three-row-a6-offset"></a>
 ## GLM DFlash2: specialize the complete three-row A6 tile
 

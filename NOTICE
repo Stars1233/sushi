@@ -163,15 +163,16 @@ Used in sushi (`src/glm5_decode.zig`):
 
   * The copy-free three-bank affine QKV dispatch adapts `multi_qmv` from
     `omlx/patches/mlx_vlm_glm5_next_compat/decode_kernels.py` at 6745c39c.
-    It is restricted to one BF16 input row, 8-bit weights and group128;
+    It is restricted to one BF16 input row, 5-, 6- and 8-bit weights and group128;
     each bank keeps its original packed weights, scales and biases.
     Its MLX-derived qmv-fast arithmetic retains the MIT attribution below.
 
 The affine row tile in `src/glm5_dflash_qmm.zig` adapts that arithmetic to
 reuse each weight group across up to four verification rows, retaining the
-per-row dot, scale/bias update and SIMD reduction order. Its 6-bit path also
-adapts MLX `load_vector` and `qdot` from `quantized.h`, including grouped
-activation sums and split-byte products, under the MIT attribution below.
+per-row dot, scale/bias update and SIMD reduction order. Its 5- and 6-bit paths,
+and the coefficient hoist in `src/glm5_dflash_a6_hoist.zig`, also adapt MLX
+`load_vector` and `qdot` from `quantized.h`, including grouped activation sums
+and split-byte products, under the MIT attribution below.
 
 Used in sushi (`src/glm5_kda_fused.zig`):
 

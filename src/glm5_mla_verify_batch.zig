@@ -13,7 +13,7 @@ pub fn run(ops: *Ops, in: Input, dir: Direction) !?Arr {
         !std.mem.eql(c_int, &.{ xs[0], 64, 1, if (dir == .query) @as(c_int, 256) else 512 }, xs) or
         mlx.mlx_array_dtype(in.x) != .bfloat16 or mlx.mlx_array_dtype(in.w) != .uint32 or
         mlx.mlx_array_dtype(in.scales) != .bfloat16 or mlx.mlx_array_dtype(in.biases) != .bfloat16 or
-        !std.mem.eql(c_int, &.{ 64, 256, 96 }, mlx.getShape(in.w)) or !std.mem.eql(c_int, &.{ 64, 256, 4 }, mlx.getShape(in.scales)) or
+        !(std.mem.eql(c_int, &.{ 64, 256, 96 }, mlx.getShape(in.w)) or std.mem.eql(c_int, &.{ 64, 256, 80 }, mlx.getShape(in.w))) or !std.mem.eql(c_int, &.{ 64, 256, 4 }, mlx.getShape(in.scales)) or
         !std.mem.eql(c_int, mlx.getShape(in.scales), mlx.getShape(in.biases))) return null;
     if (dir == .value and xs[0] == 3) {
         const linear = @import("glm5_model.zig").Linear{ .w = in.w, .scales = in.scales, .biases = in.biases, .input = 512, .output = 256 };
@@ -21,13 +21,13 @@ pub fn run(ops: *Ops, in: Input, dir: Direction) !?Arr {
     }
     return try ops.qmm(in.x, in.w, in.scales, in.biases, dir == .value);
 }
-fn fixture(ops: *Ops, dir: Direction, rows: c_int) !Input {
+fn fixture(ops: *Ops, dir: Direction, rows: c_int, bits: c_int) !Input {
     const key = try ops.slot();
     try mlx.check(mlx.mlx_random_key(key, if (dir == .query) 1903 else 1913));
     const x = try ops.slot();
     try mlx.check(mlx.mlx_random_normal(x, &.{ rows, 64, 1, if (dir == .query) @as(c_int, 256) else 512 }, 4, .bfloat16, 0, 0.2, key.*, ops.s));
     const w = try ops.slot();
-    try mlx.check(mlx.mlx_random_bits(w, &.{ 64, 256, 96 }, 3, 4, key.*, ops.s));
+    try mlx.check(mlx.mlx_random_bits(w, &.{ 64, 256, 16 * bits }, 3, 4, key.*, ops.s));
     const sc = try ops.slot();
     try mlx.check(mlx.mlx_random_uniform(sc, try ops.scalar(0.001, .bfloat16), try ops.scalar(0.01, .bfloat16), &.{ 64, 256, 4 }, 3, .bfloat16, key.*, ops.s));
     const bi = try ops.slot();
@@ -39,14 +39,14 @@ fn fixture(ops: *Ops, dir: Direction, rows: c_int) !Input {
 }
 
 test "GLM MLA verify batch matches each serial row projection" {
-    for ([_]Direction{ .query, .value }) |dir| for ([_]c_int{ 3, 4 }) |rows| {
+    for ([_]c_int{ 6, 5 }) |bits| for ([_]Direction{ .query, .value }) |dir| for ([_]c_int{ 3, 4 }) |rows| {
         if (dir == .query and rows != 3) continue;
         var ops = Ops{ .s = mlx.gpuStream() };
         defer ops.deinit();
-        const in = try fixture(&ops, dir, rows);
+        const in = try fixture(&ops, dir, rows, bits);
         const hoist = @import("glm5_dflash_a6_hoist.zig");
         const before = hoist.dispatchCount();
-        const got = (try run(&ops, in, dir)) orelse return error.SkipZigTest;
+        const got = (try run(&ops, in, dir)) orelse if (@import("glm5_model.zig").naxArms()) return error.TestExpectedMlaVerifyBatch else return error.SkipZigTest;
         try std.testing.expectEqual(before + @as(usize, if (dir == .value and rows == 3) 1 else 0), hoist.dispatchCount());
         try mlx.check(mlx.mlx_array_eval(got));
         for (0..@intCast(rows)) |row| {
