@@ -10,6 +10,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Cleanup**: `SUSHI_GDN_PIPELINED` is removed; the software-pipelined GDN prefill kernel is always the route of Flash-Next on NAX GPUs.
 - **Cleanup**: `SUSHI_SSD_WRITE_THROUGH` is removed; the prefill write-through to the SSD prefix cache is always on when its gates pass, and behaviour is unchanged.
 - **Cleanup**: `SUSHI_FUSED_256` is removed; the fused head-dim-256 prefill attention is always on, and output is unchanged.
+- **Flags**: a bad value for `--prefix-cache-entries`, `--max-concurrent`, `--max-resident-models`, `--idle-evict-secs`, `--log-level`, `--prefill-chunk`, `--ssm-checkpoint-max`, `--port`, `--temp` and the other numeric flags exits with an error naming the flag, instead of falling back to a default.
+- **Flags**: `--tool` outside `sushi run`, and `--stream` without `--prompt`, are errors instead of being ignored.
 - **Flags**: `--help` lists every flag, including `--drafter`, `--no-drafter`, `--max-concurrent` and `sushi kld --no-mtp`.
 - **Flags**: `--fast` is removed; pass the flags it set (`--mtp`, `--mtp-typical`, `--mtp-greedy-tail`, `--kv-quant 8`) yourself.
 - **Flags**: standalone prompt lookup decoding is removed with `--pld`, `--no-pld`, `--pld-draft-len` and `--pld-key-len`, the request field `enable_pld` and `/props settings.pld`; the prompt lookups inside MTP rounds and GLM DFlash2 stay (`--no-mtp-lookup`).

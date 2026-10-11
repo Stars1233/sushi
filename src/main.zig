@@ -452,6 +452,7 @@ pub fn main(init: std.process.Init) !void {
     var serve_mode = false;
     var serve_explicit = false;
     var stream_mode = false;
+    var tool_flag_given = false;
     var prompt: ?[]const u8 = null;
     var max_tokens: u32 = 100;
     var temperature: f32 = 0.0;
@@ -535,7 +536,7 @@ pub fn main(init: std.process.Init) !void {
             model_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             i += 1;
-            port_flag = try std.fmt.parseInt(u16, args[i], 10);
+            port_flag = flagInt(u16, "--port", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--host") and i + 1 < args.len) {
             i += 1;
             host_flag = args[i];
@@ -556,6 +557,7 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--tool takes on or off, not '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+            tool_flag_given = true;
         } else if (std.mem.eql(u8, args[i], "--edit") and i + 1 < args.len) {
             i += 1;
             run_opts.edit = cli_mod.parseToolSwitch(args[i]) orelse {
@@ -570,21 +572,21 @@ pub fn main(init: std.process.Init) !void {
             prompt = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-tokens") and i + 1 < args.len) {
             i += 1;
-            max_tokens = try std.fmt.parseInt(u32, args[i], 10);
+            max_tokens = flagInt(u32, "--max-tokens", args[i], 0);
             serve_default_max_tokens = max_tokens;
         } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
             i += 1;
-            temperature = try std.fmt.parseFloat(f32, args[i]);
+            temperature = flagFloat("--temp", args[i]);
             temp_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--top-p") and i + 1 < args.len) {
             i += 1;
-            top_p_flag = try std.fmt.parseFloat(f32, args[i]);
+            top_p_flag = flagFloat("--top-p", args[i]);
         } else if (std.mem.eql(u8, args[i], "--top-k") and i + 1 < args.len) {
             i += 1;
-            top_k_flag = try std.fmt.parseInt(u32, args[i], 10);
+            top_k_flag = flagInt(u32, "--top-k", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
             i += 1;
-            ctx_size = try std.fmt.parseInt(u32, args[i], 10);
+            ctx_size = flagInt(u32, "--ctx-size", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--config-overrides") and i + 1 < args.len) {
             // vLLM's `--hf-overrides` analogue. Applied the moment the flag is
             // seen, so no config.json is ever parsed without it — the loaded
@@ -600,7 +602,7 @@ pub fn main(init: std.process.Init) !void {
             log.info("[args] config-overrides: {s}\n", .{args[i]});
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
-            timeout = try std.fmt.parseInt(u32, args[i], 10);
+            timeout = flagInt(u32, "--timeout", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
         } else if (std.mem.eql(u8, args[i], "--vision")) {
@@ -673,16 +675,18 @@ pub fn main(init: std.process.Init) !void {
             generate_mod.mtp_greedy_tail_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
-            generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
+            generate_mod.max_mtp_ctx = flagInt(u32, "--max-mtp-ctx", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
-            reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
+            reasoning_budget = flagInt(i32, "--reasoning-budget", args[i], -1);
         } else if (std.mem.eql(u8, args[i], "--log-level") and i + 1 < args.len) {
             i += 1;
-            if (log.Level.fromString(args[i])) |level| {
-                log.setLevel(level);
-                log_level_explicit = true;
-            }
+            const level = log.Level.fromString(args[i]) orelse {
+                log.err("--log-level: expected error, warn, info or debug; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            log.setLevel(level);
+            log_level_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--log-file") and i + 1 < args.len) {
             i += 1;
             log_file_arg = args[i];
@@ -697,18 +701,12 @@ pub fn main(init: std.process.Init) !void {
             no_update_check = true;
         } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
             i += 1;
-            // `explicit` disables the machine-sized pin, so only a real width
-            // earns it — a typo'd value keeps the defaults (flag-absent
-            // behavior), never a silent 8192 that also switches sizing off.
-            if (std.fmt.parseInt(usize, args[i], 10)) |v| {
-                if (v > 0) {
-                    generate_mod.prefill_chunk_override = v;
-                    generate_mod.prefill_chunk_explicit = true;
-                }
-            } else |_| {}
+            // `explicit` disables the machine-sized pin, so only a real width earns it.
+            generate_mod.prefill_chunk_override = flagInt(usize, "--prefill-chunk", args[i], 1);
+            generate_mod.prefill_chunk_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
-            server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
+            server_mod.prefix_cache_capacity = flagInt(u32, "--prefix-cache-entries", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and i + 1 < args.len) {
             // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
             // bare numbers (bytes), a suffix of `MB`/`GB`/`KB` (case-
@@ -747,7 +745,7 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
-            server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
+            server_mod.ssm_checkpoint_max = flagInt(u32, "--ssm-checkpoint-max", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
@@ -765,7 +763,7 @@ pub fn main(init: std.process.Init) !void {
             decode_share_flag = args[i];
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
-            server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
+            server_mod.max_concurrent = flagInt(u32, "--max-concurrent", args[i], 0);
         } else if (std.mem.eql(u8, args[i], "--model-dir") and i + 1 < args.len) {
             // REPEATABLE. A user's library can live in more than one place (the
             // app's download folder, an external drive, an LM Studio tree), and
@@ -787,8 +785,7 @@ pub fn main(init: std.process.Init) !void {
             // Plan 05 Phase D: cap on .ready entries in the registry.
             // ensureLoaded evicts LRU before loading when this would be exceeded.
             i += 1;
-            max_resident_models = std.fmt.parseInt(u32, args[i], 10) catch 3;
-            if (max_resident_models == 0) max_resident_models = 1;
+            max_resident_models = flagInt(u32, "--max-resident-models", args[i], 1);
         } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and i + 1 < args.len) {
             // Plan 05 Phase D: cap on summed resident bytes. Accepts the
             // same suffixes as --prefix-cache-mem. Special string "auto"
@@ -814,7 +811,7 @@ pub fn main(init: std.process.Init) !void {
             // .ready entries (refcount==0) whose last_used_ms is older than
             // this. Default off — eviction is on-demand only.
             i += 1;
-            const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
+            const n = flagInt(u32, "--idle-evict-secs", args[i], 0);
             idle_evict_secs = if (n > 0) n else null;
         } else if (std.mem.eql(u8, args[i], "--qwen-gdn") and i + 1 < args.len) {
             i += 1;
@@ -851,6 +848,15 @@ pub fn main(init: std.process.Init) !void {
         log.err("--vision and --no-vision conflict; pass one\n", .{});
         std.process.exit(1);
     };
+
+    if (tool_flag_given and run_model_dir == null) {
+        log.err("--tool: only valid with `sushi run <model>`\n", .{});
+        std.process.exit(1);
+    }
+    if (stream_mode and prompt == null) {
+        log.err("--stream: only valid with --prompt\n", .{});
+        std.process.exit(1);
+    }
 
     if (prompt != null and (serve_explicit or (use_default_models_root and run_model_dir == null) or host_flag != null or port_flag != null or run_opts.tools)) {
         log.err("--prompt/-p cannot be combined with serve, --serve, --host, --port, or --tool on; it uses a private local listener and exits after one reply.\n", .{});
@@ -1659,6 +1665,21 @@ fn configOverridesJsonValid(raw: []const u8) bool {
     defer arena.deinit();
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), raw, .{}) catch return false;
     return v == .object;
+}
+
+/// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
+fn flagInt(comptime T: type, flag: []const u8, text: []const u8, min: T) T {
+    return cli_mod.parseFlagInt(T, text, min) orelse {
+        log.err("{s}: expected a whole number of at least {d}; got '{s}'\n", .{ flag, min, text });
+        std.process.exit(1);
+    };
+}
+
+fn flagFloat(flag: []const u8, text: []const u8) f32 {
+    return cli_mod.parseFlagFloat(text) orelse {
+        log.err("{s}: expected a number; got '{s}'\n", .{ flag, text });
+        std.process.exit(1);
+    };
 }
 
 fn parseSizeArg(s: []const u8) !u64 {

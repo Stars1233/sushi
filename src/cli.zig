@@ -65,6 +65,39 @@ pub fn classifyUnparsedArg(arg: []const u8, is_last: bool) ArgReject {
     return .unknown;
 }
 
+/// A launch flag's whole-number value at or above `min`; null when `text` is not one.
+pub fn parseFlagInt(comptime T: type, text: []const u8, min: T) ?T {
+    const n = std.fmt.parseInt(T, text, 10) catch return null;
+    return if (n < min) null else n;
+}
+
+/// A launch flag's finite number; null when `text` is not one.
+pub fn parseFlagFloat(text: []const u8) ?f32 {
+    const v = std.fmt.parseFloat(f32, text) catch return null;
+    return if (std.math.isFinite(v)) v else null;
+}
+
+test "launch flag values: a bad value is null, never a default" {
+    try testing.expectEqual(@as(?u32, 32), parseFlagInt(u32, "32", 0));
+    try testing.expectEqual(@as(?u32, 0), parseFlagInt(u32, "0", 0));
+    try testing.expectEqual(@as(?u32, null), parseFlagInt(u32, "0", 1));
+    try testing.expectEqual(@as(?u32, null), parseFlagInt(u32, "many", 0));
+    try testing.expectEqual(@as(?u32, null), parseFlagInt(u32, "-1", 0));
+    try testing.expectEqual(@as(?u32, null), parseFlagInt(u32, "", 0));
+    try testing.expectEqual(@as(?i32, -1), parseFlagInt(i32, "-1", -1));
+    try testing.expectEqual(@as(?i32, null), parseFlagInt(i32, "-2", -1));
+    try testing.expectEqual(@as(?u16, null), parseFlagInt(u16, "70000", 0));
+    try testing.expectEqual(@as(?f32, 0.5), parseFlagFloat("0.5"));
+    try testing.expectEqual(@as(?f32, null), parseFlagFloat("warm"));
+    try testing.expectEqual(@as(?f32, null), parseFlagFloat("inf"));
+}
+
+test "--log-level: only the four levels parse" {
+    try testing.expect(log.Level.fromString("debug") != null);
+    try testing.expect(log.Level.fromString("verbose") == null);
+    try testing.expect(log.Level.fromString("") == null);
+}
+
 // ── Alias table ─────────────────────────────────────────────────────────
 
 pub const Alias = struct {
