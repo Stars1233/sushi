@@ -149,16 +149,16 @@ check "[4] malformed file: load -> 200 (got $CODE), defaults apply (kv source $(
     "$([ "$CODE" = "200" ] && [ "$(row "$MODEL_A" src)" = "default" ] && echo 1 || echo 0)"
 check "[4] malformed file logged" "$(grep -q "\[model-settings\] .*malformed" "$LOG" && echo 1 || echo 0)"
 
-# [5] ssd_budget_gb on a model that does not stream experts: ignored, warned once, load still 200
+# [5] ssd_budget_gb on a Sushi pack: the load streams its experts at that budget
 cat >"$SETTINGS" <<JSON
 { "$MODEL_A/": { "ssd_budget_gb": 60 } }
 JSON
 post unload-model "{\"model\":\"$MODEL_A\"}" >/dev/null
 CODE="$(load "$MODEL_A")"
-check "[5] ssd_budget_gb on a non-streaming model: load -> 200 (got $CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
+check "[5] ssd_budget_gb on a Sushi pack: load -> 200 (got $CODE)" "$([ "$CODE" = "200" ] && echo 1 || echo 0)"
 check "[5] the setting is logged" "$(grep -q "\[model-settings\] .*ssd_budget_gb=60" "$LOG" && echo 1 || echo 0)"
-check "[5] one line says it is ignored" \
-    "$([ "$(grep -c "ssd_budget_gb ignored" "$LOG")" = "1" ] && echo 1 || echo 0)"
+check "[5] the load streams at the file's budget, never ignoring it" \
+    "$(grep -q "\[expert-stream\] ssd budget 60 GiB from model-settings.json" "$LOG" && ! grep -q "ssd_budget_gb ignored" "$LOG" && echo 1 || echo 0)"
 
 # [6] explicit launch flags outrank every competing key in the file
 kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=""
