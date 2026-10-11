@@ -25,6 +25,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Anthropic API**: a thought that starts after visible text gets its own content block index instead of the still-open text block's, and carries only its own text instead of repeating the answer that streamed before it.
 - **Reasoning**: a `<think>` or `</think>` the model writes inside a backtick code span, while explaining the format, stays text instead of splitting the thought or the answer, on every endpoint.
 - **Completions**: `/v1/completions` reads `prompt` given as token ids (`[1,2,3]`, `[[1,2,3]]`), refuses a batch of prompts and `echo: true` with a named 400 instead of a misleading "prompt is required" or a silent drop.
+- **Qwen3.8-Flash-Next**: `--qwen-gdn fp32` keeps the recurrent state in f32 between tokens, for measuring what the
+  default bf16 state costs.
 
 ---
 
