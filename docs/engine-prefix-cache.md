@@ -221,6 +221,7 @@ Ported from [mlx-serve #680](https://github.com/ddalcu/mlx-serve/pull/680), with
   hard-links one chunk into several entries. The tier's own `total_bytes` already bills it once.
 - **A restore that finds a chunk file missing or short poisons the entry** (`restoreKvInto`), so the request prefills
   cold and the next commit of that prompt stores fresh instead of seeing it as superseded.
+- **A restore that fails on an unreadable or corrupt file poisons its entry on every arm** (`poisonUnreadable`: `MlxError`, `DiskCacheCorrupt*`), so a same-size rotted chunk is not retried on each lookup; a coverage miss (no checkpoint, QSA gap) leaves the entry, since a shorter prefix can still serve.
 - A binary older than the lock takes none, so beside a newer one it still shares the root; only the token check
   covers that.
 

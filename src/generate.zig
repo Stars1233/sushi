@@ -2006,6 +2006,8 @@ pub const Generator = struct {
     spec_disabled_runtime: bool = false,
     /// Why `spec_disabled_runtime` was set, for `[spec-stats]`.
     spec_disable_reason: SpecDisableReason = .none,
+    /// A loop convicted inside the thought already closed it: one recovery per request.
+    think_closed_by_loop: bool = false,
     /// Adaptive serial controller: which arm this request is on and the KV bucket it was decided in.
     mtp_adaptive: MtpAdaptive = .{},
     /// This request has released the module-owned MTP head (sticky serial arm reached a serial

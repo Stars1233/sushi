@@ -1865,6 +1865,8 @@ pub const Scheduler = struct {
         // slice handed to the LoadRequest stays valid while we block on `done`.
         var victims_buf: [16]*LoadedModel = undefined;
         var n_victims: usize = 0;
+        var pinned = false;
+        errdefer if (pinned) self.registry.releaseStatus(entry);
 
         const settings_budget = resolveSsdBudget(self.ssd_budget_bytes, owned.config.ssd_budget_gb_override, owned.config.supportsExpertStreaming()).bytes;
         const streaming_gate_bytes: ?u64 = if (expert_stream_mod.expertStreamingEngaged(
@@ -1903,7 +1905,7 @@ pub const Scheduler = struct {
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
             self.registry.mutex.lockUncancelable(self.io);
-            errdefer self.registry.mutex.unlock(self.io); // bail on early returns
+            errdefer self.registry.mutex.unlock(self.io); // the one unlock of every error return
 
             // Wait out any concurrent .loading / .evicting state.
             wait_loop: while (true) {
@@ -1919,7 +1921,6 @@ pub const Scheduler = struct {
                     },
                     .error_state => {
                         const load_err = ModelRegistry.loadErrorFromName(entry.error_name);
-                        self.registry.mutex.unlock(self.io);
                         return load_err;
                     },
                     .unloaded => break :wait_loop,
@@ -1928,6 +1929,7 @@ pub const Scheduler = struct {
 
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
+            pinned = true;
 
             // Estimate post-load bytes (`gateEstimateBytes`).
             const estimated: u64 = streaming_gate_bytes orelse gateEstimateBytes(entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
@@ -1957,7 +1959,6 @@ pub const Scheduler = struct {
                     self.registry.countLoadedLocked(),
                 });
                 self.registry.markUnloadedLocked(entry); // releases the reservation
-                self.registry.mutex.unlock(self.io);
                 return error.NotEnoughMemory;
             };
             n_victims = n;
@@ -2036,11 +2037,12 @@ pub const Scheduler = struct {
         // Success — inference thread installed cpu_state onto the entry.
         owned_active = false;
 
-        // Re-acquire under mutex and refcount the ready entry.
+        // Already referenced since the claim, so no other load evicted it; only an explicit
+        // unload can have claimed it since `markReady`, and that is a 503, not a failed load.
         self.registry.mutex.lockUncancelable(self.io);
-        defer self.registry.mutex.unlock(self.io);
-        if (entry.state != .ready) return error.LoadFailed;
-        _ = entry.refcount.fetchAdd(1, .acq_rel);
+        const ready = entry.state == .ready;
+        self.registry.mutex.unlock(self.io);
+        if (!ready) return error.NotLoaded;
         return entry;
     }
 
@@ -5828,22 +5830,9 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // Step 2: the actual load. On error, mark .error_state and signal done
     // (conn thread frees pre-parsed CPU state — ownership stays on req on
     // the failure path).
+    const had_error = mlx.errorPending();
     doLoadOnInferenceThread(sch, req) catch |err| {
-        log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
-        sch.registry.mutex.lockUncancelable(sch.io);
-        if (err == error.InsufficientMemory) {
-            // A memory-preflight refusal is transient, not a property of the
-            // checkpoint: the 503 tells the user to free memory and retry, so
-            // the entry must go back to .unloaded — stuck in .error_state the
-            // retry would fail fast until a server restart (#144).
-            sch.registry.markUnloadedLocked(req.entry);
-        } else {
-            // markErrorLocked dupes the error name onto the entry; the
-            // conn thread reads it back from the entry, not from req.
-            sch.registry.markErrorLocked(req.entry, @errorName(err));
-        }
-        sch.registry.mutex.unlock(sch.io);
-        finishLoadRequest(sch, req, @errorName(err));
+        failLoadRequest(sch, req, err, had_error);
         return;
     };
 
@@ -5855,6 +5844,26 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // (MTP head / drafter / vision land after the mid-load apply).
     logWiredPolicy(mlx.applyWiredPolicy());
     finishLoadRequest(sch, req, null);
+}
+
+fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror, had_error: bool) void {
+    log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
+    // The load's own MLX error is reported here; latched, it would fail the next request.
+    mlx.dropLatchedErrorUnless(had_error);
+    sch.registry.mutex.lockUncancelable(sch.io);
+    if (err == error.InsufficientMemory) {
+        // A memory-preflight refusal is transient, not a property of the
+        // checkpoint: the 503 tells the user to free memory and retry, so
+        // the entry must go back to .unloaded — stuck in .error_state the
+        // retry would fail fast until a server restart (#144).
+        sch.registry.markUnloadedLocked(req.entry);
+    } else {
+        // markErrorLocked dupes the error name onto the entry; the
+        // conn thread reads it back from the entry, not from req.
+        sch.registry.markErrorLocked(req.entry, @errorName(err));
+    }
+    sch.registry.mutex.unlock(sch.io);
+    finishLoadRequest(sch, req, @errorName(err));
 }
 
 fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
@@ -7801,6 +7810,7 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
                 .refused => {},
             }
         }
+        if (try closeThoughtOnLoop(sch, slot, gen)) return true;
         var stop = relative_stop;
         stop.trim_start += loop_guard_start;
         // Never cut silently: the 2026-07-14 php.html post-mortem took log
@@ -7819,6 +7829,37 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     return thinkBoundTick(sch, slot, gen);
 }
 
+const LoopAction = enum { cut, close_thought };
+
+/// A loop convicted INSIDE an open think block is recoverable once per request: the
+/// bound's early-stop line and closer are committed and the model answers. Anything else
+/// (answer-side loop, a second loop, no room before `max_tokens`) keeps the ordinary cut.
+fn loopRecoveryAction(tb: *generate_mod.ThinkBound, ids: []const u32, completion_tokens: u32, max_tokens: u32, recovered: bool) LoopAction {
+    tb.observe(ids);
+    if (recovered or tb.fired or !tb.in_think) return .cut;
+    if (!generate_mod.forcedBoundaryCanContinue(completion_tokens, max_tokens, tb.forced.len + 1)) return .cut;
+    return .close_thought;
+}
+
+/// The thought a loop was convicted in is closed instead of the turn ending. The closing line
+/// is built here, not at request start: a request carrying a `think_bound` is refused DFlash2.
+/// True = the slot's tick is spent.
+fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    var lazy: ?generate_mod.ThinkBound = null;
+    defer if (lazy) |b| slot.allocator.free(b.forced);
+    const tb: *generate_mod.ThinkBound = gen.sampling.think_bound orelse blk: {
+        const tok = slot.model.tokenizer orelse return false;
+        lazy = @import("server.zig").loopCloseBound(slot.allocator, slot.model, tok, slot.full_prompt, slot.enable_thinking) orelse return false;
+        break :blk &lazy.?;
+    };
+    if (loopRecoveryAction(tb, gen.generated_ids.items, gen.completion_tokens, gen.max_tokens, gen.think_closed_by_loop) == .cut) return false;
+    log.warn("[loop-recover] repetition loop inside the thought at {d} generated tokens; closing it\n", .{gen.generated_ids.items.len});
+    tb.fired = true;
+    gen.think_closed_by_loop = true;
+    _ = try commitThoughtClose(sch, slot, gen, tb.forced);
+    return true;
+}
+
 /// A thinking budget at its limit: commit the early-stop line and the closer
 /// through the model this tick, and decode the answer regular from here on
 /// (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
@@ -7831,7 +7872,16 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
         return false;
     }
-    const r = try gen.commitForcedTokens(slot.allocator, tb.forced);
+    if (!try commitThoughtClose(sch, slot, gen, tb.forced)) {
+        log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    }
+    return true;
+}
+
+/// Commits `forced` (early-stop line, closer, separator) through the model and decodes the rest
+/// regular. True = the slot finished on the way.
+fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []const u32) !bool {
+    const r = try gen.commitForcedTokens(slot.allocator, forced);
     defer slot.allocator.free(r.emitted);
     for (r.emitted) |t| {
         slot.pushToken(t);
@@ -7845,11 +7895,11 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     }
     gen.spec_disabled_runtime = true;
     gen.spec_disable_reason = .think_bound;
-    log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
-    return true;
+    return false;
 }
 
 fn thinkBoundFired(gen: *const Generator) bool {
+    if (gen.think_closed_by_loop) return true;
     const tb = gen.sampling.think_bound orelse return false;
     return tb.fired;
 }
@@ -10996,6 +11046,7 @@ test "single MTP slot reaches the round entry through runDecodeTick" {
     gen.mtp_planner_owned = false;
     gen.generated_ids = .empty;
     gen.loop_guard_start = 0;
+    gen.think_closed_by_loop = false;
     gen.mtp = .{ .qwen4 = &xfm };
     gen.mtp_cache = .{ .qwen = undefined };
     gen.has_last_hidden = true;
@@ -12657,4 +12708,93 @@ test "a queued vision encode is refused when its bill no longer fits, and an ear
         _ = mlx.mlx_array_free(r);
     };
     try testing.expect(unbilled.error_name == null);
+}
+
+test "a failed cold load drops the MLX error it latched and keeps one latched before it" {
+    mlx.installErrorHandler();
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("m", "/m", 1);
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "", .allocator = testing.allocator };
+    defer if (req.error_name) |name| testing.allocator.free(name);
+
+    try testing.expect(!mlx.errorPending());
+    mlx.latchErrorForTest("[load] the load's own failure");
+    failLoadRequest(&sch, &req, error.LoadFailed, false);
+    try testing.expect(!mlx.errorPending());
+
+    mlx.latchErrorForTest("[decode] another request's failure");
+    failLoadRequest(&sch, &req, error.LoadFailed, true);
+    try testing.expect(mlx.errorPending());
+    mlx.dropLatchedErrorUnless(false);
+}
+
+test "loop recovery: a loop inside an open think block closes the thought once" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, 31, CLOSE, 32 };
+    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(testing.allocator);
+    try ids.appendSlice(testing.allocator, &.{ 5, 6 });
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| try ids.appendSlice(testing.allocator, &.{ 101, 102, 103 });
+
+    try testing.expectEqual(LoopAction.close_thought, loopRecoveryAction(&tb, ids.items, 400, 4096, false));
+    // No room to close the thought: the ordinary cut.
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, ids.items, 4095, 4096, false));
+    // Once recovered, a second loop is cut.
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, ids.items, 400, 4096, true));
+}
+
+test "loop recovery: an answer-side loop is still cut, a thought the prompt opened is recoverable" {
+    const OPEN: u32 = 10;
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ 30, CLOSE, 32 };
+    var tb = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = true };
+    const closed = [_]u32{ 5, 6, CLOSE, 7, 8 };
+    try testing.expectEqual(LoopAction.cut, loopRecoveryAction(&tb, &closed, 5, 4096, false));
+
+    var reopened = generate_mod.ThinkBound{ .budget = std.math.maxInt(u32), .opener_id = OPEN, .closer_id = CLOSE, .forced = &forced, .in_think = false };
+    const inside = [_]u32{ 7, OPEN, 5, 6 };
+    try testing.expectEqual(LoopAction.close_thought, loopRecoveryAction(&reopened, &inside, 4, 4096, false));
+}
+
+test "ensureLoaded: a load refused because every other resident model is pinned leaves the registry unlocked and unpinned" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0},\"merges\":[]}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const resident = try reg.registerStub("a", "a", 10);
+    const target = try reg.registerStub("b", dir, 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(resident, 10);
+    reg.mutex.unlock(io);
+    _ = resident.refcount.fetchAdd(1, .acq_rel); // an in-flight request
+
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = testing.allocator;
+    sch.expert_cache_bytes = 0;
+    sch.ssd_budget_bytes = 0;
+    sch.mtp_enabled = true;
+    sch.mtp_explicit = false;
+
+    try testing.expectError(error.NotEnoughMemory, sch.ensureLoaded("b"));
+    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+    try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
+    // The failed claim unlocked once: a second unlock would leave this free or release another thread's hold.
+    try testing.expect(reg.mutex.tryLock());
+    reg.mutex.unlock(io);
+    resident.refcount.store(0, .release);
 }

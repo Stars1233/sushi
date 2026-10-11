@@ -950,9 +950,12 @@ pub const ModelRegistry = struct {
     /// false if the entry isn't in `.unloaded` state (someone else is
     /// already loading it, or it's already ready/error). On false, the
     /// caller should re-check state and wait or fast-path.
+    /// On true the claimant holds a reference from here on: a model that turns `.ready` with
+    /// none is another load's eviction victim before the claimant wakes.
     pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
         if (entry.state != .unloaded) return false;
         entry.state = .loading;
+        _ = entry.refcount.fetchAdd(1, .acq_rel);
         entry.memory_context_refusal = null;
         self.state_cond.broadcast(self.io);
         return true;
@@ -1960,6 +1963,18 @@ test "planEvictions: evicts one LRU victim to fit the memory budget" {
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a", buf[0].id); // LRU victim
     try testing.expectEqual(LoadState.evicting, buf[0].state);
+}
+
+test "a load's claimant holds its reference through markReady, so another load cannot evict the model" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    const a = try beginLoad(reg, "a", 40);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    reg.markReadyLocked(a, 40);
+    try testing.expectEqual(@as(?*LoadedModel, null), reg.pickLruEvictable("b"));
+    a.refcount.store(0, .release);
 }
 
 test "planEvictions: multi-victim — evicts as many as needed to fit" {

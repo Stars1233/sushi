@@ -110,6 +110,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `/v1/load-model` (the app's path) on a 128 GB Mac at default flags.
 - **A reload FREES the CPU state `unloadResident` retains** while the entry is `.loading` (`releaseRetainedCpuState`):
   a reader holding no refcount takes the mutex AND skips them while `.loading`.
+- **A cold load pins its model at the claim** (`tryBeginLoadLocked` takes the requester's reference), so the entry cannot be another load's eviction victim between `markReady` and the requester waking; an unload that wins that window is a 503 (`NotLoaded`). A failed load drops the MLX error it latched (`failLoadRequest`), or the next request fails on it.
 
 <a id="settings"></a>
 ## Settings precedence

@@ -27,6 +27,12 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Completions**: `/v1/completions` reads `prompt` given as token ids (`[1,2,3]`, `[[1,2,3]]`), refuses a batch of prompts and `echo: true` with a named 400 instead of a misleading "prompt is required" or a silent drop.
 - **Qwen3.8-Flash-Next**: `--qwen-gdn fp32` keeps the recurrent state in f32 between tokens, for measuring what the
   default bf16 state costs.
+- **Server**: a client that stops sending its request is dropped after 30 seconds instead of holding a connection thread forever, and a `Content-Length` near 2^64 is refused with a 413.
+- **Prompt cache**: an SSD entry whose chunk fails to load is dropped instead of failing again on every later request that matches it.
+- **Model loading**: a model another load evicts the instant its own load finishes, and a failed model load leaving its error to fail the next request, are fixed.
+- **Model loading**: a load request refused for lack of memory no longer unlocks the model registry twice, which could release a lock another request held.
+- **Reasoning**: a repetition loop inside a thought now closes the thought and lets the model answer or call a tool, instead of ending the turn with a stop and no answer.
+- **Memory**: the available-memory figure behind the load check and request admission no longer charges a resident model's wired pages twice, so a loaded server reports the room the system can actually grant instead of a figure several GiB too low.
 
 ---
 

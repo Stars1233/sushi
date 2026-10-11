@@ -1446,6 +1446,17 @@ pub const HotPrefixCache = struct {
         return self.lookupImpl(target_cache, target_moe_seq_offset, .{ .glm = request }, s, prompt_ids, has_tools, vision_key, media_start, media_chain, dflash_target, null, slot_id, skip);
     }
 
+    /// An unreadable or corrupt file fails the same way on every later lookup, so its entry dies;
+    /// a coverage miss (no checkpoint, QSA gap) can still serve a shorter prefix, so it stays.
+    fn poisonUnreadable(d: *kv_disk_cache.DiskTier, idx: usize, err: anyerror) void {
+        switch (err) {
+            error.MlxError, error.DiskCacheCorruptChunk, error.DiskCacheCorruptRing, error.DiskCacheCorruptSsm => {
+                _ = d.poisonId(d.entries.items[idx].id, @errorName(err));
+            },
+            else => {},
+        }
+    }
+
     /// GLM's SSD arm: the entry whose highest persisted KDA checkpoint under the match beats the RAM
     /// match restores its MLA rows and that checkpoint into buffers the request then owns.
     fn restoreGlmFromDisk(
@@ -1479,6 +1490,7 @@ pub const HotPrefixCache = struct {
         }
         const restored = d.restoreIntoKda(&pseudo, kda, hm.idx, hm.cp, s) catch |err| {
             log.warn("  [disk-cache] GLM restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+            poisonUnreadable(d, hm.idx, err);
             return null;
         };
         var rows = glm5_prefix.rowsFromDisk(self.allocator, &pseudo, bits) catch return null;
@@ -1590,6 +1602,7 @@ pub const HotPrefixCache = struct {
                 const sw = io_util.Stopwatch.init(d.io);
                 d.restoreIntoRinged(target_cache, rm.idx, rm.pos, final_len, s) catch |err| {
                     log.warn("  [disk-cache] ring restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                    poisonUnreadable(d, rm.idx, err);
                     target_cache.truncate(0, s) catch {};
                     break :disk;
                 };
@@ -1634,6 +1647,7 @@ pub const HotPrefixCache = struct {
                 const sw = io_util.Stopwatch.init(d.io);
                 const restored = d.restoreIntoHybrid(target_cache, ssm_entries, hm.idx, disk_cp, s) catch |err| {
                     log.warn("  [disk-cache] hybrid restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                    poisonUnreadable(d, hm.idx, err);
                     // A failed restore can leave the cache AND ssm entries
                     // half-rebuilt; reset both before the fall-through.
                     target_cache.truncate(0, s) catch {};
@@ -1680,6 +1694,7 @@ pub const HotPrefixCache = struct {
             const sw = io_util.Stopwatch.init(d.io);
             d.restorePrefixInto(target_cache, dm.idx, @intCast(final_len), s) catch |err| {
                 log.warn("  [disk-cache] restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                poisonUnreadable(d, dm.idx, err);
                 // A failed restore can leave a half-rebuilt cache; reset it.
                 target_cache.truncate(0, s) catch {};
                 break :disk;
@@ -5734,6 +5749,49 @@ test "HotPrefixCache: dflash + mtp snapshots survive the SSD tier across a resta
         try testing.expectEqual(@as(usize, 0), dfl3.step);
         try testing.expectEqual(@as(usize, 42), dbase3); // untouched
     }
+}
+
+test "HotPrefixCache: an SSD entry that fails to restore is poisoned, not retried" {
+    mlx.installErrorHandler();
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-bad", 0, 128);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        _ = try hc.commit(&cache, &tokens, false);
+        hc.flushPendingDisk(s);
+    }
+    // A chunk whose bytes rotted at the same size passes the scan's size check and fails the load.
+    const chunk = "fp-bad/e1/c000000.safetensors";
+    const st = try tmp.dir.statFile(io, chunk, .{});
+    const junk = try testing.allocator.alloc(u8, @intCast(st.size));
+    defer testing.allocator.free(junk);
+    @memset(junk, 0xff);
+    try tmp.dir.writeFile(io, .{ .sub_path = chunk, .data = junk });
+
+    var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-bad", 0, 128);
+    defer hc2.deinit();
+    const id = hc2.disk.?.entries.items[0].id;
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    var moe_off: usize = 0;
+    const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false, 0, null, null);
+    try testing.expectEqual(@as(usize, 0), res.matched);
+    try testing.expect(hc2.disk.?.entryPoisoned(id));
+    mlx.dropLatchedErrorUnless(false);
 }
 
 test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {

@@ -411,6 +411,16 @@ pub const Conn = struct {
         };
     }
 
+    /// Waits up to `ms` for bytes to read; false when none came. Bytes the reader already
+    /// buffered count as readable.
+    fn awaitReadable(c: *Conn, ms: i64) bool {
+        if (c.reader().bufferedLen() > 0) return true;
+        if (ms <= 0) return false;
+        var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const n = std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return true;
+        return n > 0;
+    }
+
     const CLOSE_WAIT_MS: i64 = 5 * 60 * 1000;
 
     /// Keep close-delimited responses owned until the reader closes: orphaned FIN_WAIT_2
@@ -1383,10 +1393,21 @@ const THINK_BOUND_EARLY_STOP = "\n\nConsidering the limited time by the user, I 
 /// bounds it (no budget, thinking off, markers not atomic). `forced` is
 /// allocated; the caller frees it after generation.
 fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?generate_mod.ThinkBound {
-    if (budget < 0 or !enable_thinking or lm.transformer == null) return null;
+    if (budget < 0) return null;
+    return thinkBoundWithBudget(allocator, lm, tok, prompt_ids, enable_thinking, @intCast(budget), true);
+}
+
+/// The bound a loop convicted inside a thought closes it with, built when the loop is
+/// convicted: a request carrying a `think_bound` from the start is refused DFlash2.
+pub fn loopCloseBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool) ?generate_mod.ThinkBound {
+    return thinkBoundWithBudget(allocator, lm, tok, prompt_ids, enable_thinking, std.math.maxInt(u32), false);
+}
+
+fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: u32, announce: bool) ?generate_mod.ThinkBound {
+    if (!enable_thinking or lm.transformer == null) return null;
     const closer = promptOpenerMarkerCloser(allocator, tok, prompt_ids) orelse
         atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
-        log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
+        if (announce) log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
         return null;
     };
     const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
@@ -1401,8 +1422,8 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
     @memcpy(forced[0..stop_ids.len], stop_ids);
     forced[stop_ids.len] = closer;
     @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
-    log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
-    return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
+    if (announce) log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
+    return .{ .budget = budget, .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
 }
 
 /// The think penalty's lambda: the request's `think_penalty` > `--think-penalty` >
@@ -2394,6 +2415,70 @@ fn seedRequestBuf(buf: []u8, already_read: []const u8) usize {
     return n;
 }
 
+const RawRequest = struct {
+    /// Owned; `buf[0..len]` is the head plus as much of the body as arrived.
+    buf: []u8,
+    len: usize,
+    header_end: usize,
+};
+
+/// A client gets this long between bytes of its request, and in all for its head: an idle or
+/// dripping connection otherwise holds its thread forever.
+const REQUEST_READ_LIMIT_MS: i64 = 30_000;
+
+/// Reads one request: the head (up to 16 KB), then its `Content-Length` body. Null when no
+/// complete head arrived, the client stalled, or the body is over the cap (the 413 is already sent).
+fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64) !?RawRequest {
+    const head_deadline = nowMsMonotonic(stream.io) + limit_ms;
+    // Read HTTP headers first (up to 16KB), then allocate for the full body based on Content-Length.
+    var hdr_buf: [16 * 1024]u8 = undefined;
+    var total_read: usize = 0;
+    var content_length: ?usize = null;
+    var header_end_pos: usize = 0;
+
+    // Phase 1: Read until we have complete headers
+    while (total_read < hdr_buf.len) {
+        if (!stream.awaitReadable(head_deadline - nowMsMonotonic(stream.io))) return null;
+        const n = try stream.read(hdr_buf[total_read..]);
+        if (n == 0) break;
+        total_read += n;
+
+        if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| {
+            header_end_pos = he + 4;
+            content_length = findContentLength(hdr_buf[0..he]);
+            break;
+        }
+    }
+
+    if (header_end_pos == 0) return null;
+
+    // Phase 2: Allocate buffer for full request and read remaining body
+    const cl = content_length orelse 0;
+    const total_size = header_end_pos +| cl;
+    if (total_size > max_request_bytes) {
+        var msg_buf: [128]u8 = undefined;
+        const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_bytes);
+        log.warn("[http] 413: {s}\n", .{msg});
+        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
+        return null;
+    }
+
+    const buf = try allocator.alloc(u8, total_size);
+    errdefer allocator.free(buf);
+    total_read = seedRequestBuf(buf, hdr_buf[0..total_read]);
+
+    while (total_read < total_size) {
+        if (!stream.awaitReadable(limit_ms)) {
+            allocator.free(buf);
+            return null;
+        }
+        const n = try stream.read(buf[total_read..total_size]);
+        if (n == 0) break;
+        total_read += n;
+    }
+    return .{ .buf = buf, .len = total_read, .header_end = header_end_pos };
+}
+
 fn handleConnection(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -2407,52 +2492,11 @@ fn handleConnection(
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Server not ready", 503);
         return;
     };
-    // Read HTTP headers first (up to 16KB), then allocate for the full body based on Content-Length.
-    var hdr_buf: [16 * 1024]u8 = undefined;
-    var total_read: usize = 0;
-    var content_length: ?usize = null;
-    var header_end_pos: usize = 0;
-
-    // Phase 1: Read until we have complete headers
-    while (total_read < hdr_buf.len) {
-        const n = try stream.read(hdr_buf[total_read..]);
-        if (n == 0) break;
-        total_read += n;
-
-        if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| {
-            header_end_pos = he + 4;
-            content_length = findContentLength(hdr_buf[0..he]);
-            break;
-        }
-    }
-
-    if (header_end_pos == 0) {
-        // No complete headers found
-        return;
-    }
-
-    // Phase 2: Allocate buffer for full request and read remaining body
-    const cl = content_length orelse 0;
-    const total_size = header_end_pos + cl;
-    if (total_size > max_request_bytes) {
-        var msg_buf: [128]u8 = undefined;
-        const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_bytes);
-        log.warn("[http] 413: {s}\n", .{msg});
-        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
-        return;
-    }
-
-    const buf = try allocator.alloc(u8, total_size);
-    defer allocator.free(buf);
-    total_read = seedRequestBuf(buf, hdr_buf[0..total_read]);
-
-    while (total_read < total_size) {
-        const n = try stream.read(buf[total_read..total_size]);
-        if (n == 0) break;
-        total_read += n;
-    }
-
-    const request = buf[0..total_read];
+    const raw = (try readRequestWithin(allocator, stream, REQUEST_READ_LIMIT_MS)) orelse return;
+    defer allocator.free(raw.buf);
+    const total_read = raw.len;
+    const header_end_pos = raw.header_end;
+    const request = raw.buf[0..total_read];
     const first_line_end = std.mem.indexOf(u8, request, "\r\n") orelse return;
     const first_line = request[0..first_line_end];
 
@@ -3164,7 +3208,7 @@ pub fn applyMlxCacheLimit() void {
 /// counters. `mlx_footprint` = active (in-use) + cache (reclaimable) so an
 /// idle machine's ceiling stays ≈ the static device max (no auto-context
 /// regression), while external pressure — reflected in `getAvailableMemBytes`
-/// (total − wired − compressed − internal-anon) — tightens it. See
+/// (free + file-backed pages, capped by the RAM outside wired + compressor) — tightens it. See
 /// `physicalMemoryCeiling`.
 /// The ceiling term that does not move with instantaneous free RAM: Metal's recommended
 /// working set (or the wired limit). The load-time hot-cache clamp bills against this and
@@ -7984,6 +8028,10 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     const lm = scheduler.ensureLoaded(requested_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+            return;
+        },
+        error.NotLoaded => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", "Requested model is not currently loaded", 503);
             return;
         },
         error.NoDefaultModel => {
@@ -27103,6 +27151,48 @@ test "seedRequestBuf drops bytes past the allocation" {
     try std.testing.expectEqual(@as(usize, 4), seedRequestBuf(buf, "abcdefgh"));
     try std.testing.expectEqualStrings("abcd", buf);
     try std.testing.expectEqual(@as(usize, 2), seedRequestBuf(buf, "xy"));
+}
+
+/// Runs `readRequestWithin(limit_ms)` against a client that sends `sent`, then one byte per
+/// `drip_ms` (0 = nothing more), and never finishes; true when the reader gave up on its own.
+fn readerGivesUp(sent: []const u8, limit_ms: i64, drip_ms: u64) !bool {
+    const t = std.testing;
+    var sv: [2]std.posix.fd_t = undefined;
+    try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0); // AF_UNIX, SOCK_STREAM
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    defer conn.close();
+    _ = std.c.send(sv[1], sent.ptr, sent.len, 0);
+
+    var done = std.atomic.Value(bool).init(false);
+    const reader = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn, limit: i64, d: *std.atomic.Value(bool)) void {
+            if (readRequestWithin(t.allocator, c, limit) catch null) |r| t.allocator.free(r.buf);
+            d.store(true, .release);
+        }
+    }.run, .{ &conn, limit_ms, &done });
+    var waited: u64 = 0;
+    while (!done.load(.acquire) and waited < 2000) : (waited += 10) {
+        std.Io.sleep(t.io, .fromMilliseconds(10), .real) catch {};
+        if (drip_ms > 0 and waited % drip_ms == 0) _ = std.c.send(sv[1], "x", 1, 0);
+    }
+    const gave_up = done.load(.acquire);
+    _ = std.c.close(sv[1]);
+    reader.join();
+    return gave_up;
+}
+
+test "readRequest: a client that stalls its head or body, or drips its head, is dropped" {
+    const head = "POST /v1/chat/completions HTTP/1.1\r\n";
+    try std.testing.expect(try readerGivesUp(head, 200, 0));
+    try std.testing.expect(try readerGivesUp(head, 300, 50));
+    try std.testing.expect(try readerGivesUp(head ++ "Content-Length: 100\r\n\r\n{}", 200, 0));
+}
+
+test "readRequest: a Content-Length that wraps the size sum is a 413" {
+    const response = try serveOneForTest("POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n{}");
+    defer std.testing.allocator.free(response);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 413"));
 }
 
 const AnthropicEventLog = struct {
