@@ -22,6 +22,9 @@ else. Model loads take the GPU lock; step 2 waits for a quiet box (no builds, no
 **Rules:**
 - **Steps 2 and 7 are different questions.** 2 = "did our code regress", sushi only, every release. 7 = the public
   comparison; re-run it only when another engine's version bumps.
+- **The perf gate times on AC power only.** Check `pmset -g batt` right before each model's run and log the power
+  source beside it. A run that touched battery is discarded and rerun on AC: battery cost GLM 8–18% decode on 2026-10-11.
+  - All other GPU work keeps the battery-above-30% rule.
 - **The perf gate is four models: Qwen 2.6bpw, Qwen 4bpw, MiMo 2.3bpw, GLM 2.4bpw.** It is ONE run per model whose
   output IS the published `docs/bench/v<ver>/` report, in the format of `docs/bench/v1.2.0-dev/` (`summary.md` plus
   one `<model>.md` per run): pinned `npx llmprobe@<ver> --bench-only --rungs 2k,4k,8k,16k,32k,64k,128k --runs 2`, one
