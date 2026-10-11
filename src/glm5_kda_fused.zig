@@ -14,7 +14,7 @@ const HEADER: [:0]const u8 =
     \\template<bool precise> inline float glm_exp(float x) { return precise ? metal::precise::exp(x) : metal::exp(x); }
     \\template<bool precise> inline float glm_rsqrt(float x) { return precise ? metal::precise::rsqrt(x) : metal::rsqrt(x); }
 ;
-const SOURCE: [:0]const u8 =
+const SOURCE_HEAD =
     \\
     \\  constexpr int CK = 4;
     \\  constexpr int NROW = CK - 1 + TOK;
@@ -71,12 +71,49 @@ const SOURCE: [:0]const u8 =
     \\    }
     \\  }
     \\
+;
+const LOAD_SEPARATE =
     \\  for (int e = int(tid); e < TOK * DK; e += 1024) {
     \\    const int t = e / DK;
     \\    const int i = e % DK;
     \\    as_[t][i] = a_pre[t * QKV + h * DK + i];
     \\    gates[t][i] = gate_pre[t * QKV + h * DK + i];
     \\  }
+    \\
+;
+// One token only. Mirrors MLX's BF16 `gemv` at K = 128: each lane takes four consecutive columns,
+// accumulates them in order in FP32 (BF16 products are exact, so FMA contraction cannot change a
+// bit), then the lanes reduce by shuffle-down 16, 8, 4, 2, 1 and the sum rounds to BF16.
+const LOAD_PROJECTED =
+    \\  {
+    \\    float xa[4];
+    \\    float xg[4];
+    \\    for (int e = 0; e < 4; e++) {
+    \\      xa[e] = static_cast<float>(a_low[4 * lane + e]);
+    \\      xg[e] = static_cast<float>(g_low[4 * lane + e]);
+    \\    }
+    \\    for (int r = 0; r < 4; r++) {
+    \\      const int i = int(sg) * 4 + r;
+    \\      const size_t base = (size_t(h) * DK + i) * DK + 4 * lane;
+    \\      float acc_a = 0.0f;
+    \\      float acc_g = 0.0f;
+    \\      for (int e = 0; e < 4; e++) {
+    \\        acc_a += static_cast<float>(fb_w[base + e]) * xa[e];
+    \\        acc_g += static_cast<float>(gb_w[base + e]) * xg[e];
+    \\      }
+    \\      for (ushort o = 16; o >= 1; o >>= 1) {
+    \\        acc_a += simd_shuffle_down(acc_a, o);
+    \\        acc_g += simd_shuffle_down(acc_g, o);
+    \\      }
+    \\      if (lane == 0) {
+    \\        as_[0][i] = static_cast<T>(acc_a);
+    \\        gates[0][i] = static_cast<T>(acc_g);
+    \\      }
+    \\    }
+    \\  }
+    \\
+;
+const SOURCE_TAIL =
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\
     \\  if (sg < uint(2 * TOK)) {
@@ -183,14 +220,21 @@ const SOURCE: [:0]const u8 =
     \\    }
     \\  }
 ;
+const SOURCE: [:0]const u8 = SOURCE_HEAD ++ LOAD_SEPARATE ++ SOURCE_TAIL;
+const SOURCE_PROJECTED: [:0]const u8 = SOURCE_HEAD ++ LOAD_PROJECTED ++ SOURCE_TAIL;
 
 pub const Modes = struct { sig_b: bool, sig_f: bool, exp_f: bool, rsq_f: bool };
 var modes_checked = false;
 var modes_cached: ?Modes = null;
 var kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+var projected_cached: ?mlx.mlx_fast_metal_kernel = null;
 var calls: usize = 0;
+var projected_calls: usize = 0;
 pub fn dispatchCount() usize {
     return calls;
+}
+pub fn projectedDispatchCount() usize {
+    return projected_calls;
 }
 pub fn resetDispatchCount() void {
     calls = 0;
@@ -308,11 +352,15 @@ pub fn sigmoidFloatMode(s: mlx.mlx_stream) !?bool {
     return found.sig_f;
 }
 
+/// Second-stage gate projections `fb`/`gb` ([heads*128, 128] BF16) applied to the low-rank
+/// outputs `a_low`/`gate_low` ([1, 1, 128]); stands in for `Inputs.a`/`gate`.
+pub const SecondStage = struct { a_low: Arr, gate_low: Arr, fb: Arr, gb: Arr };
 pub const Inputs = struct {
     qkv: Arr,
     beta: Arr,
-    a: Arr,
-    gate: Arr,
+    a: Arr = .{ .ctx = null },
+    gate: Arr = .{ .ctx = null },
+    second_stage: ?SecondStage = null,
     conv_weight: Arr,
     exp_a: Arr,
     dt_bias: Arr,
@@ -360,12 +408,19 @@ fn configuration(heads: c_int, mode: Modes) !Config {
 
 pub fn step(s: mlx.mlx_stream, in: Inputs) !?Result {
     if (!mlx.streamIsGpu(s) or in.heads < 1 or in.heads > 1024 or !std.math.isFinite(in.norm_eps) or in.norm_eps <= 0 or !std.math.isFinite(in.lower) or in.lower != -5) return null;
-    for ([_]Arr{ in.qkv, in.beta, in.a, in.gate, in.conv_weight, in.exp_a, in.dt_bias, in.norm, in.conv_state, in.state }) |value| if (value.ctx == null) return null;
+    for ([_]Arr{ in.qkv, in.beta, in.conv_weight, in.exp_a, in.dt_bias, in.norm, in.conv_state, in.state }) |value| if (value.ctx == null) return null;
     const d = in.heads * 128;
     if (!std.mem.eql(c_int, &.{ 1, 1, d * 3 }, mlx.getShape(in.qkv)) or mlx.mlx_array_dtype(in.qkv) != .bfloat16 or
-        !std.mem.eql(c_int, &.{ 1, 1, in.heads }, mlx.getShape(in.beta)) or mlx.mlx_array_dtype(in.beta) != .bfloat16 or
-        !std.mem.eql(c_int, &.{ 1, 1, d }, mlx.getShape(in.a)) or mlx.mlx_array_dtype(in.a) != .bfloat16 or
-        !std.mem.eql(c_int, &.{ 1, 1, d }, mlx.getShape(in.gate)) or mlx.mlx_array_dtype(in.gate) != .bfloat16) return null;
+        !std.mem.eql(c_int, &.{ 1, 1, in.heads }, mlx.getShape(in.beta)) or mlx.mlx_array_dtype(in.beta) != .bfloat16) return null;
+    if (in.second_stage) |st| {
+        for ([_]Arr{ st.a_low, st.gate_low, st.fb, st.gb }) |value| if (value.ctx == null or mlx.mlx_array_dtype(value) != .bfloat16) return null;
+        if (!std.mem.eql(c_int, &.{ 1, 1, 128 }, mlx.getShape(st.a_low)) or !std.mem.eql(c_int, &.{ 1, 1, 128 }, mlx.getShape(st.gate_low)) or
+            !std.mem.eql(c_int, &.{ d, 128 }, mlx.getShape(st.fb)) or !std.mem.eql(c_int, &.{ d, 128 }, mlx.getShape(st.gb))) return null;
+    } else {
+        if (in.a.ctx == null or in.gate.ctx == null or
+            !std.mem.eql(c_int, &.{ 1, 1, d }, mlx.getShape(in.a)) or mlx.mlx_array_dtype(in.a) != .bfloat16 or
+            !std.mem.eql(c_int, &.{ 1, 1, d }, mlx.getShape(in.gate)) or mlx.mlx_array_dtype(in.gate) != .bfloat16) return null;
+    }
     if (!std.mem.eql(c_int, &.{ d * 3, 4, 1 }, mlx.getShape(in.conv_weight)) or mlx.mlx_array_dtype(in.conv_weight) != .bfloat16 or
         mlx.mlx_array_size(in.exp_a) != @as(usize, @intCast(in.heads)) or mlx.mlx_array_dtype(in.exp_a) != .float32 or
         !std.mem.eql(c_int, &.{d}, mlx.getShape(in.dt_bias)) or mlx.mlx_array_dtype(in.dt_bias) != .float32 or
@@ -381,13 +436,19 @@ pub fn step(s: mlx.mlx_stream, in: Inputs) !?Result {
     const constants = [_]f32{ 1 / @sqrt(@as(f32, 128)), 1e-6, in.norm_eps, in.lower, 1.0 / 128.0 };
     const consts = mlx.mlx_array_new_data(&constants, &[_]c_int{5}, 1, .float32);
     defer _ = mlx.mlx_array_free(consts);
-    if (kernel_cached == null) kernel_cached = try makeKernel("sushi_glm_kda_decode_body", &.{ "proj", "conv_w", "exp_a", "dt_bias", "norm_w", "consts", "conv_state", "state_in", "a_pre", "gate_pre" }, &.{ "y", "conv_state_out", "state_out" }, SOURCE);
+    const common = [_]Arr{ projection, in.conv_weight, in.exp_a, in.dt_bias, in.norm, consts, in.conv_state, in.state };
     const selected = try configuration(in.heads, mode);
     const cfg = selected.value;
     defer if (!selected.cached) {
         _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     };
-    const outputs = try applyKernel(kernel_cached.?, &.{ projection, in.conv_weight, in.exp_a, in.dt_bias, in.norm, consts, in.conv_state, in.state, in.a, in.gate }, cfg, s);
+    const outputs = if (in.second_stage) |st| blk: {
+        if (projected_cached == null) projected_cached = try makeKernel("sushi_glm_kda_decode_body_proj", &.{ "proj", "conv_w", "exp_a", "dt_bias", "norm_w", "consts", "conv_state", "state_in", "a_low", "g_low", "fb_w", "gb_w" }, &.{ "y", "conv_state_out", "state_out" }, SOURCE_PROJECTED);
+        break :blk try applyKernel(projected_cached.?, &(common ++ [_]Arr{ st.a_low, st.gate_low, st.fb, st.gb }), cfg, s);
+    } else blk: {
+        if (kernel_cached == null) kernel_cached = try makeKernel("sushi_glm_kda_decode_body", &.{ "proj", "conv_w", "exp_a", "dt_bias", "norm_w", "consts", "conv_state", "state_in", "a_pre", "gate_pre" }, &.{ "y", "conv_state_out", "state_out" }, SOURCE);
+        break :blk try applyKernel(kernel_cached.?, &(common ++ [_]Arr{ in.a, in.gate }), cfg, s);
+    };
     defer _ = mlx.mlx_vector_array_free(outputs);
     var result = Result{ .y = mlx.mlx_array_new(), .conv = mlx.mlx_array_new(), .state = mlx.mlx_array_new() };
     errdefer result.deinit();
@@ -396,6 +457,10 @@ pub fn step(s: mlx.mlx_stream, in: Inputs) !?Result {
     try mlx.check(mlx.mlx_vector_array_get(&result.state, outputs, 2));
     calls += 1;
     if (calls == 1) @import("log.zig").info("[glm-kda] fused one-token body engaged\n", .{});
+    if (in.second_stage != null) {
+        projected_calls += 1;
+        if (projected_calls == 1) @import("log.zig").info("[glm-kda] f_b/g_b projections run in the body\n", .{});
+    }
     return result;
 }
 
@@ -577,4 +642,75 @@ test "GLM SIMD KDA, prework and router arms serve GPUs without NAX" {
     const routed = (try @import("glm5_router.zig").route(s, try ops.zeros(&.{ 1, 1, 128 }, .bfloat16), try ops.own(mlx.mlx_array_new_data(&weights, &.{ 16, 128 }, 2, .float32)), try ops.own(mlx.mlx_array_new_data(&bias, &.{16}, 1, .float32)), 2, 2.5, true)) orelse return error.TestExpectedRouter;
     _ = try ops.own(routed.indices);
     _ = try ops.own(routed.scores);
+}
+
+fn randn(ops: *@import("glm5_model.zig").Ops, shape: []const c_int, dtype: mlx.mlx_dtype, loc: f32, scale: f32, seed: u64) !Arr {
+    const key = try ops.slot();
+    try mlx.check(mlx.mlx_random_key(key, seed));
+    const out = try ops.slot();
+    try mlx.check(mlx.mlx_random_normal(out, shape.ptr, shape.len, dtype, loc, scale, key.*, ops.s));
+    return out.*;
+}
+
+fn expectSameBits(want: Arr, got: Arr) !void {
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try std.testing.expectEqual(mlx.mlx_array_size(want), mlx.mlx_array_size(got));
+    try std.testing.expect(sameBytes(want, got));
+}
+
+test "GLM KDA body projects f_b and g_b in kernel with MLX's BF16 GEMV bits" {
+    if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
+    const Ops = @import("glm5_model.zig").Ops;
+    for ([_]c_int{ 1, 3, 64 }) |heads| {
+        for ([_]u64{ 11, 12 }) |seed| {
+            var ops = Ops{ .s = mlx.gpuStream() };
+            defer ops.deinit();
+            const d = heads * 128;
+            const sd = seed * 100;
+            const a_low = try randn(&ops, &.{ 1, 1, 128 }, .bfloat16, 0, 3, sd + 1);
+            const g_low = try randn(&ops, &.{ 1, 1, 128 }, .bfloat16, 0.5, 3, sd + 2);
+            const fb = try randn(&ops, &.{ d, 128 }, .bfloat16, 0, 0.1, sd + 3);
+            const gb = try randn(&ops, &.{ d, 128 }, .bfloat16, 0, 0.1, sd + 4);
+            const a = try ops.binary(.mm, a_low, try ops.transpose(fb, &.{ 1, 0 }));
+            const gate = try ops.binary(.mm, g_low, try ops.transpose(gb, &.{ 1, 0 }));
+            const base = Inputs{
+                .qkv = try randn(&ops, &.{ 1, 1, 3 * d }, .bfloat16, 0, 1.5, sd + 5),
+                .beta = try randn(&ops, &.{ 1, 1, heads }, .bfloat16, 0, 2, sd + 6),
+                .a = a,
+                .gate = gate,
+                .conv_weight = try randn(&ops, &.{ 3 * d, 4, 1 }, .bfloat16, 0, 0.5, sd + 7),
+                .exp_a = try ops.unary(.exp, try randn(&ops, &.{heads}, .float32, 0, 0.5, sd + 8)),
+                .dt_bias = try randn(&ops, &.{d}, .float32, 0, 1, sd + 9),
+                .norm = try randn(&ops, &.{128}, .bfloat16, 1, 0.2, sd + 10),
+                .conv_state = try randn(&ops, &.{ 1, 3, 3 * d }, .bfloat16, 0, 1.5, sd + 11),
+                .state = try randn(&ops, &.{ 1, heads, 128, 128 }, .float32, 0, 0.3, sd + 12),
+                .heads = heads,
+                .norm_eps = 1e-5,
+                .lower = -5,
+            };
+            const want = (try step(ops.s, base)) orelse return error.TestExpectedFusedKda;
+            defer want.deinit();
+            var fused = base;
+            fused.second_stage = .{ .a_low = a_low, .gate_low = g_low, .fb = fb, .gb = gb };
+            const before = dispatchCount();
+            const got = (try step(ops.s, fused)) orelse return error.TestExpectedFusedKda;
+            defer got.deinit();
+            try std.testing.expectEqual(before + 1, dispatchCount());
+            try expectSameBits(want.y, got.y);
+            try expectSameBits(want.conv, got.conv);
+            try expectSameBits(want.state, got.state);
+
+            // Controls: the FP32 state sees every f_b output and y sees every g_b output.
+            var nudged = fused;
+            nudged.second_stage.?.fb = try ops.binary(.mul, fb, try ops.scalar(1.0078125, .bfloat16));
+            nudged.second_stage.?.gb = try ops.binary(.mul, gb, try ops.scalar(1.0078125, .bfloat16));
+            const other = (try step(ops.s, nudged)) orelse return error.TestExpectedFusedKda;
+            defer other.deinit();
+            try mlx.check(mlx.mlx_array_eval(other.state));
+            try mlx.check(mlx.mlx_array_eval(other.y));
+            try std.testing.expect(!sameBytes(want.state, other.state));
+            try std.testing.expect(!sameBytes(want.y, other.y));
+        }
+    }
 }

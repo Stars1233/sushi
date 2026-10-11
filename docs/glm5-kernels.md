@@ -102,6 +102,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - KDA QKV in one dispatch over the three resident A5/A6/A8 banks (restricted port of oMLX `multi_qmv`; a concatenated
   bank copy would cost 3.29 GiB), then the fused one-token body: conv, BF16 SiLU, L2, per-channel forget gate, delta
   recurrence, gated output norm. Its unary math variants are chosen by probe at first use.
+- The body projects dense BF16 `f_b`/`g_b` itself (K = 128) and is THE path for them: MLX's `gemv` order is four
+  consecutive columns per lane in FP32, then shuffle-down 16..1, then BF16 (products of BF16 values are exact, so FMA
+  contraction is harmless); one simdgroup per row reproduces it bit for bit. Affine and FP8 weights and the covariance
+  tap keep the staged GEMVs. Bit-identical to the staged GEMVs at 1/3/64 heads (the unit test keeps them as its byte
+  oracle) and over 1632 live greedy steps (logits hash and argmax, `[glm-kda] f_b/g_b projections run in the body`).
+  Measured inside noise: decode 28.24 → 28.18 ms/token (−0.2%; Sushi-2.4bpw, ctx 1024, arms alternated in one boot,
+  16 rounds x 48 tokens, implementation plus a throwaway arm switch, `taskpolicy -a`, GPU lock, quiet window, battery
+  at 97%). Landed by owner decision, not for speed.
 - Router: FP32 GEMV with sigmoid and correction, then stable top-8 and unbiased normalization (two dispatches; BF16
   weights widened locally). Dense/shared activation: one dispatch over the exhaustive BF16 sigmoid table (128 KiB).
 - Attention: B1 per decode row and B3/B4 for verification branches, from one gather source (`[B,2051,512]` bank,

@@ -279,6 +279,10 @@ pub const Linear = struct {
         return mlx.mlx_array_dtype(self.w) == .uint8;
     }
 
+    pub fn projectsDenseBf16(self: Linear) bool {
+        return self.scales.ctx == null and mlx.mlx_array_dtype(self.w) == .bfloat16;
+    }
+
     pub fn apply(self: Linear, ops: *Ops, x: Arr) !Arr {
         if (linear_tap) |t| try t.observe(t.ctx, self.w, x);
         if (self.isFp8()) return ops.own(try fp8_block.linear(ops.s, x, self.w, self.scales));
@@ -568,10 +572,18 @@ pub const KdaLayer = struct {
         const joined = try self.projectQkv(ops, x);
         const previous = if (state.initialized) state.conv_state else try ops.zeros(&.{ 1, 3, width * 3 }, .bfloat16);
         const recurrent = if (state.initialized) state.ssm_state else try ops.zeros(&.{ 1, heads, 128, 128 }, .float32);
-        const a = try self.fb.apply(ops, try self.fa.apply(ops, x));
-        const gate = try self.gb.apply(ops, try self.ga.apply(ops, x));
+        const a_low = try self.fa.apply(ops, x);
+        const gate_low = try self.ga.apply(ops, x);
         const beta = try self.beta.apply(ops, x);
-        const result = (try @import("glm5_kda_fused.zig").step(ops.s, .{ .qkv = joined, .beta = beta, .a = a, .gate = gate, .conv_weight = self.prepared_conv, .exp_a = self.prepared_decay, .dt_bias = self.dt_bias, .norm = self.out_norm, .conv_state = previous, .state = recurrent, .heads = heads, .norm_eps = cfg.rms_norm_eps, .lower = cfg.kda_gate_lower_bound })) orelse return null;
+        var inputs = @import("glm5_kda_fused.zig").Inputs{ .qkv = joined, .beta = beta, .conv_weight = self.prepared_conv, .exp_a = self.prepared_decay, .dt_bias = self.dt_bias, .norm = self.out_norm, .conv_state = previous, .state = recurrent, .heads = heads, .norm_eps = cfg.rms_norm_eps, .lower = cfg.kda_gate_lower_bound };
+        // The in-kernel projection skips `Linear.apply`, so the covariance tap must keep the staged path.
+        if (linear_tap == null and self.fb.projectsDenseBf16() and self.gb.projectsDenseBf16()) {
+            inputs.second_stage = .{ .a_low = a_low, .gate_low = gate_low, .fb = self.fb.w, .gb = self.gb.w };
+        } else {
+            inputs.a = try self.fb.apply(ops, a_low);
+            inputs.gate = try self.gb.apply(ops, gate_low);
+        }
+        const result = (try @import("glm5_kda_fused.zig").step(ops.s, inputs)) orelse return null;
         defer result.deinit();
         try mlx.check(mlx.mlx_array_set(&state.conv_state, result.conv));
         try mlx.check(mlx.mlx_array_set(&state.ssm_state, result.state));
@@ -977,7 +989,9 @@ test "GLM fused KDA decode preserves output and FP32 state exactly" {
                 defer ops.deinit();
                 const x = try ops.slice(try ops.slice(fixture.get("input").?, 0, 0, 1), 1, @intCast(i), @intCast(i + 1));
                 const expected = try layer.applyReference(&ops, x, &cfg, &reference);
+                const projected_before = @import("glm5_kda_fused.zig").projectedDispatchCount();
                 const got = (try layer.applyFused(&ops, x, &cfg, &fused)) orelse return error.TestExpectedFusedKda;
+                try std.testing.expectEqual(projected_before + 1, @import("glm5_kda_fused.zig").projectedDispatchCount());
                 try expectLayerBits(got, expected);
                 try expectLayerBits(fused.conv_state, reference.conv_state);
                 try expectLayerBits(fused.ssm_state, reference.ssm_state);
