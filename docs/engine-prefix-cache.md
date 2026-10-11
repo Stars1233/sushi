@@ -123,8 +123,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 ## Defaults: SSD tier on, RAM tier off
 
 - **RAM retention is opt-in.** Unnamed, `server.prefix_cache_ram_enabled` is false and the RAM budget is 0 bytes for
-  every served model; `--prefix-cache-mem <n>` turns it on (`0` or `off` keeps it off, like `--no-prefix-cache-ram`) and `--no-prefix-cache-ram`
-  wins over it. Launch flag > default; `model-settings.json` has no prefix-cache key. With RAM off every model runs
+  every served model; `--prefix-cache-mem <n>` turns it on and `--prefix-cache-mem 0` (or `off`) keeps it off. Launch flag > default; `model-settings.json` has no prefix-cache key. With RAM off every model runs
   SSD-first (`prefix_cache.ssdFirstActive`: a disk tier and RAM off).
 - **The SSD tier is on and sized per model at load** (`server.prefixCacheDiskForLoad` through
   `LoadParams.prefix_cache_disk_resolver`, the pure `kv_disk_cache.resolveDiskBudget`):
@@ -185,7 +184,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 
 ## SSD-only storage
 
-`--no-prefix-cache-ram --prefix-cache-disk 10GB` (the default arrangement, with a sized budget) keeps reusable text
+`--prefix-cache-mem off --prefix-cache-disk 10GB` (the default arrangement, with a sized budget) keeps reusable text
 prefixes on SSD without retaining idle KV snapshots in the RAM cache. The live request still needs KV memory, and queued disk writes can hold
 buffers temporarily. The entry count must remain positive: `--prefix-cache-entries 0` disables both tiers.
 With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` reports

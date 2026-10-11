@@ -3,7 +3,7 @@
 # whatever the RAM tier keeps (docs/engine-prefix-cache.md#ssd-flush). Two arms, each on a private
 # cache root:
 #   hybrid: a RAM tier smaller than the prompt (`--prefix-cache-mem $TIERS_MEM`) plus the SSD tier
-#   ssd:    `--no-prefix-cache-ram` plus the SSD tier
+#   ssd:    `--prefix-cache-mem off` plus the SSD tier
 # Per arm:
 #  1. Every tier writes through the background writer.
 #  2. Turn 1 is whole on disk before the next request: `e<id> complete on disk: N tokens`, N within
@@ -97,7 +97,7 @@ whole_on_disk() {
 
 for ARM in ${TIERS_ARMS:-hybrid ssd}; do
     DIR="$ROOT/$ARM"
-    if [ $ARM = hybrid ]; then FLAGS=(--prefix-cache-mem "$MEM" --prefix-cache-disk 20GB); else FLAGS=(--no-prefix-cache-ram --prefix-cache-disk 20GB); fi
+    if [ $ARM = hybrid ]; then FLAGS=(--prefix-cache-mem "$MEM" --prefix-cache-disk 20GB); else FLAGS=(--prefix-cache-mem off --prefix-cache-disk 20GB); fi
     boot "$DIR" "${FLAGS[@]}"
     GLM=0; grep -q '\[glm\] prefix cache' "$LOG" && GLM=1
     grep -q 'background writer armed' "$LOG" || fail "no background writer"

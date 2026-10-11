@@ -65,7 +65,7 @@ start_server() { # extra args...
     : > "$LOGFILE"
     # The suite names both tiers (RAM is opt-in, the SSD default would size its own budget). Callers'
     # "$@" comes later, so section 5's `--prefix-cache-disk off` and the SSD-only arms'
-    # `--no-prefix-cache-ram` still win.
+    # `--prefix-cache-mem off` still win.
     # SERVER_ULIMIT_N lowers the server's soft open-file limit.
     ( [ -n "${SERVER_ULIMIT_N:-}" ] && ulimit -n "$SERVER_ULIMIT_N"
       SUSHI_PREFIX_CACHE_DIR="$SCRATCH_HOME/.sushi/kv-cache" exec "$BINARY" --model "$MODEL" --serve --port "$PORT" \
@@ -210,7 +210,7 @@ stop_server
 echo
 echo "== 6. SSD-only mode persists without RAM retention =="
 rm -rf "$KV_DIR"
-start_server --no-prefix-cache-ram || { echo -e "${RED}FAIL${NC} SSD-only server failed to start"; exit 1; }
+start_server --prefix-cache-mem off || { echo -e "${RED}FAIL${NC} SSD-only server failed to start"; exit 1; }
 fire_long > /dev/null
 sleep 1
 if grep -q 'Prefix cache: SSD ONLY' "$LOGFILE" &&
@@ -221,7 +221,7 @@ else
     tail -30 "$LOGFILE"; FAIL=1
 fi
 stop_server
-start_server --no-prefix-cache-ram || { echo -e "${RED}FAIL${NC} SSD-only restart failed"; exit 1; }
+start_server --prefix-cache-mem off || { echo -e "${RED}FAIL${NC} SSD-only restart failed"; exit 1; }
 curl -fsS "$BASE/v1/unload-model" -H 'Content-Type: application/json' -d '{"model":"sushi"}' > /dev/null
 jq -nc --arg model "$MODEL" '{model:$model}' |
     curl -fsS "$BASE/v1/load-model" -H 'Content-Type: application/json' --data-binary @- > /dev/null

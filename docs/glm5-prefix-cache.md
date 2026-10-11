@@ -38,7 +38,7 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   - Appended prompt: 0.57, 0.41 and 0.43 s warm against 11.1, 42.4 and 79.6 s cold.
   - Grid restore with up to 2K tokens to prefill: 2.1, 1.6 and 3.3 s against 6.2, 37.5 and 75.8 s.
   - Decode is unchanged, 29.9 to 30.2 tok/s.
-  - SSD-only (`--no-prefix-cache-ram --prefix-cache-disk 12GB`), turns growing from 32K to 42K tokens: 6.5 to 7.6 s
+  - SSD-only (`--prefix-cache-mem off --prefix-cache-disk 12GB`), turns growing from 32K to 42K tokens: 6.5 to 7.6 s
     warm against 33.9 s cold at 28K. A restart restored 41,720 tokens from disk in 115 ms.
 - **Sushi-2.5bpw + vision + A4, cache on at its defaults** (this change on fbdedc01, kv8, `--prefix-cache-entries 1`
   so the cold arms follow an eviction, `taskpolicy -a`, lock held, 2026-10-05):
@@ -55,7 +55,7 @@ pooled index (`src/glm5_prefix.zig`; [glm5-arch](glm5-arch.md)).
   long prefill.
   - At kv8 it keeps a 30K session at its prompt end with 5 of 8 checkpoints, a 60K one with 4, and trims a 140K one
     to its checkpoint near 121K with 1. Each case keeps the assistant window.
-  - For long reuse add `--prefix-cache-disk`, or run SSD-only (`--no-prefix-cache-ram --prefix-cache-disk 12GB`).
+  - For long reuse add `--prefix-cache-disk`, or run SSD-only (`--prefix-cache-mem off --prefix-cache-disk 12GB`).
 - **The RAM tier's rows are a real copy at commit**, through the newest checkpoint it keeps
   (`HotPrefixCache.glmCommitLen`, chosen before the copy; a restore resumes from a checkpoint, so later rows are never
   read). It keeps rows, checkpoints and window within its budget, and the checkpoints above the chosen row are freed

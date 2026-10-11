@@ -126,7 +126,7 @@ fn printUsage(io: std.Io) void {
         \\  --ctx-size <n>      Maximum context length (default: model max)
         \\  --config-overrides <json>   JSON object deep-merged into EVERY
         \\                      model's config.json this process loads or
-        \\                      discovers (alias: --hf-overrides). Generic keys
+        \\                      discovers. Generic keys
         \\                      like max_position_embeddings hit everything.
         \\                      HF attention_factor replaces the computed YaRN
         \\                      mscale; vLLM attn_factor multiplies it.
@@ -222,8 +222,8 @@ fn printUsage(io: std.Io) void {
         \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
         \\                        Use 0.2 for the Qwen3.8 matched comparison.
         \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
-        \\                        Alias: --mtp-cascade. Use 0.95 for the
-        \\                        Qwen3.8 matched comparison. Exclusive with
+        \\                        Use 0.95 for the Qwen3.8 matched
+        \\                        comparison. Exclusive with
         \\                        --mtp-typical; exact is the default.
         \\  --mtp-greedy-tail   Sampled requests draft only the first MTP token
         \\                        from the draft sampler, every later one by
@@ -283,10 +283,6 @@ fn printUsage(io: std.Io) void {
         \\  --prefix-cache-entries <n>
         \\                      Hot prefix cache LRU capacity in entries
         \\                        (default: 32). 0 disables all prefix reuse.
-        \\  --no-prefix-cache-ram
-        \\                      Keep RAM retention off even when
-        \\                        --prefix-cache-mem is given (RAM is off by
-        \\                        default).
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Turn on RAM retention of idle prefix-cache
         \\                        entries with this KV-bytes budget (default:
@@ -567,7 +563,6 @@ pub fn main(init: std.process.Init) !void {
     var metrics_enabled = false;
     var log_level_explicit = false;
     var decode_share_flag: ?[]const u8 = null;
-    var no_prefix_cache_ram = false;
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -663,9 +658,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
             i += 1;
             ctx_size = try std.fmt.parseInt(u32, args[i], 10);
-        } else if ((std.mem.eql(u8, args[i], "--config-overrides") or
-            std.mem.eql(u8, args[i], "--hf-overrides")) and i + 1 < args.len)
-        {
+        } else if (std.mem.eql(u8, args[i], "--config-overrides") and i + 1 < args.len) {
             // vLLM's `--hf-overrides` analogue. Applied the moment the flag is
             // seen, so no config.json is ever parsed without it — the loaded
             // model, the registry stubs and `/v1/models` all agree on the
@@ -780,7 +773,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-typical") and i + 1 < args.len) {
             i += 1;
             mtp_typical_raw = args[i];
-        } else if ((std.mem.eql(u8, args[i], "--mtp-tokenv3") or std.mem.eql(u8, args[i], "--mtp-cascade")) and i + 1 < args.len) {
+        } else if (std.mem.eql(u8, args[i], "--mtp-tokenv3") and i + 1 < args.len) {
             i += 1;
             mtp_tokenv3_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--mtp-greedy-tail")) {
@@ -834,9 +827,6 @@ pub fn main(init: std.process.Init) !void {
             } else |_| {}
         } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
             generate_mod.prefill_trace_force = true;
-        } else if (std.mem.eql(u8, args[i], "--no-prefix-cache-ram")) {
-            no_prefix_cache_ram = true;
-            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionFor(server_mod.prefix_cache_mem_explicit, true);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -850,7 +840,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             server_mod.prefix_cache_mem_explicit = true;
-            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionForMemArg(server_mod.prefix_cache_mem_bytes, no_prefix_cache_ram);
+            server_mod.prefix_cache_ram_enabled = server_mod.ramRetentionForMemArg(server_mod.prefix_cache_mem_bytes);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
             // SSD tier for the hot prefix cache: previously-seen prefixes are
             // persisted as chunked safetensors and restored across restarts

@@ -69,6 +69,10 @@ check_flag() {
 }
 check_flag --no-such-flag 8
 check_flag --engine mlx
+# Removed launch flags: each must stay refused, not quietly accepted again.
+check_flag --hf-overrides '{}'
+check_flag --mtp-cascade 0.95
+check_flag --no-prefix-cache-ram
 
 echo "== unsupported checkpoint format refused by name =="
 TMP=$(mktemp -d)

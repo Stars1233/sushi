@@ -10,6 +10,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Cleanup**: `SUSHI_GDN_PIPELINED` is removed; the software-pipelined GDN prefill kernel is always the route of Flash-Next on NAX GPUs.
 - **Cleanup**: `SUSHI_SSD_WRITE_THROUGH` is removed; the prefill write-through to the SSD prefix cache is always on when its gates pass, and behaviour is unchanged.
 - **Cleanup**: `SUSHI_FUSED_256` is removed; the fused head-dim-256 prefill attention is always on, and output is unchanged.
+- **Flags**: `--hf-overrides` is removed; it was another name for `--config-overrides`.
+- **Flags**: `--mtp-cascade` is removed; it was another name for `--mtp-tokenv3`.
+- **Flags**: `--no-prefix-cache-ram` is now `--prefix-cache-mem off`.
 - **Cleanup**: `SUSHI_NO_UPDATE_CHECK` is removed; use `--no-update-check`.
 - **Cleanup**: `SUSHI_CACHE_LIMIT`, `SUSHI_WIRED` and `SUSHI_WIRED_SLACK_MB` are removed; the MLX buffer-pool cap is always RAM/16 clamped to 2..8 GB and the wired limit is always the recommended working set.
 - **Cleanup**: opt-in experiments that never shipped are removed with their environment switches: the DFlash width chooser and draft-only head, sampled DFlash drafts, periodic MTP re-entry, batched Qwen4 MTP rounds, fused QKV, the pruned lm_head, batched MoE decode, the paired gate/up and crossrow verify kernels, the fused add+RMSNorm lever and the compiled whole-forward.

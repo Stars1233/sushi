@@ -1078,7 +1078,7 @@ fn queryModel(buf: []u8, raw_path: []const u8) ?[]const u8 {
 // turn. The count cap is pure retention metadata; the SSD byte budget
 // (`prefixCacheDiskForLoad`) is what bounds the bytes. 0 disables.
 pub var prefix_cache_capacity: u32 = 32;
-/// RAM retention is opt-in: `--prefix-cache-mem` turns it on, `--no-prefix-cache-ram` wins over it.
+/// RAM retention is opt-in: `--prefix-cache-mem` turns it on, `0` or `off` keeps it off.
 pub var prefix_cache_ram_enabled: bool = false;
 
 /// The RAM tier's byte budget, read only where RAM retention is on (`--prefix-cache-mem`). The cache
@@ -1090,27 +1090,14 @@ pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 /// Set by `--prefix-cache-mem`: an operator's number is used as given, even when it equals the default.
 pub var prefix_cache_mem_explicit = false;
 
-/// RAM retention is on only when `--prefix-cache-mem` names it, whatever the flag order, and `--no-prefix-cache-ram` wins.
-pub fn ramRetentionFor(mem_named: bool, no_ram_flag: bool) bool {
-    return mem_named and !no_ram_flag;
-}
-
-test "ramRetentionFor: off unless --prefix-cache-mem names it, and --no-prefix-cache-ram wins in either order" {
-    try testing.expect(!ramRetentionFor(false, false));
-    try testing.expect(ramRetentionFor(true, false));
-    try testing.expect(!ramRetentionFor(true, true));
-    try testing.expect(!ramRetentionFor(false, true));
-}
-
-/// `--prefix-cache-mem 0` (or `off`) is "no RAM retention", the same as `--no-prefix-cache-ram`.
-pub fn ramRetentionForMemArg(mem_bytes: u64, no_ram_flag: bool) bool {
-    return ramRetentionFor(mem_bytes > 0, no_ram_flag);
+/// `--prefix-cache-mem 0` (or `off`) is "no RAM retention".
+pub fn ramRetentionForMemArg(mem_bytes: u64) bool {
+    return mem_bytes > 0;
 }
 
 test "ramRetentionForMemArg: a zero budget keeps RAM retention off" {
-    try testing.expect(!ramRetentionForMemArg(0, false));
-    try testing.expect(ramRetentionForMemArg(1 << 30, false));
-    try testing.expect(!ramRetentionForMemArg(1 << 30, true));
+    try testing.expect(!ramRetentionForMemArg(0));
+    try testing.expect(ramRetentionForMemArg(1 << 30));
 }
 
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
@@ -26275,7 +26262,7 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(PREFIX_CACHE_MEM_DEFAULT, defaultPrefixCacheAskFor(&glm, PREFIX_CACHE_MEM_DEFAULT, true, 8 << 30));
     try testing.expectEqual(@as(u64, 6 << 30), defaultPrefixCacheAskFor(&glm, 6 << 30, true, 8 << 30));
     try testing.expectEqual(@as(u64, 8 << 30), defaultPrefixCacheAskFor(&other, PREFIX_CACHE_MEM_DEFAULT, false, 8 << 30));
-    // `--no-prefix-cache-ram --prefix-cache-disk 12GB` keeps no idle RAM.
+    // `--prefix-cache-mem off --prefix-cache-disk 12GB` keeps no idle RAM.
     const saved_disk = prefix_cache_disk_bytes;
     defer prefix_cache_disk_bytes = saved_disk;
     prefix_cache_disk_bytes = 12 << 30;
