@@ -133,6 +133,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   macOS 27 MPP header rejects the `thread` qualifier).
 - Metal JIT-compiles at first EVAL, not at apply, so an optional NAX arm is PROBED on a one-tile problem before it
   is trusted (`buildNaxGemmKernel`); a failed probe declines by name and the sorted arm serves.
+- A failed probe is recorded once (`gemm_nax_failed`, the GLM grid's per-window `failed`) and never re-run per call: each
+  probe eval drains the GPU, so a re-probe per layer is a silent stall.
 - Every matmul2d tile in the engine is f16/bf16 (EXL3 expert GEMM, QSA gather, attention); int8 NAX would need int8
   activations (W8A8) and is not planned. An int8 x bf16 op costs the same as bf16 x bf16.
 - A cooperative tensor's layout depends on the element types and the precision flag. Read it with

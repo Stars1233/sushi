@@ -2,6 +2,7 @@
 const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const base = @import("expert_exl3_kernels.zig");
+const log = @import("mlx_host").log;
 const api = @import("root.zig");
 const support = base.PrefillGridSupport;
 const Arr = mlx.mlx_array;
@@ -19,6 +20,14 @@ fn replace(comptime source: []const u8, comptime old: []const u8, comptime value
 }
 const SOURCE = replace(replace(support.source, "uint win = uint(threadgroup_position_in_grid.y);", "uint win = uint(threadgroup_position_in_grid.x);"), "uint(threadgroup_position_in_grid.x) * 128u + sg * 32u", "uint(threadgroup_position_in_grid.y) * 128u + sg * 32u");
 var kernels: [api.format.Window.count]?mlx.mlx_fast_metal_kernel = @splat(null);
+var failed: [api.format.Window.count]bool = @splat(false);
+var build_attempts: usize = 0;
+var force_build_failure = false;
+fn build(window: api.format.Window) !mlx.mlx_fast_metal_kernel {
+    build_attempts += 1;
+    if (force_build_failure) return error.MetalKernelCompileFailed;
+    return support.makeKernel(SOURCE, window);
+}
 const Config = struct { input: c_int, output: c_int, rate: c_int, value: mlx.mlx_fast_metal_kernel_config };
 var configs: [8]?Config = @splat(null);
 fn project(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, x: Arr, bank: Arr, ids: Arr, starts: Arr, live: Arr, windows: c_int) !Arr {
@@ -79,8 +88,15 @@ pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: A
 pub fn moe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode) !?Arr {
     if (dec.codebook != .mcg or !eligible(s, x, bank, indices, scores)) return null;
     base.setDecodeParams(dec);
-    const slot = &kernels[dec.window.index()];
-    if (slot.* == null) slot.* = support.makeKernel(SOURCE, dec.window) catch return null;
+    const w = dec.window.index();
+    // A probe eval drains the GPU, so a failed window is declined for good.
+    if (failed[w]) return null;
+    const slot = &kernels[w];
+    if (slot.* == null) slot.* = build(dec.window) catch {
+        failed[w] = true;
+        if (!@import("builtin").is_test) log.info("[exl3-prefill] GLM grid transpose declined (kernel probe failed); the clamped sorted GEMM serves prefill\n", .{});
+        return null;
+    };
     const kernel = slot.*.?;
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
@@ -242,4 +258,39 @@ test "GLM prefill grid serves W14 packs with the sorted chain's bytes" {
     try gridMatchesSortedChain(.{ 36, 36, 36 }, true, .w14);
     try gridMatchesSortedChain(.{ 40, 40, 40 }, false, .w14);
     try gridMatchesSortedChain(.{ 40, 40, 36 }, true, .w14);
+}
+
+test "GLM prefill grid probes a failing kernel once per window" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const saved_kernels = kernels;
+    kernels = @splat(null);
+    build_attempts = 0;
+    force_build_failure = true;
+    defer {
+        kernels = saved_kernels;
+        force_build_failure = false;
+        build_attempts = 0;
+        failed = @splat(false);
+    }
+    failed = @splat(false);
+    var o: Owned = .{};
+    defer o.deinit();
+    const bank = api.Bank{
+        .gate = try testProj(&o, s, 4096, 2048, 32, 11),
+        .up = try testProj(&o, s, 4096, 2048, 32, 13),
+        .down = try testProj(&o, s, 2048, 4096, 32, 17),
+    };
+    const x = try o.own(mlx.mlx_array_new());
+    try mlx.check(mlx.mlx_zeros(x, &[_]c_int{ 1, 2048, 4096 }, 3, .bfloat16, s));
+    const ids = try o.own(mlx.mlx_array_new());
+    try mlx.check(mlx.mlx_zeros(ids, &[_]c_int{ 1, 2048, 8 }, 3, .uint32, s));
+    const scores = try o.own(mlx.mlx_array_new());
+    try mlx.check(mlx.mlx_zeros(scores, &[_]c_int{ 1, 2048, 8 }, 3, .float32, s));
+    const dec = api.format.Decode{ .codebook = .mcg, .window = .w12 };
+    try std.testing.expect((try moe(s, x.*, bank, ids.*, scores.*, dec)) == null);
+    try std.testing.expect((try moe(s, x.*, bank, ids.*, scores.*, dec)) == null);
+    try std.testing.expectEqual(@as(usize, 1), build_attempts);
+    try std.testing.expect((try moe(s, x.*, bank, ids.*, scores.*, .{ .codebook = .mcg, .window = .w14 })) == null);
+    try std.testing.expectEqual(@as(usize, 2), build_attempts);
 }
