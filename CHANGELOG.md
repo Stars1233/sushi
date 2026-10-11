@@ -11,6 +11,10 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Cleanup**: opt-in experiments that never shipped are removed with their environment switches: the DFlash width chooser and draft-only head, sampled DFlash drafts, periodic MTP re-entry, batched Qwen4 MTP rounds, fused QKV, the pruned lm_head, batched MoE decode, the paired gate/up and crossrow verify kernels, the fused add+RMSNorm lever and the compiled whole-forward.
 - **Cleanup**: `--decode-attn-quant` side copies are always INT8 group-32; the NVFP4 tail and `SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM` are removed.
 - **Cleanup**: the `--dspark` flag is removed; it only set an environment variable that nothing read.
+- **Cleanup**: the speculation env switches and sweep knobs (MTP planner, drafting and DFlash gates) are removed; default behaviour is unchanged.
+- **Cleanup**: the env switches for adopted MoE, verify-qmm, prefix-cache, prefill-chunk and load behaviour are removed; default arms are unchanged.
+- **Cleanup**: the attention, QSA, KV-growth, GDN, hyper-connection and PLE kill-switch env vars are removed; the shipped paths are unchanged, and the memory bill reflects the single QSA history copy.
+- **Cleanup**: `SUSHI_DFLASH_MARKOV` is removed; a DSpark sidecar's Markov chain always runs.
 - **Cleanup**: the launch flags now are the only control for settings that also had an environment twin:
   `SUSHI_DFLASH` (use `--no-drafter`), `SUSHI_MTP_TYPICAL` and `SUSHI_MTP_TOKENV3` (`--mtp-typical`,
   `--mtp-tokenv3`), `SUSHI_PREFILL_CHUNK` (`--prefill-chunk`, which now also keeps the memory safety cap),
