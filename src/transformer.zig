@@ -620,7 +620,7 @@ fn gdnPrefillRoute(model_type: []const u8, seq_len: c_int, dk: c_int, dv: c_int,
 // matmul2d<.., execution_simdgroup> pipeline creation can fail on non-G17
 // hardware. Switch: SUSHI_FORCE_GPU_FAMILY_FALLBACK=1 pretends the units are absent (QA
 // rehearsal of the exact M1-M4 path on an M5).
-/// Comptime codegen of the per-M split-K kernel body. The row loads, weight
+/// Runtime codegen of the per-M split-K kernel body. The row loads, weight
 /// loads, and dequant+FMA chains are emitted as NAMED SCALARS with LITERAL
 /// accumulator indices — the ledger's load-bearing constraint: array-indexed
 /// rows behind a runtime-ish loop stack-spill (measured 10x at M=6 with the
@@ -631,15 +631,12 @@ fn gdnPrefillRoute(model_type: []const u8, seq_len: c_int, dk: c_int, dv: c_int,
 /// value: `wv` is the dequantized weight, `idx` the element inside the Vec8
 /// activation group. Shared by both plain-SIMD verify tiles so the two cannot
 /// drift.
-fn vqmmAccLines(comptime m: usize, comptime j: usize, comptime idx: []const u8) []const u8 {
-    comptime {
-        @setEvalBranchQuota(200_000);
-        var out: []const u8 = "";
-        for (0..m) |r| {
-            out = out ++ std.fmt.comptimePrint("        acc[{d}] += float(v{d}[{s}]) * wv;\n", .{ j * m + r, r, idx });
-        }
-        return out;
+fn vqmmAccLines(a: std.mem.Allocator, m: usize, j: usize, idx: []const u8) std.mem.Allocator.Error![]const u8 {
+    var out: []const u8 = "";
+    for (0..m) |r| {
+        out = try vqmmCat(a, out, try std.fmt.allocPrint(a, "        acc[{d}] += float(v{d}[{s}]) * wv;\n", .{ j * m + r, r, idx }));
     }
+    return out;
 }
 
 /// Hoisted weight WORDS for one column, decoded per width.
@@ -659,152 +656,142 @@ fn vqmmAccLines(comptime m: usize, comptime j: usize, comptime idx: []const u8) 
 /// this buffer, and widening that assumption for one fused load buys nothing).
 /// 6-bit lands on `pack * 6`, only 2-aligned, so three ushorts re-assembled
 /// into two 3-byte words. 5-bit on `pack * 5` is 1-aligned and takes bytes.
-fn vqmmColumnLoad(comptime j: usize) []const u8 {
-    comptime {
-        @setEvalBranchQuota(200_000);
-        return std.fmt.comptimePrint(
-            \\  uint32_t p{d}; ulong r{d}; uint32_t a{d}0; uint32_t a{d}1;
-            \\  if constexpr (BITS == 4) {{ p{d} = w_q[(n0 + {d}) * K_by_p + pack]; }}
-            \\  else {{
-            \\    const device uchar* wp = ((const device uchar*)w_q) + (n0 + {d}) * K_bytes + pack * BITS;
-            \\    if constexpr (BITS == 8) {{
-            \\      const device uint* wu = (const device uint*)wp;
-            \\      r{d} = ulong(wu[0]) | (ulong(wu[1]) << 32);
-            \\    }} else if constexpr (BITS == 5) {{
-            \\      r{d} = ulong(wp[0]) | (ulong(wp[1]) << 8) | (ulong(wp[2]) << 16) |
-            \\             (ulong(wp[3]) << 24) | (ulong(wp[4]) << 32);
-            \\    }} else {{
-            \\      const device ushort* wh = (const device ushort*)wp;
-            \\      uint32_t h0 = uint32_t(wh[0]); uint32_t h1 = uint32_t(wh[1]); uint32_t h2 = uint32_t(wh[2]);
-            \\      a{d}0 = h0 | ((h1 & 0xFFu) << 16);
-            \\      a{d}1 = (h1 >> 8) | (h2 << 8);
-            \\    }}
-            \\  }}
-            \\
-        , .{ j, j, j, j, j, j, j, j, j, j, j });
-    }
+fn vqmmColumnLoad(a: std.mem.Allocator, j: usize) std.mem.Allocator.Error![]const u8 {
+    return std.fmt.allocPrint(a,
+        \\  uint32_t p{d}; ulong r{d}; uint32_t a{d}0; uint32_t a{d}1;
+        \\  if constexpr (BITS == 4) {{ p{d} = w_q[(n0 + {d}) * K_by_p + pack]; }}
+        \\  else {{
+        \\    const device uchar* wp = ((const device uchar*)w_q) + (n0 + {d}) * K_bytes + pack * BITS;
+        \\    if constexpr (BITS == 8) {{
+        \\      const device uint* wu = (const device uint*)wp;
+        \\      r{d} = ulong(wu[0]) | (ulong(wu[1]) << 32);
+        \\    }} else if constexpr (BITS == 5) {{
+        \\      r{d} = ulong(wp[0]) | (ulong(wp[1]) << 8) | (ulong(wp[2]) << 16) |
+        \\             (ulong(wp[3]) << 24) | (ulong(wp[4]) << 32);
+        \\    }} else {{
+        \\      const device ushort* wh = (const device ushort*)wp;
+        \\      uint32_t h0 = uint32_t(wh[0]); uint32_t h1 = uint32_t(wh[1]); uint32_t h2 = uint32_t(wh[2]);
+        \\      a{d}0 = h0 | ((h1 & 0xFFu) << 16);
+        \\      a{d}1 = (h1 >> 8) | (h2 << 8);
+        \\    }}
+        \\  }}
+        \\
+    , .{ j, j, j, j, j, j, j, j, j, j, j });
 }
 
 /// Per-column dequant + FMA chain, one arm per supported affine width. The
 /// byte-addressed arms are lifted from the NAX m16 tile's validated unpack
 /// (4 values per 3 bytes at 6 bits, 8 per 5 bytes at 5, one byte per value at
 /// 8) — this is not a fresh reading of MLX's packing.
-fn vqmmColumnChain(comptime m: usize, comptime j: usize) []const u8 {
-    comptime {
-        @setEvalBranchQuota(200_000);
-        const acc_ki = vqmmAccLines(m, j, "ki");
-        const acc_hi = vqmmAccLines(m, j, "4 + ki");
-        return std.fmt.comptimePrint(
-            \\  {{
-            \\    float sj = s{d}; float bj = b{d};
-            \\    if constexpr (BITS == 4) {{
-            \\      for (int ki = 0; ki < 8; ++ki) {{
-            \\        float wv = float((p{d} >> (ki * 4)) & 0xFu) * sj + bj;
-            \\{s}      }}
-            \\    }} else if constexpr (BITS == 8) {{
-            \\      for (int ki = 0; ki < 8; ++ki) {{
-            \\        float wv = float(uint32_t((r{d} >> (ki * 8)) & 0xFFul)) * sj + bj;
-            \\{s}      }}
-            \\    }} else if constexpr (BITS == 5) {{
-            \\      for (int ki = 0; ki < 8; ++ki) {{
-            \\        float wv = float(uint32_t((r{d} >> (ki * 5)) & 0x1Ful)) * sj + bj;
-            \\{s}      }}
-            \\    }} else {{
-            \\      for (int ki = 0; ki < 4; ++ki) {{
-            \\        float wv = float((a{d}0 >> (ki * 6)) & 0x3Fu) * sj + bj;
-            \\{s}      }}
-            \\      for (int ki = 0; ki < 4; ++ki) {{
-            \\        float wv = float((a{d}1 >> (ki * 6)) & 0x3Fu) * sj + bj;
-            \\{s}      }}
-            \\    }}
-            \\  }}
-            \\
-        , .{ j, j, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_hi });
-    }
+fn vqmmColumnChain(a: std.mem.Allocator, m: usize, j: usize) std.mem.Allocator.Error![]const u8 {
+    const acc_ki = try vqmmAccLines(a, m, j, "ki");
+    const acc_hi = try vqmmAccLines(a, m, j, "4 + ki");
+    return std.fmt.allocPrint(a,
+        \\  {{
+        \\    float sj = s{d}; float bj = b{d};
+        \\    if constexpr (BITS == 4) {{
+        \\      for (int ki = 0; ki < 8; ++ki) {{
+        \\        float wv = float((p{d} >> (ki * 4)) & 0xFu) * sj + bj;
+        \\{s}      }}
+        \\    }} else if constexpr (BITS == 8) {{
+        \\      for (int ki = 0; ki < 8; ++ki) {{
+        \\        float wv = float(uint32_t((r{d} >> (ki * 8)) & 0xFFul)) * sj + bj;
+        \\{s}      }}
+        \\    }} else if constexpr (BITS == 5) {{
+        \\      for (int ki = 0; ki < 8; ++ki) {{
+        \\        float wv = float(uint32_t((r{d} >> (ki * 5)) & 0x1Ful)) * sj + bj;
+        \\{s}      }}
+        \\    }} else {{
+        \\      for (int ki = 0; ki < 4; ++ki) {{
+        \\        float wv = float((a{d}0 >> (ki * 6)) & 0x3Fu) * sj + bj;
+        \\{s}      }}
+        \\      for (int ki = 0; ki < 4; ++ki) {{
+        \\        float wv = float((a{d}1 >> (ki * 6)) & 0x3Fu) * sj + bj;
+        \\{s}      }}
+        \\    }}
+        \\  }}
+        \\
+    , .{ j, j, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_hi });
 }
 
-fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
-    comptime {
-        // The per-width unpack ladder multiplies the comptime string work.
-        @setEvalBranchQuota(200_000);
-        const nacc = bn * m;
-        var body: []const u8 = "";
-        // Row activation loads, all up front.
-        for (0..m) |r| {
-            body = body ++ std.fmt.comptimePrint("  Vec8 v{d} = xv[({d} * K + k_base) / 8];\n", .{ r, r });
-        }
-        // Weight handles for the owned columns, then scales/biases.
-        for (0..bn) |j| {
-            body = body ++ vqmmColumnLoad(j);
-        }
-        for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  float s{d} = float(scales[(n0 + {d}) * K_by_gs + gi]); float b{d} = float(biases[(n0 + {d}) * K_by_gs + gi]);\n", .{ j, j, j, j });
-        }
-        // One sequential dequant+FMA chain per output column (column-major
-        // construction; the interleaved form measurably loses).
-        for (0..bn) |j| {
-            body = body ++ vqmmColumnChain(m, j);
-        }
-        var acc_init: []const u8 = "";
-        for (0..nacc) |i| {
-            acc_init = acc_init ++ std.fmt.comptimePrint("acc[{d}] = 0.0f; ", .{i});
-        }
-        var acc_sum: []const u8 = "";
-        for (0..nacc) |i| {
-            acc_sum = acc_sum ++ std.fmt.comptimePrint("acc[{d}] = simd_sum(acc[{d}]); ", .{ i, i });
-        }
-        return std.fmt.comptimePrint(
-            \\auto part = simdgroup_index_in_threadgroup;
-            \\auto lane = thread_index_in_simdgroup;
-            \\auto tg_n = threadgroup_position_in_grid.y;
-            \\
-            \\int K = int(K_size);
-            \\int N = int(N_size);
-            \\int K_by_p = K / 8;
-            \\int K_bytes = (K * BITS) / 8;
-            \\int K_by_gs = K / GS;
-            \\int per_part = K_by_p / K_PARTS;
-            \\int n0 = int(tg_n) * {d};
-            \\int p_start = int(part) * per_part;
-            \\int p_end = (int(part) == K_PARTS - 1) ? K_by_p : p_start + per_part;
-            \\
-            \\float acc[{d}];
-            \\{s}
-            \\
-            \\using Vec8 = vec<T, 8>;
-            \\const device Vec8 *xv = (const device Vec8*)x;
-            \\
-            \\for (int pack = p_start + int(lane); pack < p_end; pack += 32) {{
-            \\  int k_base = pack * 8;
-            \\  int gi = k_base / GS;
-            \\{s}
-            \\}}
-            \\
-            \\{s}
-            \\
-            \\threadgroup float partials[K_PARTS * {d}];
-            \\if (lane == 0) {{
-            \\  _Pragma("unroll")
-            \\  for (int i = 0; i < {d}; ++i) {{
-            \\    partials[int(part) * {d} + i] = acc[i];
-            \\  }}
-            \\}}
-            \\threadgroup_barrier(mem_flags::mem_threadgroup);
-            \\
-            \\if (part == 0) {{
-            \\  for (int i = int(lane); i < {d}; i += 32) {{
-            \\    float total = 0.0f;
-            \\    _Pragma("unroll")
-            \\    for (int p = 0; p < K_PARTS; ++p) {{
-            \\      total += partials[p * {d} + i];
-            \\    }}
-            \\    int j = i / {d};
-            \\    int row = i - j * {d};
-            \\    y[row * N + n0 + j] = T(total);
-            \\  }}
-            \\}}
-        , .{ bn, nacc, acc_init, body, acc_sum, nacc, nacc, nacc, nacc, nacc, m, m });
+fn verifyQmmSource(a: std.mem.Allocator, m: usize, bn: usize) std.mem.Allocator.Error![:0]const u8 {
+    const nacc = bn * m;
+    var body: []const u8 = "";
+    // Row activation loads, all up front.
+    for (0..m) |r| {
+        body = try vqmmCat(a, body, try std.fmt.allocPrint(a, "  Vec8 v{d} = xv[({d} * K + k_base) / 8];\n", .{ r, r }));
     }
+    // Weight handles for the owned columns, then scales/biases.
+    for (0..bn) |j| {
+        body = try vqmmCat(a, body, try vqmmColumnLoad(a, j));
+    }
+    for (0..bn) |j| {
+        body = try vqmmCat(a, body, try std.fmt.allocPrint(a, "  float s{d} = float(scales[(n0 + {d}) * K_by_gs + gi]); float b{d} = float(biases[(n0 + {d}) * K_by_gs + gi]);\n", .{ j, j, j, j }));
+    }
+    // One sequential dequant+FMA chain per output column (column-major
+    // construction; the interleaved form measurably loses).
+    for (0..bn) |j| {
+        body = try vqmmCat(a, body, try vqmmColumnChain(a, m, j));
+    }
+    var acc_init: []const u8 = "";
+    for (0..nacc) |i| {
+        acc_init = try vqmmCat(a, acc_init, try std.fmt.allocPrint(a, "acc[{d}] = 0.0f; ", .{i}));
+    }
+    var acc_sum: []const u8 = "";
+    for (0..nacc) |i| {
+        acc_sum = try vqmmCat(a, acc_sum, try std.fmt.allocPrint(a, "acc[{d}] = simd_sum(acc[{d}]); ", .{ i, i }));
+    }
+    return std.fmt.allocPrintSentinel(a,
+        \\auto part = simdgroup_index_in_threadgroup;
+        \\auto lane = thread_index_in_simdgroup;
+        \\auto tg_n = threadgroup_position_in_grid.y;
+        \\
+        \\int K = int(K_size);
+        \\int N = int(N_size);
+        \\int K_by_p = K / 8;
+        \\int K_bytes = (K * BITS) / 8;
+        \\int K_by_gs = K / GS;
+        \\int per_part = K_by_p / K_PARTS;
+        \\int n0 = int(tg_n) * {d};
+        \\int p_start = int(part) * per_part;
+        \\int p_end = (int(part) == K_PARTS - 1) ? K_by_p : p_start + per_part;
+        \\
+        \\float acc[{d}];
+        \\{s}
+        \\
+        \\using Vec8 = vec<T, 8>;
+        \\const device Vec8 *xv = (const device Vec8*)x;
+        \\
+        \\for (int pack = p_start + int(lane); pack < p_end; pack += 32) {{
+        \\  int k_base = pack * 8;
+        \\  int gi = k_base / GS;
+        \\{s}
+        \\}}
+        \\
+        \\{s}
+        \\
+        \\threadgroup float partials[K_PARTS * {d}];
+        \\if (lane == 0) {{
+        \\  _Pragma("unroll")
+        \\  for (int i = 0; i < {d}; ++i) {{
+        \\    partials[int(part) * {d} + i] = acc[i];
+        \\  }}
+        \\}}
+        \\threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\
+        \\if (part == 0) {{
+        \\  for (int i = int(lane); i < {d}; i += 32) {{
+        \\    float total = 0.0f;
+        \\    _Pragma("unroll")
+        \\    for (int p = 0; p < K_PARTS; ++p) {{
+        \\      total += partials[p * {d} + i];
+        \\    }}
+        \\    int j = i / {d};
+        \\    int row = i - j * {d};
+        \\    y[row * N + n0 + j] = T(total);
+        \\  }}
+        \\}}
+    , .{ bn, nacc, acc_init, body, acc_sum, nacc, nacc, nacc, nacc, nacc, m, m }, 0);
 }
 
 /// Wide multi-simdgroup tile for HUGE N (the lm_head class): NSG independent
@@ -812,66 +799,62 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
 /// heavier units — the split-K tiny-tile grid measurably thrashes there
 /// (2.1x stock at M=4), while this tile holds 1.18x off the weight-stream
 /// floor per the source ledger. Full-K per simdgroup, no barrier.
-fn verifyQmmMsgSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
-    comptime {
-        // The per-width unpack ladder multiplies the comptime string work.
-        @setEvalBranchQuota(200_000);
-        const nacc = bn * m;
-        var body: []const u8 = "";
-        for (0..m) |r| {
-            body = body ++ std.fmt.comptimePrint("  Vec8 v{d} = xv[({d} * K + k_base) / 8];\n", .{ r, r });
-        }
-        for (0..bn) |j| {
-            body = body ++ vqmmColumnLoad(j);
-        }
-        for (0..bn) |j| {
-            body = body ++ std.fmt.comptimePrint("  float s{d} = float(scales[(n0 + {d}) * K_by_gs + gi]); float b{d} = float(biases[(n0 + {d}) * K_by_gs + gi]);\n", .{ j, j, j, j });
-        }
-        for (0..bn) |j| {
-            body = body ++ vqmmColumnChain(m, j);
-        }
-        var acc_init: []const u8 = "";
-        for (0..nacc) |i| {
-            acc_init = acc_init ++ std.fmt.comptimePrint("acc[{d}] = 0.0f; ", .{i});
-        }
-        var acc_sum: []const u8 = "";
-        for (0..nacc) |i| {
-            acc_sum = acc_sum ++ std.fmt.comptimePrint("acc[{d}] = simd_sum(acc[{d}]); ", .{ i, i });
-        }
-        return std.fmt.comptimePrint(
-            \\auto sg = simdgroup_index_in_threadgroup;
-            \\auto lane = thread_index_in_simdgroup;
-            \\auto tg_n = threadgroup_position_in_grid.y;
-            \\
-            \\int K = int(K_size);
-            \\int N = int(N_size);
-            \\int K_by_p = K / 8;
-            \\int K_bytes = (K * BITS) / 8;
-            \\int K_by_gs = K / GS;
-            \\int n0 = (int(tg_n) * NSG + int(sg)) * {d};
-            \\if (n0 + {d} >= N) {{ return; }}
-            \\
-            \\float acc[{d}];
-            \\{s}
-            \\
-            \\using Vec8 = vec<T, 8>;
-            \\const device Vec8 *xv = (const device Vec8*)x;
-            \\
-            \\for (int pack = int(lane); pack < K_by_p; pack += 32) {{
-            \\  int k_base = pack * 8;
-            \\  int gi = k_base / GS;
-            \\{s}
-            \\}}
-            \\
-            \\{s}
-            \\
-            \\if (lane < {d}) {{
-            \\  int j = int(lane) / {d};
-            \\  int row = int(lane) - j * {d};
-            \\  y[row * N + n0 + j] = T(acc[int(lane)]);
-            \\}}
-        , .{ bn, bn - 1, nacc, acc_init, body, acc_sum, nacc, m, m });
+fn verifyQmmMsgSource(a: std.mem.Allocator, m: usize, bn: usize) std.mem.Allocator.Error![:0]const u8 {
+    const nacc = bn * m;
+    var body: []const u8 = "";
+    for (0..m) |r| {
+        body = try vqmmCat(a, body, try std.fmt.allocPrint(a, "  Vec8 v{d} = xv[({d} * K + k_base) / 8];\n", .{ r, r }));
     }
+    for (0..bn) |j| {
+        body = try vqmmCat(a, body, try vqmmColumnLoad(a, j));
+    }
+    for (0..bn) |j| {
+        body = try vqmmCat(a, body, try std.fmt.allocPrint(a, "  float s{d} = float(scales[(n0 + {d}) * K_by_gs + gi]); float b{d} = float(biases[(n0 + {d}) * K_by_gs + gi]);\n", .{ j, j, j, j }));
+    }
+    for (0..bn) |j| {
+        body = try vqmmCat(a, body, try vqmmColumnChain(a, m, j));
+    }
+    var acc_init: []const u8 = "";
+    for (0..nacc) |i| {
+        acc_init = try vqmmCat(a, acc_init, try std.fmt.allocPrint(a, "acc[{d}] = 0.0f; ", .{i}));
+    }
+    var acc_sum: []const u8 = "";
+    for (0..nacc) |i| {
+        acc_sum = try vqmmCat(a, acc_sum, try std.fmt.allocPrint(a, "acc[{d}] = simd_sum(acc[{d}]); ", .{ i, i }));
+    }
+    return std.fmt.allocPrintSentinel(a,
+        \\auto sg = simdgroup_index_in_threadgroup;
+        \\auto lane = thread_index_in_simdgroup;
+        \\auto tg_n = threadgroup_position_in_grid.y;
+        \\
+        \\int K = int(K_size);
+        \\int N = int(N_size);
+        \\int K_by_p = K / 8;
+        \\int K_bytes = (K * BITS) / 8;
+        \\int K_by_gs = K / GS;
+        \\int n0 = (int(tg_n) * NSG + int(sg)) * {d};
+        \\if (n0 + {d} >= N) {{ return; }}
+        \\
+        \\float acc[{d}];
+        \\{s}
+        \\
+        \\using Vec8 = vec<T, 8>;
+        \\const device Vec8 *xv = (const device Vec8*)x;
+        \\
+        \\for (int pack = int(lane); pack < K_by_p; pack += 32) {{
+        \\  int k_base = pack * 8;
+        \\  int gi = k_base / GS;
+        \\{s}
+        \\}}
+        \\
+        \\{s}
+        \\
+        \\if (lane < {d}) {{
+        \\  int j = int(lane) / {d};
+        \\  int row = int(lane) - j * {d};
+        \\  y[row * N + n0 + j] = T(acc[int(lane)]);
+        \\}}
+    , .{ bn, bn - 1, nacc, acc_init, body, acc_sum, nacc, m, m }, 0);
 }
 
 /// msg column-tile width per M: 4 columns through M=6, 2 for M=7 (14
@@ -880,13 +863,11 @@ fn vqmmMsgBn(m: c_int) c_int {
     return if (m <= 6) 4 else 2;
 }
 
-const VQMM_MSG_SOURCES = blk: {
-    @setEvalBranchQuota(20_000_000);
-    break :blk [6][:0]const u8{
-        verifyQmmMsgSource(2, 4), verifyQmmMsgSource(3, 4), verifyQmmMsgSource(4, 4),
-        verifyQmmMsgSource(5, 4), verifyQmmMsgSource(6, 4), verifyQmmMsgSource(7, 2),
-    };
-};
+/// Kernel text is built at runtime into a scratch arena: comptime string work for 24 tiles costs seconds of Sema.
+fn vqmmCat(a: std.mem.Allocator, x: []const u8, y: []const u8) std.mem.Allocator.Error![]const u8 {
+    return std.mem.concat(a, u8, &.{ x, y });
+}
+
 const VQMM_MSG_NAMES = [6][*:0]const u8{
     "sushi_vqmm_msg_m2", "sushi_vqmm_msg_m3", "sushi_vqmm_msg_m4",
     "sushi_vqmm_msg_m5", "sushi_vqmm_msg_m6", "sushi_vqmm_msg_m7",
@@ -904,11 +885,14 @@ fn getVerifyQmmMsgKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const source = try verifyQmmMsgSource(arena.allocator(), @intCast(m), @intCast(vqmmMsgBn(m)));
     const kernel = mlx.mlx_fast_metal_kernel_new(
         VQMM_MSG_NAMES[idx],
         in_vec,
         out_vec,
-        VQMM_MSG_SOURCES[idx],
+        source,
         "",
         true,
         false,
@@ -975,17 +959,6 @@ fn vqmmSourceIdx(m: c_int, bn: c_int) usize {
 
 const VQMM_N_KERNELS = 6 * VQMM_BN_CHOICES.len;
 
-const VQMM_SOURCES = blk: {
-    // 18 tiles x a four-width unpack ladder is a lot of comptime string work.
-    @setEvalBranchQuota(20_000_000);
-    var out: [VQMM_N_KERNELS][:0]const u8 = undefined;
-    for (2..8) |m| {
-        for (VQMM_BN_CHOICES, 0..) |bn, bi| {
-            out[(m - 2) * VQMM_BN_CHOICES.len + bi] = verifyQmmSource(m, @intCast(bn));
-        }
-    }
-    break :blk out;
-};
 const VQMM_NAMES = blk: {
     var out: [VQMM_N_KERNELS][*:0]const u8 = undefined;
     for (2..8) |m| {
@@ -1009,7 +982,9 @@ fn getVerifyQmmKernel(m: c_int, bn: c_int) !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const source: [*:0]const u8 = VQMM_SOURCES[idx];
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const source = try verifyQmmSource(arena.allocator(), @intCast(m), @intCast(bn));
     const name: [*:0]const u8 = VQMM_NAMES[idx];
     const kernel = mlx.mlx_fast_metal_kernel_new(
         name,
@@ -28163,6 +28138,7 @@ fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
 // ── Tests ──
 
 const testing = std.testing;
+const expectError = @import("test_expect.zig").expectError;
 
 /// Helper: create a dummy K or V tensor of shape [1, 1, seq_len, 1].
 fn testKV(seq_len: usize, s: mlx.mlx_stream) mlx.mlx_array {
@@ -37141,6 +37117,28 @@ fn expectVerifyQmmNoWorseThanStock(
         );
         return error.TestExpectedApproxEq;
     }
+}
+
+test "vqmm Metal sources are byte-identical to the shipped text" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var sha = std.crypto.hash.sha2.Sha256.init(.{});
+    var bytes: usize = 0;
+    for (2..8) |m| {
+        for (VQMM_BN_CHOICES) |bn| {
+            const src = try verifyQmmSource(arena.allocator(), m, @intCast(bn));
+            sha.update(src);
+            bytes += src.len;
+        }
+    }
+    for (2..8) |m| {
+        const src = try verifyQmmMsgSource(arena.allocator(), m, @intCast(vqmmMsgBn(@intCast(m))));
+        sha.update(src);
+        bytes += src.len;
+    }
+    try testing.expectEqual(@as(usize, 312_254), bytes);
+    const digest = std.fmt.bytesToHex(sha.finalResult(), .lower);
+    try testing.expectEqualStrings("484c91a3c6460e022df1f2a5f1f2db9d8630c50c760722b90cc4821bf66f9aea", &digest);
 }
 
 test "verifyQmmParityVerdict: reduction-order noise passes, a gross or systematic error does not" {
@@ -55301,7 +55299,7 @@ test "mimo v2 raw per-expert load failure releases partial construction" {
 
     // The fixture's dense layer 0 binds before the first MoE layer asks for
     // packed switch_mlp banks that are absent from the raw HF layout.
-    try testing.expectError(error.MissingWeight, Transformer.init(io, allocator, config, &weights));
+    try expectError(error.MissingWeight, Transformer.init(io, allocator, config, &weights));
 }
 
 test "mimo v2 fixture full and cached forwards track the HF reference (MIMO_V2_MODEL + MIMO_V2_FIXTURE)" {

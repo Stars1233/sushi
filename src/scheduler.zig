@@ -6445,7 +6445,7 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Transformer, cfg: *const ModelC
             };
             if (iter > 0) times[iter - 1] = @as(f64, @floatFromInt(sw.read())) / 1.0e6;
         }
-        std.mem.sort(f64, times, {}, std.sort.asc(f64));
+        std.mem.sortUnstable(f64, times, {}, std.sort.asc(f64));
         log.info("[prefill-ubench] arm={s} rows={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s)\n", .{
             if (arm) |a| (if (a) "1" else "0") else "shipped", rows, n, times[n / 2], times[0], times[n - 1],
             @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0,
@@ -9433,6 +9433,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
 }
 
 const testing = std.testing;
+const expectError = @import("test_expect.zig").expectError;
 
 test "runPrefill wires the interleave hook and bills its decode ticks out of prefill_ns" {
     const src = @embedFile("scheduler.zig");
@@ -11564,7 +11565,7 @@ test "a GLM slot submitted with a kv4 override is refused by the same name admis
     model.transformer = null;
     model.prefix_cache = null;
     const result = sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1, .kv_quant_config = transformer_mod.KVQuantConfig.affine(4) });
-    try testing.expectError(error.GlmKvQuantUnsupported, result);
+    try expectError(error.GlmKvQuantUnsupported, result);
 }
 
 test "an empty prompt is refused at submit, before any slot reaches the inference thread" {
@@ -11594,7 +11595,7 @@ test "an empty prompt is refused at submit, before any slot reaches the inferenc
     model.transformer = null;
     model.prefix_cache = null;
     const result = sch.submit(.{ .model = &model, .prompt_ids = &.{}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 4 });
-    try testing.expectError(error.EmptyPrompt, result);
+    try expectError(error.EmptyPrompt, result);
     try testing.expectEqual(@as(usize, 0), sch.pending.items.len);
 }
 
