@@ -4102,27 +4102,11 @@ const QSA_ATTN_Q_SOURCE =
     \\// but a split's last is full. A split starting past L is EMPTY and
     \\// writes the merge's identity.
     \\const int tiles = (L + BK - 1) / BK;
-    \\// BALANCED=0 (default, MEASURED): ceil(tiles/NSPLIT) per split, so the
-    \\// last splits can be short or empty — at the swept shape 129 tiles over
-    \\// 16 splits is 14 full, 1 partial, 1 empty. BALANCED=1 spreads the
-    \\// remainder one tile per split instead. Strictly better load balance on
-    \\// paper; NOT the default because the sweep that chose NSPLIT=16 ran on
-    \\// the ceil distribution, and changing how work is divided invalidates
-    \\// it. Same outputs either way — the split boundaries move, the merge is
-    \\// exact over whatever they are.
-    \\int t_lo, t_hi;
-    \\if (BALANCED) {
-    \\  const int base_t = tiles / NSPLIT;
-    \\  const int rem_t = tiles % NSPLIT;
-    \\  const int start_t = jsp * base_t + metal::min(jsp, rem_t);
-    \\  const int cnt_t = base_t + ((jsp < rem_t) ? 1 : 0);
-    \\  t_lo = start_t * BK;
-    \\  t_hi = metal::min(L, (start_t + cnt_t) * BK);
-    \\} else {
-    \\  const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
-    \\  t_lo = jsp * tiles_per * BK;
-    \\  t_hi = metal::min(L, t_lo + tiles_per * BK);
-    \\}
+    \\// ceil(tiles/NSPLIT) per split, so the last splits can be short or empty; the
+    \\// merge is exact over whatever the boundaries are.
+    \\const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
+    \\const int t_lo = jsp * tiles_per * BK;
+    \\const int t_hi = metal::min(L, t_lo + tiles_per * BK);
     \\
     \\const long block_base = (long)bb * blocks_strides[0] + (long)s * blocks_strides[1];
     \\const long kq_base  = (long)bb * kq_strides[0]  + (long)hk * kq_strides[1];
@@ -4336,7 +4320,6 @@ pub var qsa_attn_nsplit_override: ?c_int = null;
 /// Resolve every lazily-cached QSA env read once, from the main thread, before any other
 /// thread exists: first touch of a `?bool`/`?c_int` from two threads is a race.
 pub fn warmQsaEnvCaches() void {
-    _ = qsaAttnBalanced();
     _ = qsaScoreSheetBudget();
 }
 
@@ -4404,27 +4387,13 @@ fn getQsaAttnMergeKernel() !mlx.mlx_fast_metal_kernel {
 /// Threadgroup tile depth: 16 keys stages 12 KiB, half the dense prefill kernel's footprint.
 pub const QSA_ATTN_BK: c_int = 16;
 
-var qsa_attn_balanced_env: ?bool = null;
 /// Microbench and test seam: forces the tile depth.
 pub var qsa_attn_bk_override: ?c_int = null;
-pub var qsa_attn_balanced_override: ?bool = null;
 
 /// Threadgroup tile depth; a multiple of 8 (`KT = BK / 8`).
 pub fn qsaAttnBk() c_int {
     const v = qsa_attn_bk_override orelse QSA_ATTN_BK;
     if (v <= 0 or @rem(v, 8) != 0 or v > 32) return QSA_ATTN_BK;
-    return v;
-}
-
-/// `SUSHI_QSA_ATTN_BALANCED=1` spreads the tile remainder one per split. Default off (invalidates the sweep).
-pub fn qsaAttnBalanced() bool {
-    if (qsa_attn_balanced_override) |v| return v;
-    if (qsa_attn_balanced_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_ATTN_BALANCED") orelse break :blk false;
-        break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
-    };
-    qsa_attn_balanced_env = v;
     return v;
 }
 
@@ -4533,7 +4502,6 @@ const QsaAttnCfgKey = struct {
     nsg: c_int,
     nsplit: c_int,
     bk: c_int,
-    balanced: bool,
     ratio: c_int,
     dtype: mlx.mlx_dtype,
 };
@@ -4572,7 +4540,6 @@ fn splitKAttnDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, blocks: mlx.mlx_array
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(key.bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(key.gs)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "QUANT", @intFromBool(key.quant)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BALANCED", @intFromBool(key.balanced)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DK", qs[3]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "DV", key.dv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SPARSE", @intFromBool(key.sparse)));
@@ -4681,7 +4648,6 @@ pub fn qsaSparseAttn(
         .nsg = @divTrunc(gqa + 7, 8),
         .nsplit = qsaAttnNSplit(),
         .bk = qsaAttnBk(),
-        .balanced = qsaAttnBalanced(),
         .ratio = ratio,
         .dtype = .bfloat16,
     };
@@ -4758,7 +4724,6 @@ pub fn qkvAttnSplitKKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const 
         .nsg = @divTrunc(gqa + 7, 8),
         .nsplit = qkvSplitKSplits(t_k),
         .bk = QSA_ATTN_BK,
-        .balanced = false,
         .ratio = 1,
         .dtype = .bfloat16,
     };
@@ -43388,9 +43353,7 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     qsa_attn_nsplit_override = null;
 
     defer qsa_attn_bk_override = null;
-    defer qsa_attn_balanced_override = null;
     try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
-    try std.testing.expectEqual(false, qsaAttnBalanced());
     // BK must be a multiple of 8; 12 is rejected back to the default.
     qsa_attn_bk_override = 12;
     try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
@@ -43402,9 +43365,6 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     try std.testing.expectEqual(@as(c_int, 8), qsaAttnBk());
     try std.testing.expect(256 * (8 + 8) * 2 <= 10 * 1024);
     qsa_attn_bk_override = null;
-    qsa_attn_balanced_override = true;
-    try std.testing.expectEqual(true, qsaAttnBalanced());
-    qsa_attn_balanced_override = null;
 }
 
 test "qsa packed gather: serves while each packed row is staged at most 4 times (the measured crossover)" {

@@ -257,7 +257,7 @@ width; the context grows ~7.3k keys over a boot. ms per forward:
   (the recorded v1.0.4 cell reads 1671).
 
 <a id="gdn-pipelined"></a>
-## Flash-Next: pipelined GDN prefill (9b3369a6)
+## Flash-Next: pipelined GDN prefill and the balanced split-K arm (9b3369a6)
 
 M5 Max, 2026-10-11, Sushi-4bpw, `--kv-quant 8 --no-mtp --prefix-cache-disk 0`, binary 9b3369a6, llmprobe rungs, A B B A
 twice, one boot per arm.
@@ -267,6 +267,10 @@ twice, one boot per arm.
   14.3 s, decode unchanged. KLD had passed at landing (0.058801 against 0.059171, Sushi-4bpw 16x512, inside the
   floor); the dot order differs, so the output is not bit-identical. The pipelined kernel is now the only route of
   qwen4_exp on NAX; the blocked kernel serves MiMo, GLM and non-NAX GPUs.
+- Balanced split-K (`SUSHI_QSA_ATTN_BALANCED=1`, tile remainder spread one per split) against ceil per split, decode
+  at 32K and 64K KV: 57.9 against 57.8 tok/s (+0.2%) and 57.1 against 56.0 (+2.0%, inside the ceil arm's 3% spread),
+  one contaminated boot excluded. Greedy output diverged around token 8 of a 70K prompt. Not adopted: the arm and
+  its kernel branch are removed.
 
 ## Sushi-2bpw streamed decode on an M1 Max 32 GB (`--ssd-budget-gb 20`, kv8)
 
