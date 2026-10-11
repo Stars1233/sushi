@@ -17,4 +17,4 @@
 | Qwen3.8-Flash-Next-Sushi-2bpw | · | · | · | · | 108.8 mtp (2 runs) | · | · | · | · | · |
 | Qwen3.8-Flash-Next-Sushi-2.6bpw | · | · | · | · | 95.3 mtp (2 runs) | · | 92.1 mtp (2 runs) | 89.9 mtp (2 runs) | 98.6 mtp (2 runs) | · |
 | GLM-5.3-Flash-Sushi-2.3bpw | · | · | · | · | · | 51.1 dflash (3 runs) | · | · | · | · |
-| GLM-5.3-Flash-Sushi-2.4bpw | · | · | · | · | · | · | 54.6 dflash (2 runs) | 53.7 dflash (2 runs) | 56.5 dflash (2 runs) | · |
+| GLM-5.3-Flash-Sushi-2.4bpw | · | · | · | · | · | · | 54.6 dflash (2 runs) | 53.7 dflash (2 runs) | 55.1 dflash (2 runs) | · |

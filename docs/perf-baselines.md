@@ -209,4 +209,5 @@ A6 trunk), same ladder: [v1.2.0 release bench](bench/v1.2.0/summary.md), decode 
 `--bench-only` 2K–128K, 2 runs, all on AC power. `taskpolicy -a`, per-model GPU lock, fans max, at least 60 s idle
 before each server. One binary built from `bb9adb6a`.
 - Qwen 2.6bpw and 4bpw come from the first pass.
-- MiMo 2.3bpw and GLM 2.4bpw come from fresh AC reruns: their first-pass runs crossed onto battery, which slowed GLM 8–18%.
+- MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
+- GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
