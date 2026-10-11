@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 169 vars. By kind: tradeoff levers 13, diagnostics 39, microbenches 61, test-only seams 43, paths and config 6, open 2, flag twins that are not equivalents 5.
+**Summary.** 168 vars. By kind: tradeoff levers 13, diagnostics 39, microbenches 61, test-only seams 43, paths and config 6, open 1, flag twins that are not equivalents 5.
 
 ## Tradeoff levers (13)
 
@@ -124,11 +124,10 @@ A path, a credential or an output location.
 
 ## Open (owner measurement pending)
 
-Two arms, one not yet measured; they stay until an owner measurement decides them.
+One arm, not yet measured; it stays until an owner measurement decides it.
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
-| `SUSHI_GDN_PIPELINED` | `transformer.zig:546` | GDN prefill recurrence: unset = pipelined on NAX Qwen4, `0` the blocked kernel, any other value forces pipelined; not bit-identical. KLD is within the floor, speed was never measured here | once | yes: engine-kernels |
 | `SUSHI_QSA_ATTN_BALANCED` | `transformer.zig:4436` | `1` spreads the split-K tile remainder one per split (default off); never measured | once | no |
 
 ## Flag twins that are not equivalents (5)
@@ -161,6 +160,7 @@ Cut from the code with the arm only they reached; the defaults are unchanged.
 - *Rejected or never-adopted experiments*: `SUSHI_DFLASH_CHOOSER`, `_DRAFT_HEAD_BITS`, `_SAMPLED_DRAFTS`, `SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS`, `SUSHI_MTP_BATCHED_QWEN4`, `SUSHI_FUSED_QKV`, `SUSHI_LMHEAD_PRUNE`, `_PRUNE_TRACE`, `SUSHI_LMHEAD_UBENCH` (its meter), `SUSHI_MOE_BATCHED_DECODE`, `SUSHI_MOE_VERIFY_PAIRED_GU`, `SUSHI_VERIFY_QMM_CROSSROW`, `SUSHI_ADD_RMSNORM_FUSED` (the gated entry only; the kernel stays, MiMo wires it), `SUSHI_COMPILE_FORWARD`.
 - *The nvfp4 tail of `--decode-attn-quant`*: `SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM`, with the tail itself (every side copy is int8 group-32).
 - *Kill switches of adopted arms*: `SUSHI_FUSED_256` (the hd-256 `sushi_attn_p256` kernel; the composed path still serves declined shapes and is the tests' parity oracle) and `SUSHI_SSD_WRITE_THROUGH` (the prefill write-through to the SSD tier, always on once its gates pass).
+- *Measured, then adopted*: `SUSHI_GDN_PIPELINED` (the software-pipelined GDN prefill kernel is the NAX Qwen route, +3.8% prefill at 32K; [qwen4-perf](qwen4-perf.md#gdn-pipelined)).
 - *Dead or leftover*: `CODEX_SANDBOX`, `HY3_MODEL_DIR`, `MINICPM5_MODEL_DIR`, `PERF_REPORT`, `REAL_BLOB`, `SUSHI_DSV4_DSPARK`, and the `--dspark` flag that only set it.
 
 ## Tooling-only variables

@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Cleanup**: `SUSHI_GDN_PIPELINED` is removed; the software-pipelined GDN prefill kernel is always the route of Flash-Next on NAX GPUs.
 - **Cleanup**: `SUSHI_SSD_WRITE_THROUGH` is removed; the prefill write-through to the SSD prefix cache is always on when its gates pass, and behaviour is unchanged.
 - **Cleanup**: `SUSHI_FUSED_256` is removed; the fused head-dim-256 prefill attention is always on, and output is unchanged.
 - **Cleanup**: `SUSHI_NO_UPDATE_CHECK` is removed; use `--no-update-check`.

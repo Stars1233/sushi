@@ -256,6 +256,18 @@ width; the context grows ~7.3k keys over a boot. ms per forward:
   (72.8 / 73.6 °C die vs 90.6-then-3-min / 53.2 °C); the kernel is ~1% of a round and cannot reach prefill by 13%
   (the recorded v1.0.4 cell reads 1671).
 
+<a id="gdn-pipelined"></a>
+## Flash-Next: pipelined GDN prefill (9b3369a6)
+
+M5 Max, 2026-10-11, Sushi-4bpw, `--kv-quant 8 --no-mtp --prefix-cache-disk 0`, binary 9b3369a6, llmprobe rungs, A B B A
+twice, one boot per arm.
+
+- Pipelined GDN prefill (`SUSHI_GDN_PIPELINED` unset) against the blocked kernel (`=0`): prefill 8K 2534 against
+  2415 tok/s (+4.9%, ranges overlap), 32K 2384 against 2296 (+3.8%, outside the spread), 32K TTFT about 13.7 against
+  14.3 s, decode unchanged. KLD had passed at landing (0.058801 against 0.059171, Sushi-4bpw 16x512, inside the
+  floor); the dot order differs, so the output is not bit-identical. The pipelined kernel is now the only route of
+  qwen4_exp on NAX; the blocked kernel serves MiMo, GLM and non-NAX GPUs.
+
 ## Sushi-2bpw streamed decode on an M1 Max 32 GB (`--ssd-budget-gb 20`, kv8)
 
 Greedy 300-token decode of one prompt after a warm-up (tok/s; same box, arms run back to back):

@@ -115,8 +115,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   [perf-baselines](mimo2-perf.md#mimo-fp8-tile) has the audit.
 - Qwen4 HC + GDN prefill fusions take the chunk WIDTH as a scalar INPUT.
 - GDN prefill (S >= 64) takes one of three recurrences (`GdnRoute`): stock, blocked-seq, or oMLX's software-pipelined
-  kernel (mlx-serve #641; 8 lanes per value row, 12-token blocks prefetched), the default for qwen4_exp on NAX GPUs.
-  `SUSHI_GDN_PIPELINED=0` keeps the blocked kernel, `=1` forces it; not bit-identical (dot order).
+  kernel (mlx-serve #641; 8 lanes per value row, 12-token blocks prefetched), the route of qwen4_exp on NAX GPUs;
+  MiMo, GLM and non-NAX GPUs take the blocked kernel. Not bit-identical to it (dot order); prefill +3.8% at 32K
+  ([qwen4-perf](qwen4-perf.md#gdn-pipelined), 9b3369a6, Sushi-4bpw kv8 `--no-mtp`).
 
 ## Verify lanes
 

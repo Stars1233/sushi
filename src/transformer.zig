@@ -532,21 +532,9 @@ fn getGdnKernelBlocked(tb: u32) !mlx.mlx_fast_metal_kernel {
 pub const GdnRoute = enum { stock, blocked, pipelined };
 
 var gdn_pipelined_cached: ?mlx.mlx_fast_metal_kernel = null;
-pub var gdn_pipelined_override: ?bool = null;
-var gdn_pipelined_env: ??[]const u8 = null;
-
-pub fn gdnPipelinedFor(raw: ?[]const u8, model_type: []const u8, nax: bool) bool {
-    if (raw) |v| return !std.mem.eql(u8, v, "0");
-    return nax and std.mem.eql(u8, model_type, "qwen4_exp");
-}
 
 fn gdnPipelinedEnabled(model_type: []const u8) bool {
-    if (gdn_pipelined_override) |v| return v;
-    if (gdn_pipelined_env == null) {
-        const raw: ?[]const u8 = if (std.c.getenv("SUSHI_GDN_PIPELINED")) |r| std.mem.sliceTo(r, 0) else null;
-        gdn_pipelined_env = raw;
-    }
-    return gdnPipelinedFor(gdn_pipelined_env.?, model_type, verifyQmmNaxAvailable());
+    return verifyQmmNaxAvailable() and std.mem.eql(u8, model_type, "qwen4_exp");
 }
 
 fn getGdnKernelPipelined() !mlx.mlx_fast_metal_kernel {
@@ -36940,20 +36928,14 @@ fn gdnBlockedParityCase(case: GdnCase, s: mlx.mlx_stream) !void {
     }
 }
 
-test "GDN pipelined route: defaults, overrides, eligibility and kill switch" {
+test "GDN pipelined route: NAX Qwen default, eligibility" {
     const saved_blocked = gdn_blocked_override;
-    const saved_pipeline = gdn_pipelined_override;
-    const saved_env = gdn_pipelined_env;
     const saved_nax = vqmm_nax_probe_override;
     defer {
         gdn_blocked_override = saved_blocked;
-        gdn_pipelined_override = saved_pipeline;
-        gdn_pipelined_env = saved_env;
         vqmm_nax_probe_override = saved_nax;
     }
     gdn_blocked_override = true;
-    gdn_pipelined_override = null;
-    gdn_pipelined_env = @as(?[]const u8, null);
     vqmm_nax_probe_override = true;
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
     for ([_][]const u8{ "mimo_v2", "qwen3_5", "qwen3_5_moe" }) |model_type| {
@@ -36962,12 +36944,7 @@ test "GDN pipelined route: defaults, overrides, eligibility and kill switch" {
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
     vqmm_nax_probe_override = false;
     try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
-    gdn_pipelined_env = @as(?[]const u8, "1");
-    try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("mimo_v2", 64, 128, 128, 2, 4, false, 2).route);
     vqmm_nax_probe_override = true;
-    gdn_pipelined_env = @as(?[]const u8, "0");
-    try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
-    gdn_pipelined_override = true;
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
     for ([_]c_int{ 1, 2, 8, 63 }) |seq_len| {
         try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", seq_len, 128, 128, 2, 4, false, 2).route);
@@ -36987,9 +36964,6 @@ test "GDN pipelined route: defaults, overrides, eligibility and kill switch" {
     const fp32 = gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 4);
     try testing.expectEqual(GdnRoute.pipelined, fp32.route);
     try testing.expectEqual(@as(u32, 16), fp32.tb);
-    gdn_pipelined_override = false;
-    try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
-    gdn_pipelined_override = true;
     gdn_blocked_override = false;
     try testing.expectEqual(GdnRoute.stock, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
 }
