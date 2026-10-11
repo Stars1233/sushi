@@ -15417,7 +15417,7 @@ pub const Transformer = struct {
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, sparse.logits, &[_]c_int{ xsh[0], xsh[1], vocab }, 3, self.s));
-        if (diagEnvOn("SUSHI_LMHEAD_SHORTLIST_AUDIT")) {
+        if (diagEnvOnCached(&lmhead_shortlist_audit_env, "SUSHI_LMHEAD_SHORTLIST_AUDIT")) {
             const full = try self.qmatmul(x3, self.lm_head_w, self.lm_head_s, self.lm_head_b);
             defer _ = mlx.mlx_array_free(full);
             try shortlistAudit(self.s, full, sparse.logits, sparse.idx, n, vocab);
@@ -18646,7 +18646,7 @@ pub const Transformer = struct {
                     break :blk;
                 };
             }
-            if (diagEnvOn("QWEN4_GDN_CHECK")) self.gdnCheckFused(la, qkv, incoming_conv, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
+            if (diagEnvOnCached(&gdn_check_env, "QWEN4_GDN_CHECK")) self.gdnCheckFused(la, qkv, incoming_conv, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
             _ = mlx.mlx_array_free(ssm.conv_state);
             ssm.conv_state = pre.conv_state;
             ssm.initialized = true;
@@ -22361,7 +22361,7 @@ pub const ProfClock = struct {
 
 pub fn decodeProfileEnabled() bool {
     if (decode_prof_enabled) |v| return v;
-    const v = std.c.getenv("SUSHI_DECODE_PROFILE") != null;
+    const v = diagEnvOn("SUSHI_DECODE_PROFILE");
     decode_prof_enabled = v;
     return v;
 }
@@ -22369,8 +22369,12 @@ pub fn decodeProfileEnabled() bool {
 /// Widest forward the profiler times: `SUSHI_DECODE_PROFILE=<rows>` also times verify widths.
 pub fn decodeProfileRows() c_int {
     if (decode_prof_forced_rows > 0) return decode_prof_forced_rows;
-    const raw = std.c.getenv("SUSHI_DECODE_PROFILE") orelse return 0;
-    return @max(1, std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch 1);
+    return decodeProfileRowsFrom(std.c.getenv("SUSHI_DECODE_PROFILE"));
+}
+
+fn decodeProfileRowsFrom(raw: ?[*:0]const u8) c_int {
+    if (!diagEnvValueOn(raw)) return 0;
+    return @max(1, std.fmt.parseInt(c_int, std.mem.sliceTo(raw.?, 0), 10) catch 1);
 }
 var decode_prof_forced_rows: c_int = 0;
 
@@ -22388,14 +22392,6 @@ pub fn decodeProfileSession(rows: c_int) void {
     decode_prof_enabled = null;
 }
 
-/// PRESENCE semantics: `FOO=0` reads as ON. Never substitute this for
-/// `diagEnvOnCached` — a harness exporting `FOO=0` would arm the switch.
-pub fn envFlagCached(cache: *?bool, name: [*:0]const u8) bool {
-    if (cache.*) |v| return v;
-    const v = std.c.getenv(name) != null;
-    cache.* = v;
-    return v;
-}
 /// Diagnostic switches are off for empty values and values beginning with `0`.
 pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
     const v = raw orelse return false;
@@ -24025,10 +24021,12 @@ fn shortlistSparseLogits(s: mlx.mlx_stream, lists: []const mtp_mod.Shortlist, vo
 const LMHEAD_SHORTLIST_MAX_ROWS: usize = 16;
 /// Fwd-meter arm seam; null = on unless the diagnostic SUSHI_LMHEAD_FULL=1 forces the full head.
 pub var lmhead_shortlist_override: ?bool = null;
+var lmhead_full_env: ?bool = null;
+var lmhead_shortlist_audit_env: ?bool = null;
 
 fn lmHeadShortlistOn() bool {
     if (lmhead_shortlist_override) |v| return v;
-    return !diagEnvOn("SUSHI_LMHEAD_FULL");
+    return !diagEnvOnCached(&lmhead_full_env, "SUSHI_LMHEAD_FULL");
 }
 
 /// DIAGNOSTIC (SUSHI_LMHEAD_SHORTLIST_AUDIT=1): every shortlist row also reads the full head and
@@ -37392,7 +37390,7 @@ fn expectVerifyQmmNoWorseThanStock(
     const cos_stock = dot_s / (@sqrt(ns) * @sqrt(nt));
     const cos_kern = dot_k / (@sqrt(nk) * @sqrt(nt));
 
-    if (std.c.getenv("SUSHI_VQMM_PARITY_DEBUG") != null) {
+    if (diagEnvOn("SUSHI_VQMM_PARITY_DEBUG")) {
         std.debug.print(
             "[vqmm-parity] {s:>16}: n={d} max {d:.5}/{d:.5} rms {d:.6}/{d:.6} (ratio {d:.3}) cos {d:.7}/{d:.7}\n",
             .{ label, count, stock_max, kern_max, rms_stock, rms_kern, if (rms_stock > 0) rms_kern / rms_stock else 0, cos_stock, cos_kern },
@@ -38422,14 +38420,14 @@ test "MoE decode gather µbench (SUSHI_MOE_GATHER_UBENCH=1)" {
     // compare against the pip-MLX Python sim (single gather ~133us, 47-layer
     // MoE ~7.5ms). If this is far slower, the gap is our MLX build/runtime;
     // if it matches, the gap is the live server context (stream/alloc/pipeline).
-    if (std.c.getenv("SUSHI_MOE_GATHER_UBENCH") == null) return error.SkipZigTest;
+    if (!diagEnvOn("SUSHI_MOE_GATHER_UBENCH")) return error.SkipZigTest;
     const io_util = @import("io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     // Trace mode: run the gather and qmv sections in long sustained bursts so an
     // Instruments Metal System Trace shows a clean, comparable GPU timeline.
-    const gather_trace = std.c.getenv("SUSHI_MOE_GATHER_TRACE") != null;
+    const gather_trace = diagEnvOn("SUSHI_MOE_GATHER_TRACE");
     const E: c_int = 256;
     const N: c_int = 1024; // moe_intermediate (gate/up out)
     const K: c_int = 3072; // hidden
@@ -39023,7 +39021,7 @@ test "spec-verify width sweep µbench (SUSHI_VERIFY_WIDTH_UBENCH=1)" {
     // above it the 32x32-tiled qmm_splitk runs (compute-bound, and a width of
     // 16 wastes half the 32-row tile). The limit is a per-shape number, so the
     // cliff is what this prints — a whole-model per-round estimate at each M.
-    if (std.c.getenv("SUSHI_VERIFY_WIDTH_UBENCH") == null) return error.SkipZigTest;
+    if (!diagEnvOn("SUSHI_VERIFY_WIDTH_UBENCH")) return error.SkipZigTest;
     const io_util = @import("io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
@@ -39121,7 +39119,7 @@ test "spec-verify width sweep µbench (SUSHI_VERIFY_WIDTH_UBENCH=1)" {
 }
 
 test "verifyQmm µbench: kernel vs stock per 27B shape (SUSHI_VQMM_UBENCH=1)" {
-    if (std.c.getenv("SUSHI_VQMM_UBENCH") == null) return error.SkipZigTest;
+    if (!diagEnvOn("SUSHI_VQMM_UBENCH")) return error.SkipZigTest;
     const io_util = @import("io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
@@ -39262,7 +39260,7 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (SUSHI_VQMM_UBENCH=1)" {
 }
 
 test "verifyQmm mixed-width NAX µbench (SUSHI_VQMM_MIXED_UBENCH=1)" {
-    if (std.c.getenv("SUSHI_VQMM_MIXED_UBENCH") == null) return error.SkipZigTest;
+    if (!diagEnvOn("SUSHI_VQMM_MIXED_UBENCH")) return error.SkipZigTest;
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const io_util = @import("io_util.zig");
     const tio = testing.io;
@@ -39412,7 +39410,7 @@ test "verifyQmm mixed-width NAX µbench (SUSHI_VQMM_MIXED_UBENCH=1)" {
 }
 
 test "prefill qmm µbench: stock qmm vs dequant+GEMM at 27B prefill shapes (SUSHI_PREFILL_QMM_UBENCH=1)" {
-    if (std.c.getenv("SUSHI_PREFILL_QMM_UBENCH") == null) return error.SkipZigTest;
+    if (!diagEnvOn("SUSHI_PREFILL_QMM_UBENCH")) return error.SkipZigTest;
     const io_util = @import("io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
@@ -39528,7 +39526,7 @@ test "GDN µbench: sequential kernel vs bare qmm at 27B shapes (attribution; SUS
     // kernel's sequential-over-T cost and (b) qmm row-count effects, at the
     // real Qwen3.6-27B geometry. Run with:
     //   SUSHI_GDN_UBENCH=1 zig build test -Doptimize=ReleaseFast -Dtest-filter="GDN µbench"
-    if (std.c.getenv("SUSHI_GDN_UBENCH") == null) return error.SkipZigTest;
+    if (!diagEnvOn("SUSHI_GDN_UBENCH")) return error.SkipZigTest;
     const io_util = @import("io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
@@ -52115,6 +52113,13 @@ test "the warm-credit capacity gate survives a hybrid trunk's uninitialized laye
 test "qwen4PleInstalledAt accepts the MTP head's deliberate -1 and still refuses a stray PLE" {
     try testing.expect(model_mod.qwen4PleInstalledAt(&.{false}, -1));
     try testing.expect(!model_mod.qwen4PleInstalledAt(&.{true}, -1));
+}
+
+test "decode profile rows: 0 and absent are off, a bare switch is one row" {
+    try testing.expectEqual(@as(c_int, 0), decodeProfileRowsFrom(null));
+    try testing.expectEqual(@as(c_int, 0), decodeProfileRowsFrom("0"));
+    try testing.expectEqual(@as(c_int, 1), decodeProfileRowsFrom("on"));
+    try testing.expectEqual(@as(c_int, 8), decodeProfileRowsFrom("8"));
 }
 
 test "diagEnvValueOn: absent, empty or 0 is off" {

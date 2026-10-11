@@ -21,7 +21,6 @@ const SSMCacheEntry = trf.SSMCacheEntry;
 const capBufAppend = trf.capBufAppend;
 const diagEnvOnCached = trf.diagEnvOnCached;
 const diagEnvValueOn = trf.diagEnvValueOn;
-const envFlagCached = trf.envFlagCached;
 const fusedSdpa256Masked = trf.fusedSdpa256Masked;
 const gatherQsa256 = trf.gatherQsa256;
 const gatherQsa256Packed = trf.gatherQsa256Packed;
@@ -1230,7 +1229,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     const kv: c_int = offset + seq_len;
     entry.qsa_ratio = ratio;
     if (!qsaEntrySatisfiesForward(entry, offset)) return error.QsaHistoryGap;
-    if (envFlagCached(&qwen4_forward.qwen4_no_pooled_env, "QWEN4_NO_POOLED")) return error.QsaPooledRequired;
+    if (diagEnvOnCached(&qwen4_forward.qwen4_no_pooled_env, "QWEN4_NO_POOLED")) return error.QsaPooledRequired;
     const nb: c_int = @divTrunc(kv, ratio);
     const nb_cached: c_int = if (entry.qsa_pooled.ctx != null) mlx.getShape(entry.qsa_pooled)[1] else 0;
     if (nb > nb_cached) {
@@ -1322,7 +1321,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     }
 
     // Pooled block keys: mean of leftover + this chunk, already appended above.
-    if (envFlagCached(&qwen4_forward.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
+    if (diagEnvOnCached(&qwen4_forward.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
         const qs = mlx.getShape(entry.qsa_pooled);
         std.debug.print("[qsa] kv={d} nb={d} cached={d} pooled shape {any} keys {any}\n", .{ kv, nb, nb_cached, qs, mlx.getShape(keys) });
     }
@@ -1371,7 +1370,7 @@ pub fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa
     const scores = try qsaScoreSheet(self.s, q_rope, entry.qsa_pooled, k32, fused);
     defer _ = mlx.mlx_array_free(scores);
 
-    if (envFlagCached(&qwen4_forward.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
+    if (diagEnvOnCached(&qwen4_forward.qwen4_debug_scores_env, "QWEN4_DEBUG_SCORES")) {
         var f = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f);
         try mlx.check(mlx.mlx_astype(&f, scores, .float32, self.s));

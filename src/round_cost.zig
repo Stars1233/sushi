@@ -752,9 +752,14 @@ pub fn persistEnabledFrom(raw: ?[]const u8) bool {
     return std.mem.eql(u8, v, "1");
 }
 
+var persist_env: ?bool = null;
+
 pub fn persistEnabled() bool {
+    if (persist_env) |v| return v;
     const raw = std.c.getenv("SUSHI_ROUND_COST_PERSIST");
-    return persistEnabledFrom(if (raw) |r| std.mem.span(r) else null);
+    const v = persistEnabledFrom(if (raw) |r| std.mem.span(r) else null);
+    persist_env = v;
+    return v;
 }
 
 pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {

@@ -1,8 +1,8 @@
 # Environment variables
 
-An env var is only a lossy or tradeoff lever or a diagnostic, including a knob a correctness test (equivalence, parity or byte test) needs. It is read once, through `diagEnvOn` (absent, empty or `0` = off). It is never a launch flag's twin and never promoted to a flag, and an arm that lost is deleted together with its knob ([CLAUDE.md](../CLAUDE.md)). The map is the code's: every `getenv`, `diagEnvOn`, `diagEnvOnCached`, `diagEnvValueOn`, `envFlagCached` and `readEnv*` read in `src/` (the three served architectures and their shared code). `HOME`, `TMPDIR`, the variable `--api-key-env` names, the `QWEN4_PROFILE_` prefix scan of the round-cost store and the agent-launch scripts `sushi launch` writes are not levers and are left out. Tooling that only `scripts/` and `tests/` read is in the last table.
+An env var is only a lossy or tradeoff lever or a diagnostic, including a knob a correctness test (equivalence, parity or byte test) needs. It is read once, through `diagEnvOn` (absent, empty or `0` = off). It is never a launch flag's twin and never promoted to a flag, and an arm that lost is deleted together with its knob ([CLAUDE.md](../CLAUDE.md)). The map is the code's: every `getenv`, `diagEnvOn`, `diagEnvOnCached`, `diagEnvValueOn` and `readEnv*` read in `src/` (the three served architectures and their shared code). `HOME`, `TMPDIR`, the variable `--api-key-env` names, the `QWEN4_PROFILE_` prefix scan of the round-cost store and the agent-launch scripts `sushi launch` writes are not levers and are left out. Tooling that only `scripts/` and `tests/` read is in the last table.
 
-**Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). `presence` marks a read where `FOO=0` still turns the switch ON; every other diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
+**Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
 **Summary.** 171 vars. By kind: tradeoff levers 13, diagnostics 39, microbenches 61, test-only seams 43, paths and config 6, open 2, flag twins that are not equivalents 5, cut candidates 2.
 
@@ -16,7 +16,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `QWEN4_PLE_PREFETCH_PREFILL` | `qwen4_exp.zig:949` | wide n-gram gather arm: unset = kv gate (pool from 256k keys, serial walk below), `0` serial, `1` pool; both arms measured, the best flips with table residency | once | yes: qwen4-arch, qwen4-perf |
 | `SUSHI_DECODE_ASYNC_LADDER` | `transformer.zig:15047` | unset: batched Qwen4 decode ladders every 4th layer, other paths serial; `0\|off` off, `auto` every 8th, `<n>` every n-th | boot | yes: engine-kernels, qwen4-perf |
 | `SUSHI_DFLASH_QUANT_BITS` | `dflash.zig:445` | affine width of the DFlash sidecar requant (default 8; `0\|off` or an unsupported width keeps dense bf16) | load | no |
-| `SUSHI_LMHEAD_FULL` | `transformer.zig:24031` | `1` reads the full lm_head instead of the greedy top-32 shortlist (MiMo; the shortlist is not certified exact) | per call | yes: engine-mtp |
+| `SUSHI_LMHEAD_FULL` | `transformer.zig:24029` | `1` reads the full lm_head instead of the greedy top-32 shortlist (MiMo; the shortlist is not certified exact) | once | yes: engine-mtp |
 | `SUSHI_LOOP_TRIM` | `scheduler.zig:6233` | default on: trims displayed loop-stop replies; `0` keeps the whole degenerate tail for strict bytes (`tests/test_loop_stop_signal.sh` boots both) | once | yes: server-http-apis, tests/CLAUDE |
 | `SUSHI_MTP_ADAPTIVE_SERIAL` | `generate.zig:9517` | default on; `0` disables the adaptive speculate-vs-serial vote at long KV (`tests/test_mtp_adaptive.sh` boots both) | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_MTP_DENSE_ROWS` | `mtp_dense_rows.zig:10` | `1` runs the dense-row router GEMV for MTP verify rows (default off; one equivalence run failed, seven reruns passed) | once | yes: engine-mtp, qwen4-perf |
@@ -24,7 +24,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_MTP_HEAD_QUANT_BITS` | `mtp.zig:1780` | requant width of dense MTP head trunks at load (default 4, g64; `0` off) | load | yes: engine-mtp |
 | `SUSHI_NGRAM_WARM` | `qwen4_exp.zig:146` | default on: pread the Flash-Next n-gram table at load; `0` skips it | once | yes: qwen4-arch, qwen4-perf |
 | `SUSHI_QSA_SCORE_SHEET_MB` | `transformer.zig:5879` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
-| `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:756` | `1` persists the measured MTP round-cost table across boots (default off) | per request | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
+| `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
 ## Diagnostics (39)
 
@@ -32,18 +32,18 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
-| `QWEN4_DEBUG_SCORES` | `qwen4_qsa.zig:1325, qwen4_qsa.zig:1374` | prints QSA pooled shapes and score rows | once; presence | no |
+| `QWEN4_DEBUG_SCORES` | `qwen4_qsa.zig:1324, 1373` | prints QSA pooled shapes and score rows | once | no |
 | `QWEN4_DUMP_QSA_BLOCKS` | `qwen4_qsa.zig:618` | `<path>` dumps the selected QSA block indices | once | no |
 | `QWEN4_FIXTURE_ROWS` | `transformer.zig` | prints per-row cos/margin in the Qwen4 fixture test | test | no |
-| `QWEN4_GDN_CHECK` | `transformer.zig:18506, 18649` | runs the composed GDN prework beside the fused kernel and compares | once at the decode gate; per layer at the prefill check | no |
-| `QWEN4_NO_POOLED` | `qwen4_qsa.zig:1233` | forces `QsaPooledRequired` to exercise the pooled-key fallback | once; presence | no |
-| `QWEN4_OPCOUNT` | `qwen4_forward.zig:2908` | FFI op counts per block of the Qwen4 forward | per forward | no |
-| `QWEN4_PROFILE_FWD` | `qwen4_forward.zig:1421, 2904, 2907; qwen4_exp.zig:781; transformer.zig:17557` | `1` times S 2..16 forwards per block with a sync each, `all` every S; also logs PLE reads and keeps verify off the grouped-rows path | per forward; per PLE read; once in the PLE gather | no |
-| `QWEN4_PROFILE_QSA` | `qwen4_qsa.zig:1350, qwen4_forward.zig:2466` | logs synced QSA indexer/gather laps | once in the indexer; per layer in the forward | no |
+| `QWEN4_GDN_CHECK` | `transformer.zig:18506, 18649` | runs the composed GDN prework beside the fused kernel and compares | once | no |
+| `QWEN4_NO_POOLED` | `qwen4_qsa.zig:1232` | forces `QsaPooledRequired` to exercise the pooled-key fallback | once | no |
+| `QWEN4_OPCOUNT` | `qwen4_forward.zig:2907` | FFI op counts per block of the Qwen4 forward | once | no |
+| `QWEN4_PROFILE_FWD` | `qwen4_forward.zig:1420, 2903; qwen4_exp.zig:783; transformer.zig:17557, 17564` | `1` times S 2..16 forwards per block with a sync each, `all` every S; also logs PLE reads and keeps verify off the grouped-rows path | once | no |
+| `QWEN4_PROFILE_QSA` | `qwen4_qsa.zig:1349, qwen4_forward.zig:2465` | logs synced QSA indexer/gather laps | once | no |
 | `QWEN4_STANDIN` | `qwen4_forward.zig:2866` | comma list (`gdn,attn,mlp,hc,moe_*,...`) replaces blocks with free stand-ins for ablation under the decode meter | once | yes: engine-kernels, qwen4-perf |
-| `QWEN4_STREAM_F32` | `qwen4_forward.zig:1485, 1747, 1931` | runs the Qwen4 residual streams in f32 (math oracle) | once; presence | yes: qwen4-arch |
+| `QWEN4_STREAM_F32` | `qwen4_forward.zig:1484, 1746, 1930` | runs the Qwen4 residual streams in f32 (math oracle) | once | yes: qwen4-arch |
 | `SUSHI_DECODE_FWD_GRAPH` | `scheduler.zig:4467` | `<path>` writes one decode forward's primitive list at the forward meter; inert without `SUSHI_DECODE_FWD_UBENCH` | load | yes: mimo2-arch |
-| `SUSHI_DECODE_PROFILE` | `transformer.zig:22364, transformer.zig:22372` | arms the decode sub-block profiler; `=<rows>` also times verify widths | once; presence | no |
+| `SUSHI_DECODE_PROFILE` | `transformer.zig:22364, transformer.zig:22372` | arms the decode sub-block profiler; `=<rows>` also times verify widths | once | no |
 | `SUSHI_DFLASH_TRACE` | `generate.zig:8862` | `1` per-phase DFlash round wall-time trace | once | no |
 | `SUSHI_DISPATCH_PROBE` | `transformer.zig:24541` | `<n>` injects n small dependent dispatches per MoE layer to price a dispatch | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_DUMP_RESTORE` | `restore_dump.zig:31` | `<dir>` dumps prefix-restore tensors | once | no |
@@ -53,11 +53,11 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_FORCE_GPU_FAMILY_FALLBACK` | `transformer.zig:1532, exl3/expert_exl3_kernels.zig:1253` | `1` pretends the matrix units are absent to rehearse the M1-M4 path on an M5; the EXL3 and verify-qmm parity tests set it | once | yes: glm5-arch, glm5-kernels, glm5-perf, ... |
 | `SUSHI_KVQ_PARITY_TRACE`, `SUSHI_MIMO_VISION_DIAG` | `transformer.zig`, `mimo_vision.zig` | prints extra parity / vision diagnostics inside a test | test | no |
 | `SUSHI_LAYER_CAP` | `transformer.zig:22308` | `<n>` runs only the first n layers so a ms-vs-layers slope is measurable (`tests/fwd_ubench.sh`) | once | yes: tests/CLAUDE |
-| `SUSHI_LMHEAD_SHORTLIST_AUDIT` | `transformer.zig:15420` | `1` re-reads the full head on every shortlist row and counts disagreements | per forward | yes: engine-mtp, mimo2-perf |
+| `SUSHI_LMHEAD_SHORTLIST_AUDIT` | `transformer.zig:15420` | `1` re-reads the full head on every shortlist row and counts disagreements | once | yes: engine-mtp, mimo2-perf |
 | `SUSHI_MOE_DUMP` | `transformer.zig:22421` | `<dir>` writes one forward's MoE tensors as raw f32 | once | no |
-| `SUSHI_MOE_GATHER_TRACE`, `SUSHI_VQMM_PARITY_DEBUG`, `REPLAY_DUMP_SOFT` | `transformer.zig`, `tool_traffic_replay_test.zig` | extra prints inside a test | test; presence | no |
+| `SUSHI_MOE_GATHER_TRACE`, `SUSHI_VQMM_PARITY_DEBUG`, `REPLAY_DUMP_SOFT` | `transformer.zig`, `tool_traffic_replay_test.zig` | extra prints inside a test | test | no |
 | `SUSHI_MTP_TRACE` | `generate.zig:8915, round_cost.zig:780` | `1` per-round MTP phase trace; also disarms round-cost persistence | once | yes: mimo2-perf, qwen4-perf, tests/CLAUDE |
-| `SUSHI_MTP_TRACE_SYNC` | `generate.zig:7160` | drains the GPU before the verify build so the `sync` lap is separable; read only while tracing | per round; presence | no |
+| `SUSHI_MTP_TRACE_SYNC` | `generate.zig:7162` | drains the GPU before the verify build so the `sync` lap is separable; read only while tracing | once | no |
 | `SUSHI_PROFILE_ATTN` | `qwen4_forward.zig:2992` | `1` logs synced indexer/projection/QSA/tail laps per Qwen4 forward | once | yes: qwen4-qsa-long-context |
 | `SUSHI_RAW_DUMP_FILE` | `server.zig:11999, server.zig:17261` | `<abs path>` appends the full pre-parse buffer of every tools request (corpus harvest) | per tool request | yes: server-tool-calling |
 | `SUSHI_EXL3_GEMM_WIN`, `SUSHI_EXL3_WIN_ALIGN` | `exl3/expert_exl3_kernels.zig` | prefill GEMM window rows (default 32) and `0` unaligns it; the window-geometry parity tests drive both | once | yes: engine-exl3-experts |
@@ -74,16 +74,16 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
-| `SUSHI_ATTN_PD_UBENCH`, `SUSHI_ATTN_PD_UBENCH_ABL`, `SUSHI_ATTN_PD_UBENCH_ABL_KL`, `SUSHI_ATTN_PD_UBENCH_ALT`, `SUSHI_ATTN_PD_UBENCH_BUDGETS`, `SUSHI_ATTN_PD_UBENCH_KL`, `SUSHI_ATTN_PD_UBENCH_LEAN`, `SUSHI_ATTN_PD_UBENCH_QL`, `SUSHI_ATTN_PD_UBENCH_REPS` | `transformer.zig` | MiMo prefill-attention chunk meter and its sweep lists (gate, ablation, kv and query lengths, budgets, reps) | test; `_ALT` presence | yes: engine-kernels, mimo2-perf |
+| `SUSHI_ATTN_PD_UBENCH`, `SUSHI_ATTN_PD_UBENCH_ABL`, `SUSHI_ATTN_PD_UBENCH_ABL_KL`, `SUSHI_ATTN_PD_UBENCH_ALT`, `SUSHI_ATTN_PD_UBENCH_BUDGETS`, `SUSHI_ATTN_PD_UBENCH_KL`, `SUSHI_ATTN_PD_UBENCH_LEAN`, `SUSHI_ATTN_PD_UBENCH_QL`, `SUSHI_ATTN_PD_UBENCH_REPS` | `transformer.zig` | MiMo prefill-attention chunk meter and its sweep lists (gate, ablation, kv and query lengths, budgets, reps) | test; `_ALT` is a path list | yes: engine-kernels, mimo2-perf |
 | `SUSHI_DECODE_FWD_UBENCH` | `scheduler.zig:4321` | `<n>` times n decode-width forwards at load (no sampling, no cache bookkeeping), then resets the KV | load | yes: engine-kernels, mimo2-arch, mimo2-perf, ... |
 | `SUSHI_DECODE_FWD_UBENCH_S`, `SUSHI_DECODE_FWD_UBENCH_KV` | `scheduler.zig` | `<rows>[,...]` verify widths to time; `<tokens>` prefill before timing | load | yes: perf-baselines |
 | `SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS`, `SUSHI_DECODE_FWD_UBENCH_GLOBAL_ROWS_ARMS`, `SUSHI_DECODE_FWD_UBENCH_LMHEAD_ARMS`, `SUSHI_DECODE_FWD_UBENCH_QKV_PREP_ARMS`, `SUSHI_DECODE_FWD_UBENCH_QSA_POOL_ARMS` | `scheduler.zig` | same-process A/B seams of the forward meter: verify fold, MiMo global rows, argmax-only full head vs shortlist, rope+kv8 prep, QSA pooled-key chain | load | yes: engine-kernels, qwen4-perf, mimo2-arch, ... |
-| `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS`, `SUSHI_DECODE_FWD_UBENCH_PROFILE`, `SUSHI_DECODE_FWD_UBENCH_ROW_ARMS` | `scheduler.zig` | GDN chain vs fused step, one extra profiled pass per width, MiMo verify width run prefill-shaped then as rows | load; presence | yes: engine-kernels |
+| `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS`, `SUSHI_DECODE_FWD_UBENCH_PROFILE`, `SUSHI_DECODE_FWD_UBENCH_ROW_ARMS` | `scheduler.zig` | GDN chain vs fused step, one extra profiled pass per width, MiMo verify width run prefill-shaped then as rows | load | yes: engine-kernels |
 | `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:89, exl3/expert_exl3_kernels.zig:1221` | `<n>` times n decode ticks end to end | once | no |
 | `SUSHI_EXL3_CODEBOOK_AB`, `SUSHI_EXL3_GEMM_ARMS`, `SUSHI_EXL3_LOWK_UBENCH`, `SUSHI_EXL3_GEMM_COUNTS` | `exl3/expert_exl3_kernels.zig` | EXL3 codebook A/B, served-vs-reference GEMM arms, low-rate decode chain; `_COUNTS=<file>` replays per-layer expert counts into the arms meter | test | yes: engine-exl3-experts, mimo2-perf |
 | `SUSHI_EXL3_LAYER_UBENCH` | `exl3/expert_exl3_kernels.zig:82` | prints per-stage EXL3 expert timings (adds syncs) | once | yes: engine-exl3-experts, qwen4-perf |
 | `SUSHI_FP8_UBENCH`, `SUSHI_FP8_UBENCH_SHAPE`, `SUSHI_FP8_UBENCH_SWEEP` | `fp8_block.zig` | FP8 trunk GEMV meter (`<reps>`, shape filter, `direct` sweep) | test | yes: mimo2-perf |
-| `SUSHI_GDN_UBENCH`, `SUSHI_MOE_GATHER_UBENCH`, `SUSHI_PREFILL_QMM_UBENCH`, `SUSHI_VERIFY_WIDTH_UBENCH`, `SUSHI_VQMM_MIXED_UBENCH`, `SUSHI_VQMM_UBENCH` | `transformer.zig` | GDN, gather-qmv, prefill qmm, verify-width and verify-qmm meters | test; presence | no |
+| `SUSHI_GDN_UBENCH`, `SUSHI_MOE_GATHER_UBENCH`, `SUSHI_PREFILL_QMM_UBENCH`, `SUSHI_VERIFY_WIDTH_UBENCH`, `SUSHI_VQMM_MIXED_UBENCH`, `SUSHI_VQMM_UBENCH` | `transformer.zig` | GDN, gather-qmv, prefill qmm, verify-width and verify-qmm meters | test | no |
 | `SUSHI_GLM_ARMS_UBENCH`, `SUSHI_GLM_ATTN_UBENCH`, `SUSHI_GLM_LONGCTX_UBENCH`, `SUSHI_GLM_LONGCTX_UBENCH_CTX`, `SUSHI_GLM_LONGCTX_UBENCH_REPS`, `SUSHI_GLM_QMM_UBENCH` | `glm5_model.zig`, `glm5_attention.zig`, `glm5_dflash_qmm.zig` | GLM NAX-arm, sparse-attention, long-context and qmm meters (+ ctx/reps lists) | test | yes: glm5-perf, glm5-kernels |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `scheduler.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
 | `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `scheduler.zig` | `<n>` rounds per width B in 1..4 of plain decode at load; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |
@@ -153,8 +153,6 @@ Still a kill switch of an adopted arm, with no correctness test behind it. The n
 
 ## Reads to fix
 
-- *Uncached on a repeated path* (cache first, the cheapest fix): `QWEN4_PROFILE_FWD` (per forward and per PLE read), `QWEN4_OPCOUNT` (per forward), `QWEN4_PROFILE_QSA` (per layer in the forward), `QWEN4_GDN_CHECK` (per layer at the prefill check), `SUSHI_LMHEAD_FULL` and `SUSHI_LMHEAD_SHORTLIST_AUDIT` (per greedy MiMo forward), `SUSHI_ROUND_COST_PERSIST` (per request), `SUSHI_MTP_TRACE_SYNC` (per round while tracing).
-- *Presence reads* (`=0` turns them on; read through `diagEnvOnCached` or `diagEnvOn`): `QWEN4_DEBUG_SCORES`, `QWEN4_NO_POOLED`, `QWEN4_STREAM_F32`, `SUSHI_DECODE_PROFILE`, `SUSHI_MTP_TRACE_SYNC`, `SUSHI_MOE_GATHER_TRACE`, `SUSHI_VQMM_PARITY_DEBUG`, `REPLAY_DUMP_SOFT`, the three presence-armed `SUSHI_DECODE_FWD_UBENCH_*` options and the six presence-gated test meters in the microbench table.
 - *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_PADWASTE_ARM` and `SUSHI_QSA_NAX_PRECISION` are script-side only.
 
 ## Removed 2026-10-11

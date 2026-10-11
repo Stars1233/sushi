@@ -52,7 +52,6 @@ const decodeProfileEnabled = trf.decodeProfileEnabled;
 const decodeRowsProjection = trf.decodeRowsProjection;
 const diagEnvOn = trf.diagEnvOn;
 const diagEnvOnCached = trf.diagEnvOnCached;
-const envFlagCached = trf.envFlagCached;
 const fusedQkNormRope = trf.fusedQkNormRope;
 const fusedQkNormRope256 = trf.fusedQkNormRope256;
 const fusedSdpa256Masked = trf.fusedSdpa256Masked;
@@ -1418,7 +1417,7 @@ pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_a
     {
         return false;
     }
-    if (Transformer.qwen4_trace != null or diagEnvOn("QWEN4_PROFILE_FWD")) return false;
+    if (Transformer.qwen4_trace != null or diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) return false;
     // The grouped verify reads resident expert banks; a streamed trunk has none.
     if (self.expert_stream != null) return false;
     const si = qwen4Standin();
@@ -1482,7 +1481,7 @@ pub fn forwardQwen4VerifyRows(
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
-        if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+        if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
             _ = mlx.mlx_array_free(h);
@@ -1744,7 +1743,7 @@ pub fn forwardQwen4DecodeRows(
         var h = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_tile(&h, emb, &.{ 1, 1, hc }, 3, self.s));
         errdefer _ = mlx.mlx_array_free(h);
-        if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+        if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
             var h32 = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
             _ = mlx.mlx_array_free(h);
@@ -1928,7 +1927,7 @@ pub fn forwardQwen4With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     var h = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_tile(&h, emb, &reps, 3, self.s));
     errdefer _ = mlx.mlx_array_free(h);
-    if (self.qwen4_stream_f32 or envFlagCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
+    if (self.qwen4_stream_f32 or diagEnvOnCached(&qwen4_stream_f32_env, "QWEN4_STREAM_F32")) {
         var h32 = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&h32, h, .float32, self.s));
         _ = mlx.mlx_array_free(h);
@@ -2463,7 +2462,7 @@ pub fn gatedFullAttnProjected(
         // The prefill kernel has no q_len floor of its own; a verify-width
         // selection must never fall into it (it walks the WHOLE cache).
         if (gathered == null and seq_len >= FUSED256_MIN_Q_LEN and ctx.qsa_blocks.ctx != null and !qwen4Standin().attn_sdpa) {
-            const prof = diagEnvOn("QWEN4_PROFILE_QSA");
+            const prof = diagEnvOnCached(&qwen4_profile_qsa_env, "QWEN4_PROFILE_QSA");
             var clk: ProfClock = undefined;
             if (prof) {
                 try mlx.check(mlx.mlx_array_eval(q_rope));
@@ -2901,11 +2900,11 @@ pub const Qwen4FwdProf = struct {
     op_ns: [6]u64 = @splat(0),
 
     pub fn init(seq_len: c_int, h: mlx.mlx_array) !Qwen4FwdProf {
-        const env = std.c.getenv("QWEN4_PROFILE_FWD");
+        const env = if (diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) std.c.getenv("QWEN4_PROFILE_FWD") else null;
         // `=1`: S 2..16 (verify). `=all`: any S, including decode S=1 and prefill.
         const all = env != null and env.?[0] == 'a';
-        const timing = diagEnvOn("QWEN4_PROFILE_FWD") and (all or (seq_len >= 2 and seq_len <= 16));
-        var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOn("QWEN4_OPCOUNT"), .clock = ProfClock.init() };
+        const timing = env != null and (all or (seq_len >= 2 and seq_len <= 16));
+        var p: Qwen4FwdProf = .{ .timing = timing, .ops = diagEnvOnCached(&qwen4_opcount_env, "QWEN4_OPCOUNT"), .clock = ProfClock.init() };
         if (p.ops) {
             trf.moe_rows_fused_layers = 0;
             trf.moe_sorted_layers = 0;
@@ -3029,6 +3028,8 @@ pub var qwen4_debug_scores_env: ?bool = null;
 pub var qwen4_profile_fwd_env: ?bool = null;
 
 pub var qwen4_profile_qsa_env: ?bool = null;
+
+var qwen4_opcount_env: ?bool = null;
 
 pub fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
     if (qwen4_hc.hc_fused_kernels[which]) |k| return k;

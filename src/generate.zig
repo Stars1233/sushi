@@ -587,6 +587,8 @@ pub const MtpHeadRef = union(enum) {
     }
 };
 
+var mtp_trace_sync_env: ?bool = null;
+
 /// `SUSHI_MTP_HEAD_PERSIST=0`: the qwen4_exp head's committed history is neither
 /// snapshotted into a prefix-cache entry nor restored from one.
 var mtp_head_persist_env: ?bool = null;
@@ -7157,7 +7159,7 @@ pub const Generator = struct {
         // DIAGNOSTIC (SUSHI_MTP_TRACE_SYNC=1): drain the GPU before the
         // verify build so the `sync` lap shows the pending lazy work (draft
         // chain, rollback, commit) and `verify` the forward alone.
-        if (tracing and std.c.getenv("SUSHI_MTP_TRACE_SYNC") != null) {
+        if (tracing and transformer_mod.diagEnvOnCached(&mtp_trace_sync_env, "SUSHI_MTP_TRACE_SYNC")) {
             var sync_watch = io_util.Stopwatch.init(self.timer.io);
             try mlx.check(mlx.mlx_array_eval(st.verify_input));
             self.mtp_trace.add(.sync, sync_watch.read());

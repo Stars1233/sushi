@@ -4342,7 +4342,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 }
                 n_widths = @max(n_widths, 1);
             }
-            const profile_pass = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_PROFILE") != null;
+            const profile_pass = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_PROFILE");
             const kv_pre: usize = blk: {
                 const r = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
                 break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
@@ -4366,10 +4366,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             }
             // SUSHI_DECODE_FWD_UBENCH_ROW_ARMS=1: a MiMo verify width runs twice, the
             // prefill-shaped forward first, then the verify rows (decode arithmetic per row).
-            const row_arms = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_ROW_ARMS") != null;
+            const row_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_ROW_ARMS");
             // SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1: every width runs the GDN chain and the fused
             // decode step (`gdn_decode.step`) as off, on, on, off passes in this one process.
-            const gdn_arms = std.c.getenv("SUSHI_DECODE_FWD_UBENCH_GDN_ARMS") != null;
+            const gdn_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GDN_ARMS");
             defer transformer_mod.gdn_decode_recur_override = null;
             const fold_arms = transformer_mod.diagEnvOn("SUSHI_DECODE_FWD_UBENCH_GDN_FOLD_ARMS");
             defer transformer_mod.gdn_verify_fold_override = null;

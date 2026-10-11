@@ -13,6 +13,8 @@ const std = @import("std");
 const io_util = @import("io_util.zig");
 const expert_stream = @import("expert_stream.zig");
 const log = @import("log.zig");
+const qwen4_forward = @import("qwen4_forward.zig");
+const transformer_mod = @import("transformer.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
@@ -778,8 +780,8 @@ const PrefetchPool = struct {
         std.mem.sort(RowRead, refs, {}, RowRead.less);
         const before = self.wide_preads.load(.monotonic);
         const ok = self.dispatch(table, rows, out, refs);
-        if (std.c.getenv("QWEN4_PROFILE_FWD")) |raw| {
-            if (raw[0] != '0') log.info("[qwen4-prof] ple reads rows={d} preads={d} rounds=1\n", .{ rows.len, self.wide_preads.load(.monotonic) - before });
+        if (transformer_mod.diagEnvOnCached(&qwen4_forward.qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) {
+            log.info("[qwen4-prof] ple reads rows={d} preads={d} rounds=1\n", .{ rows.len, self.wide_preads.load(.monotonic) - before });
         }
         return ok;
     }
