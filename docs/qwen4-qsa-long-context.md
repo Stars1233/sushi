@@ -11,18 +11,15 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 ## Attention arms by query width
 
 - **QSA GATHERS selected blocks, never a dense `[S, kv]` mask** on a packed cache.
-- Selection = the exact radix-select `sushi_qsa_select` on both arms, SPLIT across 16 threadgroups at decode widths
-  (`SUSHI_QSA_SELECT_SPLIT=0`).
+- Selection = the exact radix-select `sushi_qsa_select` on both arms, SPLIT across 16 threadgroups at decode widths.
 - Rows 1..15 (decode and verify) = the fused split-K `qsaSparseAttn` on dense and packed caches alike
-  (`qsaAlignedSparseAttn`; `SUSHI_QSA_ATTN_MIN_S` raises its floor). When it declines, decode falls to
-  `qsaDecodeGatherAttn` and rows 2..15 to the union gather `qsaVerifyGatherAttn`
-  (`SUSHI_QSA_ATTN_KERNEL=0` forces the union gather).
+  (`qsaAlignedSparseAttn`). When it declines, decode falls to
+  `qsaDecodeGatherAttn` and rows 2..15 to the union gather `qsaVerifyGatherAttn`.
 - **A PACKED (kv8/kv4) cache never takes the dense-mask arm and never rebuilds whole per layer**
   (`qsaSparseAttnServes`): split-K serves up to `QSA_ATTN_PACKED_MAX_S` = 40 rows; past that
   `gatherQsa256Packed` gathers the packed rows in place while each cache row is staged at most
   `QSA_PACKED_GATHER_MAX_REUSE` = 4 times (`qsaPackedGatherServes`), else a gather over ONE rebuild.
-  `kvDequantScratchBytes` bills the rebuild per forward width (`qsaDenseRebuildRows`); `SUSHI_QSA_ATTN_KERNEL=0`
-  restores the old route and its bill.
+  `kvDequantScratchBytes` bills the rebuild per forward width (`qsaDenseRebuildRows`).
 - Prefill = `gatherQsa256`; batched slots keep the dense mask up to the gather floor: (top-512 + 1) x 4 = 2052 keys
   where the NAX gather serves (`qsaPrefillGatherMinKv`), 8192 elsewhere; decode and verify floors are unchanged.
 - **Verify gather kv floor is per KV SCHEME** (`qsaVerifyGatherMinKvFor`: dense 32768, quantized 16384).
@@ -64,8 +61,7 @@ separate M-RoPE guard.
 
 ## Indexer
 
-- The score sheet is ONE NAX kernel (`sushi_qsa_score`, bit-identical to the stock tf32 chain;
-  `SUSHI_QSA_SCORE_FUSED=0`).
+- The score sheet is ONE NAX kernel (`sushi_qsa_score`, bit-identical to the stock tf32 chain).
 - The prefill gather rides NAX cooperative tensors on its own predicate (`qsaNaxEligible`: G17 + macOS 26.3 + bf16 +
   hd 256 + gqa 12 + q_len ≥ 16; bar = per-element error vs float64 no worse than stock,
   `tests/qsa_nax_precision.py`, never bytes). The packed NAX variant joins the NAX probe.
@@ -90,7 +86,7 @@ separate M-RoPE guard.
 
 ## Admission and load-time bills
 
-- Past 32k a request RESERVES its KV capacity up front (`KVCache.reservedTokens`; `SUSHI_KV_RESERVE=0`).
+- Past 32k a request RESERVES its KV capacity up front (`KVCache.reservedTokens`).
 - A long prefill EVICTS the hot cache to be admitted on the INFERENCE thread (`evictLruToAdmit`, credits only
   PROVABLY reclaimable bytes, refuses by NAME `PrefillDoesNotFit` → 400, defers a warm prompt to the `WarmPrefix`
   bill); ONE `[admission]` line.

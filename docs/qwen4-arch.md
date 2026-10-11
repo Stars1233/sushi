@@ -38,7 +38,7 @@ hidden 2560, expert intermediate 640.
   only under `--vision` ([engine-expert-streaming](engine-expert-streaming.md#vision)).
 - **The deferred PLE leaf is filled before anything evaluates the build**: see [engine-mtp](engine-mtp.md#ple-defer).
   A host token read inside the graph build serialized the build with the GPU.
-- **Decode kernels**: the fused hc read is LATENCY-bound (`SUSHI_HC_FUSED=0`; `hcWrite` DEFERS into the next
+- **Decode kernels**: the fused hc read is LATENCY-bound (`hcWrite` DEFERS into the next
   read); HC + GDN prefill fusions take the chunk WIDTH as a scalar input. Each of the 36 GDN layers decodes and
   verifies (S <= 8) in two dispatches: `gdn_decode.step` (`src/gdn_decode.zig`), then the norm-gate. Details in
   [engine-kernels](engine-kernels.md).
@@ -70,7 +70,7 @@ hidden 2560, expert intermediate 640.
 - `mx.quantize` packs DENSELY (element i at bit offset `i*bits`, straddling words at 3/5/6 bits; `dequantRow` tested
   at every width) or raw bf16 (bits-16 arm).
 - A random read into a cold 32 GB mmap is a serial SSD fault, so `gather` rides a `PrefetchPool`
-  (`QWEN4_PLE_PREFETCH=0` disables) and `startWarm` preads the table at load (`SUSHI_NGRAM_WARM=0`).
+  and `startWarm` preads the table at load (`SUSHI_NGRAM_WARM=0`).
 - A wide prefill gather walks a resident table serially below `PREFILL_PREFETCH_MIN_KV` (256k) and pools past it;
   `QWEN4_PLE_PREFETCH_PREFILL=0|1` forces either arm, and the one-shot `PLE prefill gather:` line names the reason.
 - Which arm a wide gather takes is MEASURED on the table, not predicted from RAM: `calibrateArm` reads 128 random rows

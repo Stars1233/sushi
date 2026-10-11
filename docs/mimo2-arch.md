@@ -143,7 +143,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   [heads, rows, keys] score sheet, unbilled. A warm restore's short tail (a follow-up of a few tokens) is the case;
   each row is its serial decode tick bit for bit.
 - **On M5 both layer kinds prefill on the matrix units** (`sushi_attn_pd_nax`, same carries, bill and slices;
-  `SUSHI_ATTN_PD_NAX=0` = the SIMD kernel): global attention ~3x faster per layer
+  the SIMD kernel elsewhere): global attention ~3x faster per layer
   ([engine-kernels](engine-kernels.md#prefill-kernels), [perf-baselines](mimo2-perf.md#mimo-attn-kernels)).
 - **A packed-cache global-layer DECODE reads in place** (`mimoGlobalDecodeArm`): with matrix units (M5) the matmul2d
   `sushi_qkv_mpp` (`qkvMppDecodeServes`, from `QKV_MPP_DECODE_MIN_TK` = 4096 keys); without them (M4) the QSA split-K

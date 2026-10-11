@@ -69,7 +69,6 @@ pub const getHcFusedKernel = qwen4_forward.getHcFusedKernel;
 pub const getQsaSelectKernel = qwen4_forward.getQsaSelectKernel;
 pub const getQsaSelectSplitLocalKernel = qwen4_forward.getQsaSelectSplitLocalKernel;
 pub const getQsaSelectSplitMergeKernel = qwen4_forward.getQsaSelectSplitMergeKernel;
-const hcFusedEnabled = qwen4_hc.hcFusedEnabled;
 pub const hcReadFused = qwen4_hc.hcReadFused;
 const hcReadJoined = qwen4_hc.hcReadJoined;
 const hcReadPrepared = qwen4_hc.hcReadPrepared;
@@ -328,23 +327,16 @@ fn getGdnKernelSeq(vector_gate: bool) !mlx.mlx_fast_metal_kernel {
 // (8 threads x 16-wide fragments), Dv % 32 == 0 (DB=32 dv rows per
 // threadgroup). Anything else — and decode (T==1), PLD/MTP verify, and the
 // per-position-state capture path — stays on the stock kernels.
-// Kill switch: SUSHI_GDN_BLOCKED=0; block size: SUSHI_GDN_BLOCK_T
-// (16|32|48, default 32 for bf16 — Metal's 32 KiB threadgroup limit governs,
+// Block size 32 for bf16 — Metal's 32 KiB threadgroup limit governs,
 // and it is a function of the INPUT WIDTH, not a constant: fp32 activations
 // stage twice the bytes and clamp to 16 via gdnBlockTFor. GDN inputs are NOT
-// always bf16 — an f16 checkpoint promotes its activations to f32).
+// always bf16 — an f16 checkpoint promotes its activations to f32.
 
-/// Test seam: forces the blocked-prefill route on/off without the environment.
+/// Test seam: false takes the stock recurrence for every prefill width.
 pub var gdn_blocked_override: ?bool = null;
-var gdn_blocked_env_cached: ?bool = null;
 
 pub fn gdnBlockedEnabled() bool {
-    if (gdn_blocked_override) |v| return v;
-    if (gdn_blocked_env_cached) |v| return v;
-    const raw = std.c.getenv("SUSHI_GDN_BLOCKED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gdn_blocked_env_cached = enabled;
-    return enabled;
+    return gdn_blocked_override orelse true;
 }
 
 /// Prefill-width floor for the blocked kernel (mirrors oMLX's OMLX_GDN_MIN_T
@@ -397,21 +389,7 @@ pub fn gdnBlockTFor(requested: u32, dk: c_int, in_elem_size: usize) ?u32 {
 
 const GDN_BLOCKED_TBS = [_]u32{ 16, 32, 48 };
 var gdn_blocked_cached: [GDN_BLOCKED_TBS.len]?mlx.mlx_fast_metal_kernel = @splat(null);
-var gdn_block_t_cached: ?u32 = null;
-
-pub fn gdnBlockT() u32 {
-    if (gdn_block_t_cached) |v| return v;
-    const v: u32 = blk: {
-        const raw = std.c.getenv("SUSHI_GDN_BLOCK_T") orelse break :blk 32;
-        const parsed = std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch break :blk 32;
-        for (GDN_BLOCKED_TBS) |cand| {
-            if (cand == parsed) break :blk parsed;
-        }
-        break :blk 32;
-    };
-    gdn_block_t_cached = v;
-    return v;
-}
+const GDN_BLOCK_T: u32 = 32;
 
 // Body of the blocked-seq kernel; the `constexpr int TB = N;` line is
 // prepended per block size by gdnBlockedSource (one cached kernel per TB,
@@ -616,7 +594,7 @@ const GdnPrefillRoute = struct { route: GdnRoute, tb: u32 = 0 };
 
 fn gdnPrefillRoute(model_type: []const u8, seq_len: c_int, dk: c_int, dv: c_int, num_k_heads: c_int, num_v_heads: c_int, vector_gate: bool, in_itemsize: usize) GdnPrefillRoute {
     if (vector_gate or !gdnBlockedEnabled() or !gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads)) return .{ .route = .stock };
-    const tb = gdnBlockTFor(gdnBlockT(), dk, in_itemsize) orelse return .{ .route = .stock };
+    const tb = gdnBlockTFor(GDN_BLOCK_T, dk, in_itemsize) orelse return .{ .route = .stock };
     return .{ .route = if (gdnPipelinedEnabled(model_type)) .pipelined else .blocked, .tb = tb };
 }
 
@@ -1782,26 +1760,17 @@ fn computeNaxAvailable() bool {
 
 var nax_sdpa_avail_cache: ?bool = null;
 pub var nax_sdpa_override: ?bool = null; // test seam
-var nax_sdpa_env: ?bool = null;
 
 /// mlx >= 0.32.2 serves hd-256 attention on NAX with a fused full-attention
 /// kernel (`sdpa_full_self_attention_nax`), auto only at >= 1024 causal rows
-/// and reachable below that through `force_fused`. Default ON where NAX is
-/// available; SUSHI_NAX_SDPA=0 restores sushi_attn_p256 + the split/vector
-/// path, =1 forces the stock full kernel on a non-NAX GPU (A/B lever).
-pub fn naxSdpaPreferredFrom(nax_available: bool, raw: ?[]const u8) bool {
-    if (raw) |v| return !std.mem.eql(u8, v, "0");
-    return nax_available;
-}
-
+/// and reachable below that through `force_fused`. Preferred wherever NAX is
+/// available; elsewhere sushi_attn_p256 and the split/vector path serve.
 pub fn naxSdpaPreferred() bool {
     if (nax_sdpa_override) |v| return v;
-    if (nax_sdpa_env) |v| return v;
-    if (nax_sdpa_avail_cache == null) nax_sdpa_avail_cache = computeNaxAvailable();
-    const raw = std.c.getenv("SUSHI_NAX_SDPA");
-    const on = naxSdpaPreferredFrom(nax_sdpa_avail_cache.?, if (raw) |v| std.mem.sliceTo(v, 0) else null);
-    nax_sdpa_env = on;
-    if (on) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; sushi_attn_p256 causal arm declined (SUSHI_NAX_SDPA=0 restores)\n", .{});
+    if (nax_sdpa_avail_cache) |v| return v;
+    const on = computeNaxAvailable();
+    nax_sdpa_avail_cache = on;
+    if (on) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; sushi_attn_p256 causal arm declined\n", .{});
     return on;
 }
 
@@ -2590,13 +2559,6 @@ fn newAttnPdKernel(name: [*:0]const u8, source: [*:0]const u8, header: [*:0]cons
 /// Test seam: the arm the LAST fusedSdpaPrefill call ran.
 pub var attn_pd_last_arm: AttnPdArm = .simd;
 
-/// SUSHI_ATTN_PD_NAX=0 keeps the SIMD kernel on NAX silicon (A/B lever).
-pub fn attnPdNaxEnabledFrom(raw: ?[]const u8) bool {
-    const v = raw orelse return true;
-    return !std.mem.eql(u8, v, "0");
-}
-
-var attn_pd_nax_env: ?bool = null;
 /// null = not probed yet; the verdict holds for the process.
 var attn_pd_nax_probe_ok: ?bool = null;
 /// Test seam: perturb the probe's NAX output so the numeric check must fail.
@@ -2611,14 +2573,7 @@ pub fn attnPdNaxProbeReset() void {
 /// one-tile probe passed.
 fn attnPdNaxServes(qk_dim: c_int, v_dim: c_int, masked: bool) bool {
     if (masked or qk_dim != 192 or v_dim != 128) return false;
-    const want = attn_pd_nax_override orelse blk: {
-        if (attn_pd_nax_env == null) {
-            const raw = std.c.getenv("SUSHI_ATTN_PD_NAX");
-            attn_pd_nax_env = attnPdNaxEnabledFrom(if (raw) |r| std.mem.sliceTo(r, 0) else null);
-        }
-        break :blk attn_pd_nax_env.?;
-    };
-    if (!want or !verifyQmmNaxAvailable() or !qsaNaxOsOk()) return false;
+    if (!(attn_pd_nax_override orelse true) or !verifyQmmNaxAvailable() or !qsaNaxOsOk()) return false;
     if (attn_pd_nax_probe_ok == null) attn_pd_nax_probe_ok = attnPdNaxRunProbe();
     return attn_pd_nax_probe_ok.?;
 }
@@ -2704,7 +2659,6 @@ pub var fused256_override: ?bool = null;
 /// Test seam: true = the NAX arm wherever the hardware and its probe allow it, false = SIMD.
 pub var attn_pd_nax_override: ?bool = null;
 var fused256_env_cached: ?bool = null;
-var fused256_causal_env_cached: ?Fused256CausalMode = null;
 
 pub fn fused256Enabled() bool {
     if (fused256_override) |v| return v;
@@ -2725,7 +2679,7 @@ pub fn fused256Enabled() bool {
 /// key axis split into budget-sized dispatches (see
 /// FUSED256_DEFAULT_DISPATCH_BUDGET) the causal arm WINS the same
 /// same-session A/B on the 27B: +2.9%/+2.3%/+4.6% at 8K/16K/32K.
-/// SUSHI_FUSED_256_CAUSAL=0 restores composed causal (and the old
+/// SUSHI_FUSED_256=0 restores composed causal (and the old
 /// OOM-guard score billing via prefillHeadDimFused).
 /// The SLIDING-BAND arm (window > 0) has no such competition — composed
 /// computes full-width scores + a GB-scale mask while the kernel
@@ -2744,8 +2698,7 @@ pub const Fused256CausalMode = enum { all, off };
 // (fp32 m/l/O buffers chained between dispatches — bit-identical to the
 // single-dispatch result). The band arm never chunks: its in-kernel block
 // skip already bounds per-dispatch work by the window.
-// SUSHI_FUSED_256_BUDGET overrides (0 = single-dispatch, pre-budget
-// behavior); default mirrors oMLX's 250M fallback (~23 ms/dispatch on the
+// The default mirrors oMLX's 250M fallback (~23 ms/dispatch on the
 // M4 Max at the kernel's measured ~1.1e10 work-units/s).
 pub const FUSED256_DEFAULT_DISPATCH_BUDGET: i64 = 250_000_000;
 /// `sushi_attn_pd_nax` does the same work in about a third of the time, and its lockstep simdgroups
@@ -2758,18 +2711,11 @@ pub const ATTN_PD_NAX_DISPATCH_BUDGET: i64 = 1_000_000_000;
 /// is ~21 MB at the widest cache geometry we serve.
 pub const PACKED_KV_SLICE_MAX: c_int = 16384;
 
-/// Test seam: forces the budget without the environment.
+/// Test seam: forces the budget (0 = single dispatch).
 pub var fused256_budget_override: ?i64 = null;
-/// null = not read yet; the inner null = unset, each arm takes its own default.
-var fused256_budget_env_cached: ??i64 = null;
 
 pub fn fused256DispatchBudget(arm: AttnPdArm) i64 {
     if (fused256_budget_override) |v| return v;
-    if (fused256_budget_env_cached == null) fused256_budget_env_cached = blk: {
-        const raw = std.c.getenv("SUSHI_FUSED_256_BUDGET") orelse break :blk null;
-        break :blk std.fmt.parseInt(i64, std.mem.sliceTo(raw, 0), 10) catch null;
-    };
-    if (fused256_budget_env_cached.?) |v| return v;
     return if (arm == .nax) ATTN_PD_NAX_DISPATCH_BUDGET else FUSED256_DEFAULT_DISPATCH_BUDGET;
 }
 
@@ -2791,16 +2737,7 @@ pub fn fused256KvChunkLen(batch: i64, hq: i64, ql: i64, kl: i64, budget: i64) c_
 pub var fused256_last_dispatch_count: u32 = 0;
 
 pub fn fused256CausalMode() Fused256CausalMode {
-    if (fused256_override) |v| return if (v) .all else .off;
-    if (!fused256Enabled()) return .off;
-    if (fused256_causal_env_cached) |v| return v;
-    const mode: Fused256CausalMode = blk: {
-        const raw = std.c.getenv("SUSHI_FUSED_256_CAUSAL") orelse break :blk .all;
-        if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0")) break :blk .off;
-        break :blk .all;
-    };
-    fused256_causal_env_cached = mode;
-    return mode;
+    return if (fused256Enabled()) .all else .off;
 }
 
 /// (query/key width, value width) pairs `sushi_attn_pd` is instantiated for.
@@ -2816,7 +2753,7 @@ pub fn fusedPdDims(qk_dim: c_int, v_dim: c_int) bool {
 /// the composed [heads, chunk, total_kv] score tensor — either MLX's own
 /// fused kernel covers it (<= 128) or `sushi_attn_pd` does for EVERY arm.
 /// Keyed on causal mode: at `.all` (the default since the budgeted-dispatch
-/// flip) no score tensor materializes; SUSHI_FUSED_256_CAUSAL=0
+/// flip) no score tensor materializes; SUSHI_FUSED_256=0
 /// restores composed causal AND the guards' score billing together. Guards
 /// and dispatch must never drift (the effectivePrefillChunk rule).
 ///
@@ -2944,7 +2881,7 @@ pub fn slidingPrefillAttn(
 var attn_pd_engaged_logged: [2][2]bool = .{ .{ false, false }, .{ false, false } };
 
 fn attnPdKernelName(arm: AttnPdArm) []const u8 {
-    return if (arm == .nax) "sushi_attn_pd_nax (SUSHI_ATTN_PD_NAX=0 restores sushi_attn_pd)" else "sushi_attn_pd";
+    return if (arm == .nax) "sushi_attn_pd_nax" else "sushi_attn_pd";
 }
 
 fn logAttnPdEngaged(arm: AttnPdArm, qk_dim: c_int, v_dim: c_int, q_len: c_int, kv_len: c_int, dispatches: u32) void {
@@ -2963,23 +2900,6 @@ fn attn256Base16Aligned(a: mlx.mlx_array) bool {
     return @intFromPtr(p) % 16 == 0;
 }
 
-var qsa_fused_env_cached: ?bool = null;
-pub var qsa_fused_override: ?bool = null;
-
-/// SUSHI_QSA_FUSED=0 restores the stock array-mask sdpa (the unfused
-/// hd-256 fallback on every silicon: `use_fallback` has no fused arm for an
-/// array mask at hd 256).
-fn qsaFusedEnabled() bool {
-    if (qsa_fused_override) |v| return v;
-    if (qsa_fused_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_FUSED") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_fused_env_cached = v;
-    return v;
-}
-
 var qsa_fused_logged = false;
 
 /// Array-mask arm of sushi_attn_p256 (qwen4_exp QSA prefill): `mask` is the
@@ -2994,7 +2914,7 @@ pub fn fusedSdpa256Masked(
     scale: f32,
     mask: mlx.mlx_array,
 ) !?mlx.mlx_array {
-    if (!fused256Enabled() or !qsaFusedEnabled()) return null;
+    if (!fused256Enabled()) return null;
     if (mask.ctx == null or mlx.mlx_array_ndim(mask) != 4 or mlx.mlx_array_dtype(mask) != .bool_) return null;
     const ms = mlx.getShape(mask);
     const qs = mlx.getShape(q);
@@ -3003,7 +2923,7 @@ pub fn fusedSdpa256Masked(
     const out = try fusedSdpaPrefillImpl(s, q, k, v, scale, 0, mask, null, .{ .ctx = null });
     if (out != null and !qsa_fused_logged) {
         qsa_fused_logged = true;
-        log.info("[qsa-fused] engaged: sushi_attn_p256 mask arm qL={d} kL={d} Hq={d} Hkv={d} (SUSHI_QSA_FUSED=0 restores stock sdpa)\n", .{ qs[2], ks[2], qs[1], ks[1] });
+        log.info("[qsa-fused] engaged: sushi_attn_p256 mask arm qL={d} kL={d} Hq={d} Hkv={d}\n", .{ qs[2], ks[2], qs[1], ks[1] });
     }
     return out;
 }
@@ -3031,94 +2951,49 @@ fn qsaSkipTable(s: mlx.mlx_stream, mask: mlx.mlx_array) !mlx.mlx_array {
     return out;
 }
 
-var qsa_gather_env_cached: ?bool = null;
 pub var qsa_gather_override: ?bool = null;
 
-/// SUSHI_QSA_GATHER=0 restores the dense [S, kv] mask arm for the
-/// qwen4_exp QSA prefill (the block-gather kernel is the default).
+/// The block-gather kernel serves the qwen4_exp QSA prefill; the override restores the dense
+/// [S, kv] mask arm.
 pub fn qsaGatherEnabled() bool {
-    if (qsa_gather_override) |v| return v;
-    if (qsa_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_gather_env_cached = v;
-    return v;
+    return qsa_gather_override orelse true;
 }
 
 /// Below this many keys the mask arm wins: it reads at most kv rows per
 /// 64-row tile, the gather reads 2051 rows per token unshared (ladder: 8k
-/// -3%, 16k +4%, 32k +19%, 64k +42%). SUSHI_QSA_GATHER_MIN_KV.
+/// -3%, 16k +4%, 32k +19%, 64k +42%).
 pub const QSA_GATHER_MIN_KV_DEFAULT: c_int = 8192;
-var qsa_gather_min_kv_cached: ?c_int = null;
 pub var qsa_gather_min_kv_override: ?c_int = null;
 
 pub fn qsaGatherMinKv() c_int {
-    if (qsa_gather_min_kv_override) |v| return v;
-    if (qsa_gather_min_kv_cached) |v| return v;
-    const raw = std.c.getenv("SUSHI_QSA_GATHER_MIN_KV");
-    const v = qsaPrefillGatherMinKvFrom(1, false, if (raw) |r| std.mem.sliceTo(r, 0) else null, null);
-    qsa_gather_min_kv_cached = v;
-    return v;
+    return qsa_gather_min_kv_override orelse QSA_GATHER_MIN_KV_DEFAULT;
 }
 
 pub const QSA_GATHER_MIN_KV_NAX: c_int = 2052;
 
-pub fn qsaPrefillGatherMinKvFrom(seq_len: c_int, nax_serves: bool, raw: ?[]const u8, override: ?c_int) c_int {
+pub fn qsaPrefillGatherMinKvFrom(seq_len: c_int, nax_serves: bool, override: ?c_int) c_int {
     if (override) |v| return v;
-    if (raw) |v| return std.fmt.parseInt(c_int, v, 10) catch QSA_GATHER_MIN_KV_DEFAULT;
     return if (seq_len >= FUSED256_MIN_Q_LEN and nax_serves) QSA_GATHER_MIN_KV_NAX else QSA_GATHER_MIN_KV_DEFAULT;
 }
 
 
-pub const QSA_GATHER_BK_DEFAULT: c_int = 32;
-var qsa_gather_bk_cached: ?c_int = null;
-pub var qsa_gather_bk_override: ?c_int = null;
-
-/// Key tile of the gather kernel: 16 or 32 (SUSHI_QSA_GATHER_BK).
-fn qsaGatherBk() c_int {
-    if (qsa_gather_bk_override) |v| return v;
-    if (qsa_gather_bk_cached) |v| return v;
-    var v: c_int = QSA_GATHER_BK_DEFAULT;
-    if (std.c.getenv("SUSHI_QSA_GATHER_BK")) |raw| {
-        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
-        if (parsed == 16 or parsed == 32) v = parsed;
-    }
-    qsa_gather_bk_cached = v;
-    return v;
-}
+/// Key tile of the gather kernel.
+const QSA_GATHER_BK: c_int = 32;
 
 pub var qsa_decode_gather_override: ?bool = null;
-var qsa_decode_gather_env_cached: ?bool = null;
 
 /// Decode-width QSA gather (S==1): reuse the sorted block selection and read
 /// only the selected blocks + incomplete tail instead of the full KV — O(topk)
-/// per step, never O(kv). SUSHI_QSA_DECODE_GATHER=0 restores the dense
-/// bool-mask arm (same selection, full-KV SDPA).
+/// per step, never O(kv). The override restores the dense bool-mask arm (same selection,
+/// full-KV SDPA).
 pub fn qsaDecodeGatherEnabled() bool {
-    if (qsa_decode_gather_override) |v| return v;
-    if (qsa_decode_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_DECODE_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_decode_gather_env_cached = v;
-    return v;
+    return qsa_decode_gather_override orelse true;
 }
 
 pub var qsa_batched_gather_override: ?bool = null;
-var qsa_batched_gather_env_cached: ?bool = null;
 
 pub fn qsaBatchedGatherEnabled() bool {
-    if (qsa_batched_gather_override) |v| return v;
-    if (qsa_batched_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_BATCHED_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_batched_gather_env_cached = v;
-    return v;
+    return qsa_batched_gather_override orelse true;
 }
 
 pub fn qsaBatchedGatherOn(seq_len: c_int) bool {
@@ -3133,23 +3008,6 @@ pub fn qsaBatchedGatherOn(seq_len: c_int) bool {
 pub fn qsaBatchedGatherFloor(seq_len: c_int, quantized: bool) c_int {
     if (seq_len >= 2) return @max(qsaGatherMinKv(), qsaVerifyGatherMinKvFor(quantized));
     return qsaGatherMinKv();
-}
-
-var qsa_history_share_env_cached: ?bool = null;
-pub var qsa_history_share_override: ?bool = null;
-
-/// `SUSHI_QSA_HISTORY_SHARE=0` restores the end-of-prefill materialized copy of the QSA
-/// indexer history. On (default) the newest SSM checkpoint takes a view of the slot's live
-/// history at commit (`handoffQsaHistoryToLatest`): one copy per (slot ∪ entry).
-pub fn qsaHistoryShareEnabled() bool {
-    if (qsa_history_share_override) |v| return v;
-    if (qsa_history_share_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_HISTORY_SHARE") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_history_share_env_cached = v;
-    return v;
 }
 
 /// Virtual key index -> cache position for one query's block selection:
@@ -3364,7 +3222,8 @@ var qsa_nax_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 pub var qsa_nax_override: ?bool = null;
 var qsa_nax_env: ?bool = null;
 
-/// Default on: the hardware gate (`qsaNaxEligible`) decides, `=0` is the kill switch.
+/// Default on: the hardware gate (`qsaNaxEligible`) decides. `SUSHI_QSA_NAX=0` forces the stock
+/// gather: `tests/test_qsa_nax_prefill.py` runs its stock arm with it.
 pub fn qsaNaxEnabledFrom(raw: ?[]const u8) bool {
     const v = raw orelse return true;
     return !std.mem.eql(u8, v, "0");
@@ -3583,7 +3442,7 @@ fn qsaGatherProbeDispatch(
     const ks = mlx.getShape(k);
     const gqa: c_int = @divTrunc(qs[1], ks[1]);
     const nsg: c_int = @divTrunc(gqa + 7, 8);
-    const bk: c_int = if (nax) 32 else qsaGatherBk();
+    const bk: c_int = QSA_GATHER_BK;
     const one = [_]c_int{1};
     const scl_data = [_]f32{scale};
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
@@ -3801,7 +3660,6 @@ pub fn gatherQsa256(
 
 /// `gatherQsa256` straight off a PACKED cache (`view.has_quant_triple`): the kernel stages only
 /// the rows each query gathers, so no layer attends a dense rebuild of the whole cache.
-/// `SUSHI_QSA_ATTN_KERNEL=0` declines it with the split-K kernel.
 pub fn gatherQsa256Packed(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVView, scale: f32, blocks: mlx.mlx_array, ratio: c_int) !?mlx.mlx_array {
     if (!view.has_quant_triple or !qsaAttnKernelEnabled()) return null;
     return gatherQsa256Impl(s, q, view.*, scale, blocks, ratio);
@@ -3875,7 +3733,7 @@ fn gatherQsa256Impl(
     const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
     defer _ = mlx.mlx_array_free(scl);
     const nsg: c_int = @divTrunc(gqa + 7, 8);
-    const bk: c_int = if (use_nax) 32 else qsaGatherBk();
+    const bk: c_int = QSA_GATHER_BK;
     const key = QsaGatherCfgKey{
         .q_shape = ShapeKey.from(qs),
         .h_kv = ks[1],
@@ -3919,7 +3777,7 @@ fn gatherQsa256Impl(
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (is_packed) {
         if (qsa_gather_packed_engaged_bits.take(@intFromBool(use_nax))) {
-            log.info("[qsa-gather] engaged: {s} S={d} kv={d} blocks={d} kv{d}/gs{d} (SUSHI_QSA_ATTN_KERNEL=0 restores the gather over a dense rebuild)\n", .{ if (use_nax) "sushi_qsa_nax_packed" else "sushi_attn_qsa256_packed", qs[2], ks[2], bs[2], view.bits, view.group_size });
+            log.info("[qsa-gather] engaged: {s} S={d} kv={d} blocks={d} kv{d}/gs{d}\n", .{ if (use_nax) "sushi_qsa_nax_packed" else "sushi_attn_qsa256_packed", qs[2], ks[2], bs[2], view.bits, view.group_size });
         }
         return out;
     }
@@ -3931,10 +3789,10 @@ fn gatherQsa256Impl(
             @as(usize, @intCast(bk + 8)) * 256 * 2;
         if (use_nax) {
             qsa_gather_engaged_nax += 1;
-            log.info("[qsa-gather] engaged: sushi_qsa_nax_precise S={d} kv={d} blocks={d} bk={d} tgmem={d} (SUSHI_QSA_NAX=0 restores the stock gather)\n", .{ qs[2], ks[2], bs[2], bk, tgmem });
+            log.info("[qsa-gather] engaged: sushi_qsa_nax_precise S={d} kv={d} blocks={d} bk={d} tgmem={d}\n", .{ qs[2], ks[2], bs[2], bk, tgmem });
         } else {
             qsa_gather_engaged_stock += 1;
-            log.info("[qsa-gather] engaged: sushi_attn_qsa256 S={d} kv={d} blocks={d} bk={d} tgmem={d} (SUSHI_QSA_GATHER=0 restores the dense mask arm)\n", .{ qs[2], ks[2], bs[2], bk, tgmem });
+            log.info("[qsa-gather] engaged: sushi_attn_qsa256 S={d} kv={d} blocks={d} bk={d} tgmem={d}\n", .{ qs[2], ks[2], bs[2], bk, tgmem });
         }
     }
     return out;
@@ -3947,20 +3805,6 @@ fn gatherQsa256Impl(
 
 
 
-pub var qsa_select_tg_override: ?c_int = null;
-var qsa_select_tg_cached: ?c_int = null;
-
-pub fn qsaSelectTg() c_int {
-    if (qsa_select_tg_override) |v| return v;
-    if (qsa_select_tg_cached) |v| return v;
-    var v: c_int = 0;
-    if (std.c.getenv("SUSHI_QSA_SELECT_TG")) |raw| {
-        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch v;
-        if (parsed == 256 or parsed == 512 or parsed == 1024) v = parsed;
-    }
-    qsa_select_tg_cached = v;
-    return v;
-}
 
 
 
@@ -3974,7 +3818,6 @@ pub fn qsaSelectCfgBuilds() usize {
 }
 
 pub var qsa_select_kernel_override: ?bool = null;
-var qsa_select_kernel_env: ?bool = null;
 const SingleVerifyFeature = enum { routing, down_reduce, hc_graph };
 var single_verify_test_features: [3]bool = @splat(true);
 
@@ -4007,16 +3850,9 @@ test "shared expert gate tail admits the joined verifier envelope only" {
 }
 
 
-/// Fused QSA block select (default on). `SUSHI_QSA_SELECT_KERNEL=0` restores the argpartition chain.
+/// Fused QSA block select; the override restores the argpartition chain.
 pub fn qsaSelectKernelEnabled() bool {
-    if (qsa_select_kernel_override) |v| return v;
-    if (qsa_select_kernel_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_SELECT_KERNEL") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_select_kernel_env = v;
-    return v;
+    return qsa_select_kernel_override orelse true;
 }
 
 
@@ -4025,17 +3861,9 @@ pub fn qsaSelectKernelEnabled() bool {
 
 
 pub var qsa_select_split_override: ?bool = null;
-var qsa_select_split_env: ?bool = null;
 
 pub fn qsaSelectSplitEnabled() bool {
-    if (qsa_select_split_override) |v| return v;
-    if (qsa_select_split_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_SELECT_SPLIT") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_select_split_env = v;
-    return v;
+    return qsa_select_split_override orelse true;
 }
 
 
@@ -4053,7 +3881,6 @@ pub const QsaScoreLayout = enum(u8) { base = 0, h4 = 1 };
 
 pub var qsa_score_fused_override: ?bool = null;
 pub var qsa_score_probe_flip_override: bool = false;
-var qsa_score_fused_env: ?bool = null;
 pub var qsa_score_layout_override: ?QsaScoreLayout = null;
 pub var qsa_score_tf32_override: ?bool = null;
 var qsa_score_tf32_env: ?bool = null;
@@ -4069,14 +3896,7 @@ pub fn qsaScoreKernelBuilds() usize {
 }
 
 pub fn qsaScoreFusedEnabled() bool {
-    if (qsa_score_fused_override) |v| return v;
-    if (qsa_score_fused_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_SCORE_FUSED") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_score_fused_env = v;
-    return v;
+    return qsa_score_fused_override orelse true;
 }
 
 pub fn qsaScoreFusedActive() bool {
@@ -4432,7 +4252,7 @@ pub fn qsaScoreFusedDispatch(s: mlx.mlx_stream, q: mlx.mlx_array, pooled: mlx.ml
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (qsa_score_engaged_bits.take(qsaWidthBucket(rows))) {
         log.debug(
-            "[qsa-score] engaged (S={d} nb={d} layout={s} nsg={d} nsh={d}) — SUSHI_QSA_SCORE_FUSED=0 restores the composed chain\n",
+            "[qsa-score] engaged (S={d} nb={d} layout={s} nsg={d} nsh={d})\n",
             .{ rows, nb, if (layout == .h4) "h4" else "base", nsg, nsh },
         );
     }
@@ -4766,68 +4586,24 @@ pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
 /// Ceiling on the split count; past it the f32 partial buffer costs more traffic than it buys.
 pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
 
-/// Decode and verify use one per-position sparse-attention body.
-pub const QSA_ATTN_MIN_S_DEFAULT: c_int = 1;
-
-var qsa_attn_nsplit_env: ?c_int = null;
+/// Test and microbench seam: forces the split count.
 pub var qsa_attn_nsplit_override: ?c_int = null;
-var qsa_attn_min_s_env: ?c_int = null;
-pub var qsa_attn_min_s_override: ?c_int = null;
 
-fn qsaAttnEnvInt(cache: *?c_int, name: [*:0]const u8, dflt: c_int) c_int {
-    if (cache.*) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv(name) orelse break :blk dflt;
-        const parsed = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch break :blk dflt;
-        // Absent or 0 means "auto".
-        break :blk if (parsed <= 0) dflt else parsed;
-    };
-    cache.* = v;
-    return v;
-}
-
-/// Splits per (row, kv head): a measured constant, independent of kv and the row's key
-/// count. `SUSHI_QSA_ATTN_NSPLIT=<n>` overrides.
 /// Resolve every lazily-cached QSA env read once, from the main thread, before any other
 /// thread exists: first touch of a `?bool`/`?c_int` from two threads is a race.
 pub fn warmQsaEnvCaches() void {
-    _ = qsaFusedEnabled();
-    _ = qsaGatherEnabled();
-    _ = qsaGatherMinKv();
-    _ = qsaGatherBk();
-    _ = qsaDecodeGatherEnabled();
-    _ = qsaHistoryShareEnabled();
-    _ = qsaVerifyGatherEnabled();
-    _ = qsaVerifyGatherMinKvFor(false);
-    _ = qsaSelectEnabledWarm();
-    _ = qsaSelectSplitEnabled();
-    _ = qsaSelectTg();
-    _ = qsaAttnKernelEnabled();
-    _ = qsaAttnNSplit();
-    _ = qsaAttnMinS();
-    _ = qsaAttnBk();
     _ = qsaAttnBalanced();
     _ = qsaScoreSheetBudget();
 }
 
-fn qsaSelectEnabledWarm() bool {
-    return qsaSelectKernelEnabled();
-}
-
 pub fn qsaAttnNSplit() c_int {
-    const forced = qsa_attn_nsplit_override orelse qsaAttnEnvInt(&qsa_attn_nsplit_env, "SUSHI_QSA_ATTN_NSPLIT", 0);
+    const forced = qsa_attn_nsplit_override orelse 0;
     if (forced > 0) {
         var f: c_int = 1;
         while (f < forced and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
         return f;
     }
     return QSA_ATTN_NSPLIT_DEFAULT;
-}
-
-/// Lowest query width the fused kernel serves. `SUSHI_QSA_ATTN_MIN_S`.
-pub fn qsaAttnMinS() c_int {
-    const v = qsa_attn_min_s_override orelse qsaAttnEnvInt(&qsa_attn_min_s_env, "SUSHI_QSA_ATTN_MIN_S", QSA_ATTN_MIN_S_DEFAULT);
-    return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
 }
 
 /// Widest query width the split-K kernel serves on a PACKED cache: past it the gathers win
@@ -4851,8 +4627,8 @@ pub fn qsaDenseRebuildRows(budget: u32, ratio: u32, fwd: u64) ?u64 {
     return @max(span, fwd * budget / QSA_PACKED_GATHER_MAX_REUSE);
 }
 
-pub fn qsaSparseAttnServes(has_quant_triple: bool, seq_len: c_int, min_s: c_int) bool {
-    if (seq_len < min_s) return false;
+pub fn qsaSparseAttnServes(has_quant_triple: bool, seq_len: c_int) bool {
+    if (seq_len < 1) return false;
     if (seq_len < FUSED256_MIN_Q_LEN) return true;
     return has_quant_triple and seq_len <= (qsa_attn_packed_max_s_override orelse QSA_ATTN_PACKED_MAX_S);
 }
@@ -4884,15 +4660,14 @@ fn getQsaAttnMergeKernel() !mlx.mlx_fast_metal_kernel {
 /// Threadgroup tile depth: 16 keys stages 12 KiB, half the dense prefill kernel's footprint.
 pub const QSA_ATTN_BK: c_int = 16;
 
-var qsa_attn_bk_env: ?c_int = null;
 var qsa_attn_balanced_env: ?bool = null;
+/// Microbench and test seam: forces the tile depth.
 pub var qsa_attn_bk_override: ?c_int = null;
 pub var qsa_attn_balanced_override: ?bool = null;
 
-/// Threadgroup tile depth, `SUSHI_QSA_ATTN_BK` (default `QSA_ATTN_BK`). Must be a multiple
-/// of 8 (`KT = BK / 8`). A new value owes a re-run of the NSPLIT sweep.
+/// Threadgroup tile depth; a multiple of 8 (`KT = BK / 8`).
 pub fn qsaAttnBk() c_int {
-    const v = qsa_attn_bk_override orelse qsaAttnEnvInt(&qsa_attn_bk_env, "SUSHI_QSA_ATTN_BK", QSA_ATTN_BK);
+    const v = qsa_attn_bk_override orelse QSA_ATTN_BK;
     if (v <= 0 or @rem(v, 8) != 0 or v > 32) return QSA_ATTN_BK;
     return v;
 }
@@ -4937,14 +4712,7 @@ pub var qsa_attn_kernel_override: ?bool = null;
 var qsa_attn_kernel_env: ?bool = null;
 
 pub fn qsaAttnKernelEnabled() bool {
-    if (qsa_attn_kernel_override) |v| return v;
-    if (qsa_attn_kernel_env) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_ATTN_KERNEL") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_attn_kernel_env = v;
-    return v;
+    return qsa_attn_kernel_override orelse true;
 }
 
 /// Keyed on everything the config depends on and nothing else: `kv`/`kb` are runtime shapes,
@@ -5118,7 +4886,7 @@ pub fn qsaSparseAttn(
     if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
     const qs = mlx.getShape(q_rope);
     const seq_len = qs[2];
-    if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, qsaAttnMinS())) return null;
+    if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len)) return null;
     if (qs[0] != 1 or qs[3] != 256) return null;
     if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
     if (mlx.mlx_array_dtype(blocks) != .int32) return null;
@@ -5176,7 +4944,7 @@ pub fn qsaSparseAttn(
     const out = (try splitKAttnDispatch(s, q_rope, blocks, arrays, attn_scale, key)) orelse return null;
     if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len))) {
         log.info(
-            "[qsa-attn] engaged (S={d} kv={d} quant={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — SUSHI_QSA_ATTN_KERNEL=0 restores the union gather\n",
+            "[qsa-attn] engaged (S={d} kv={d} quant={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d})\n",
             .{ seq_len, kv, kv_view.bits, kv_view.group_size, gqa, key.bk, key.nsplit, seq_len * h_kv * key.nsplit },
         );
     }
@@ -5633,7 +5401,7 @@ pub fn qsaDecodeGatherAttn(
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
     if (qsa_engaged_bits.take(qsaEngagedBit(.decode_gather, qs[2]))) {
-        log.info("[qsa-decode-gather] engaged (S={d} kv={d} rows={d}) (SUSHI_QSA_DECODE_GATHER=0 restores the dense mask arm)\n", .{ qs[2], kv, gathered_len });
+        log.info("[qsa-decode-gather] engaged (S={d} kv={d} rows={d})\n", .{ qs[2], kv, gathered_len });
     }
     return out;
 }
@@ -5670,23 +5438,15 @@ pub const KvPrefixView = struct {
 
 
 pub var qsa_verify_gather_override: ?bool = null;
-var qsa_verify_gather_env_cached: ?bool = null;
 
 /// Verify-width QSA gather (2 <= S < FUSED256_MIN_Q_LEN — an MTP/DFlash
 /// verify block): read the UNION of the S rows' selections + the union tail
 /// instead of the whole cache under a dense [S, kv] mask. With `--kv-quant 8`
 /// the dense mask arm also dequantizes the whole stored range per layer per
 /// forward; this arm dequantizes only the gathered rows.
-/// SUSHI_QSA_VERIFY_GATHER=0 restores the dense mask arm.
+/// The override restores the dense mask arm.
 pub fn qsaVerifyGatherEnabled() bool {
-    if (qsa_verify_gather_override) |v| return v;
-    if (qsa_verify_gather_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_QSA_VERIFY_GATHER") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_verify_gather_env_cached = v;
-    return v;
+    return qsa_verify_gather_override orelse true;
 }
 
 /// The union is FIXED-size (S * budget blocks): at the production budget
@@ -5694,38 +5454,22 @@ pub fn qsaVerifyGatherEnabled() bool {
 /// rows while the mask arm reads the cache in place, so the copy only pays
 /// once the union is well under half the cache (M4 Max, S=7: gather loses 7%
 /// at 17k keys, breaks even at 34k). Quantized KV dequantizes only the
-/// gathered rows, so its floor stays lower. SUSHI_QSA_VERIFY_GATHER_MIN_KV
-/// sets ONE floor for both.
+/// gathered rows, so its floor stays lower.
 pub const QSA_VERIFY_GATHER_MIN_KV_DENSE: c_int = 32768;
 pub const QSA_VERIFY_GATHER_MIN_KV_QUANT: c_int = 16384;
-var qsa_verify_gather_min_kv_env: ?c_int = null;
-var qsa_verify_gather_min_kv_env_read = false;
 pub var qsa_verify_gather_min_kv_override: ?c_int = null;
 
 /// `quantized` = the arm will dequantize only the gathered rows, i.e. the
 /// view carries affine triples (`DenseKVView.has_quant_triple`).
 pub fn qsaVerifyGatherMinKvFor(quantized: bool) c_int {
     if (qsa_verify_gather_min_kv_override) |v| return v;
-    if (!qsa_verify_gather_min_kv_env_read) {
-        qsa_verify_gather_min_kv_env_read = true;
-        if (std.c.getenv("SUSHI_QSA_VERIFY_GATHER_MIN_KV")) |raw| {
-            qsa_verify_gather_min_kv_env = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch null;
-        }
-    }
-    if (qsa_verify_gather_min_kv_env) |v| return v;
     return if (quantized) QSA_VERIFY_GATHER_MIN_KV_QUANT else QSA_VERIFY_GATHER_MIN_KV_DENSE;
 }
 
 test "qsa verify gather floor: dense KV 32768, quantized 16384, override wins" {
     const prev_o = qsa_verify_gather_min_kv_override;
-    const prev_e = qsa_verify_gather_min_kv_env;
-    defer {
-        qsa_verify_gather_min_kv_override = prev_o;
-        qsa_verify_gather_min_kv_env = prev_e;
-    }
+    defer qsa_verify_gather_min_kv_override = prev_o;
     qsa_verify_gather_min_kv_override = null;
-    qsa_verify_gather_min_kv_env = null;
-    qsa_verify_gather_min_kv_env_read = true;
     try std.testing.expectEqual(@as(c_int, 32768), qsaVerifyGatherMinKvFor(false));
     try std.testing.expectEqual(@as(c_int, 16384), qsaVerifyGatherMinKvFor(true));
     qsa_verify_gather_min_kv_override = 4096;
@@ -6227,7 +5971,7 @@ pub fn qsaVerifyGatherAttn(
         try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q_rope, gk, gv, attn_scale, "array", add4, .{ .ctx = null }, false, s));
     }
     if (qsa_engaged_bits.take(qsaEngagedBit(.verify_gather, seq_len))) {
-        log.info("[qsa-verify-gather] engaged (S={d} kv={d} rows={d}) (SUSHI_QSA_VERIFY_GATHER=0 restores the dense mask arm)\n", .{ seq_len, kv, geom.rows });
+        log.info("[qsa-verify-gather] engaged (S={d} kv={d} rows={d})\n", .{ seq_len, kv, geom.rows });
     }
     return out;
 }
@@ -6693,21 +6437,6 @@ fn attnPdDispatch(
     return out;
 }
 
-/// Kill switch (SUSHI_SDPA_SPLIT=0). Test seam: `sdpa_split_override`
-/// forces the arm on/off without the environment.
-pub var sdpa_split_override: ?bool = null;
-var sdpa_split_env_cached: ?bool = null;
-fn sdpaSplitEnabled() bool {
-    if (sdpa_split_override) |v| return v;
-    if (sdpa_split_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_SDPA_SPLIT") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    sdpa_split_env_cached = v;
-    return v;
-}
-
 /// One engagement log per width (6..9): the first engagement is usually the
 /// warmup's own 8-token prefill (kL==qL==8) — a per-width line is what
 /// witnesses the split at REAL verify shapes in an A/B arm's log.
@@ -6775,7 +6504,6 @@ pub fn splitCausalSdpa(
     v: mlx.mlx_array,
     scale: f32,
 ) !?mlx.mlx_array {
-    if (!sdpaSplitEnabled()) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
@@ -6835,7 +6563,7 @@ pub fn splitCausalSdpa(
     const log_idx: usize = @intCast(qL - 6);
     if (!sdpa_split_logged[log_idx]) {
         sdpa_split_logged[log_idx] = true;
-        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d} (SUSHI_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, kL, qs[1], ks[1] });
+        log.info("[sdpa-split] engaged: qL={d} kL={d} Hq={d} Hkv={d}\n", .{ qL, kL, qs[1], ks[1] });
     }
     return out;
 }
@@ -6846,7 +6574,7 @@ var sdpa_mask_split_logged = false;
 /// vector kernel serves `qL * gqa <= 32` rows, anything wider (S >= 3 at
 /// gqa 12) and every array-masked qL 9..15 is the unfused fallback. Rows are
 /// independent under a per-row mask, so slice the block into vector-sized row
-/// groups. Kill switch shared with the causal split (SUSHI_SDPA_SPLIT=0).
+/// groups.
 pub fn splitMaskedSdpa256(
     s: mlx.mlx_stream,
     q: mlx.mlx_array,
@@ -6855,7 +6583,6 @@ pub fn splitMaskedSdpa256(
     scale: f32,
     mask: mlx.mlx_array,
 ) !?mlx.mlx_array {
-    if (!sdpaSplitEnabled()) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(mask) != 4) return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
@@ -6895,7 +6622,7 @@ pub fn splitMaskedSdpa256(
     try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 2, s));
     if (!sdpa_mask_split_logged) {
         sdpa_mask_split_logged = true;
-        log.info("[sdpa-split] masked arm engaged: qL={d} kL={d} gqa={d} rows/group={d} (SUSHI_SDPA_SPLIT=0 restores the single dispatch)\n", .{ qL, ks[2], gqa, group });
+        log.info("[sdpa-split] masked arm engaged: qL={d} kL={d} gqa={d} rows/group={d}\n", .{ qL, ks[2], gqa, group });
     }
     return out;
 }
@@ -7085,18 +6812,6 @@ pub fn slidingTailSpan(window: u32, q_len: usize, max_width: usize) u32 {
     return window + @as(u32, @intCast(q_len)) - 1;
 }
 
-/// Kill switch for the block-width half of the trim (SUSHI_SLIDING_BLOCK_TRIM=0
-/// pins every multi-token forward back to the untrimmed view). Decode-width
-/// trimming is unconditional and predates this.
-var sliding_block_trim_cached: ?bool = null;
-pub fn slidingBlockTrimEnabled() bool {
-    if (sliding_block_trim_cached) |v| return v;
-    const raw = std.c.getenv("SUSHI_SLIDING_BLOCK_TRIM");
-    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    sliding_block_trim_cached = on;
-    return on;
-}
-
 /// What a sliding layer's K/V view looks like for THIS forward: the `max_kv`
 /// to hand `KVCache.update`, the length the view will actually have, and
 /// whether the fused hd-256 kernel is the thing doing the band masking.
@@ -7136,21 +6851,17 @@ pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) 
     // and then fell through to the explicit-mask path anyway — gemma got
     // nothing from the trim at all.
     const band = fused256Enabled() and cfg.head_dim == 256 and seq_len >= FUSED256_MIN_Q_LEN;
-    // A ringed arch does not get to decline the block trim: the rows below the
-    // span are no longer in the cache, so an untrimmed view would be a lie.
-    const rings = cfg.swaRingTokens() > 0;
-    const width: usize = if (band or (!slidingBlockTrimEnabled() and !rings)) 1 else SLIDING_TRIM_UNBOUNDED;
+    const width: usize = if (band) 1 else SLIDING_TRIM_UNBOUNDED;
     const span: u32 = if (cfg.has_sliding_window)
         slidingTailSpan(cfg.sliding_window, @intCast(seq_len), width)
     else
         0;
     const kv_len: c_int = if (span > 0) @min(total_kv, @as(c_int, @intCast(span))) else total_kv;
-    // One-shot: an A/B arm is proven by an engagement line in its own log, not
-    // by the env it was launched with. Fires only when the BLOCK half of the
-    // trim did something — decode has always trimmed to the window.
+    // One-shot: fires only when the BLOCK half of the trim did something — decode has always
+    // trimmed to the window.
     if (!sliding_block_trim_logged and span > cfg.sliding_window and kv_len < total_kv) {
         sliding_block_trim_logged = true;
-        log.info("[sliding] block trim engaged: window={d} q_len={d} span={d} kv={d} of {d} (SUSHI_SLIDING_BLOCK_TRIM=0 restores the untrimmed view)\n", .{ cfg.sliding_window, seq_len, span, kv_len, total_kv });
+        log.info("[sliding] block trim engaged: window={d} q_len={d} span={d} kv={d} of {d}\n", .{ cfg.sliding_window, seq_len, span, kv_len, total_kv });
     }
     return .{ .span = span, .kv_len = kv_len, .band_in_kernel = band };
 }
@@ -7450,8 +7161,7 @@ pub const KVCache = struct {
     /// PURE: the capacity the K/V buffers must be grown to so `needed` tokens
     /// fit.
     ///
-    /// Growing by a fixed `chunk_step` (the pre-#110 policy, still reachable
-    /// with `linear = true`) means one grow-copy-free every 256 tokens, and
+    /// Growing by a fixed `chunk_step` (the pre-#110 policy) means one grow-copy-free every 256 tokens, and
     /// every superseded buffer is orphaned: MLX only reuses a cached buffer
     /// when `cached_size < requested + 2*page_size` (`buffer_cache.h`), and the
     /// next KV buffer is a full chunk past that ~32 KB tolerance. On a 64
@@ -7462,18 +7172,16 @@ pub const KVCache = struct {
     /// Proportional growth (+25%, floored at one chunk, capped at
     /// `max_grow_tokens`) turns that into ~27 growth events over a 100 K-token
     /// walk instead of 391.
-    pub fn nextCapacityPolicy(current_cap: usize, needed: usize, linear: bool) usize {
+    pub fn nextCapacityPolicy(current_cap: usize, needed: usize) usize {
         if (needed <= current_cap) return current_cap;
-        const target = if (linear) needed else blk: {
-            const grow = @min(@max(current_cap / 4, chunk_step), max_grow_tokens);
-            break :blk @max(needed, current_cap + grow);
-        };
+        const grow = @min(@max(current_cap / 4, chunk_step), max_grow_tokens);
+        const target = @max(needed, current_cap + grow);
         const n_chunks = (target + chunk_step - 1) / chunk_step;
         return n_chunks * chunk_step;
     }
 
     fn nextCapacity(current_cap: usize, needed: usize) usize {
-        return nextCapacityPolicy(current_cap, needed, kvGrowLinear());
+        return nextCapacityPolicy(current_cap, needed);
     }
 
     /// Tokens of capacity a request reserves: prompt + allowed generation + one chunk of slack.
@@ -7501,26 +7209,9 @@ pub const KVCache = struct {
     /// How many times a KV capacity buffer actually grew (the moments a second copy of the whole cache exists).
     pub var kv_cap_buf_grows: usize = 0;
 
-    /// Ask this cache to hold `tokens` up front. Idempotent and monotone. `SUSHI_KV_RESERVE=0` restores proportional growth.
+    /// Ask this cache to hold `tokens` up front. Idempotent and monotone.
     pub fn reserve(self: *KVCache, tokens: usize) void {
-        if (!kvReserveEnabled()) return;
         if (tokens > self.reserve_tokens) self.reserve_tokens = tokens;
-    }
-
-    /// Is the up-front reservation on (`SUSHI_KV_RESERVE` != 0)?
-    pub fn kvReservationEnabled() bool {
-        return kvReserveEnabled();
-    }
-
-    var kv_reserve_cache: ?bool = null;
-    fn kvReserveEnabled() bool {
-        if (kv_reserve_cache) |v| return v;
-        var on = true;
-        if (std.c.getenv("SUSHI_KV_RESERVE")) |p| {
-            on = !std.mem.eql(u8, std.mem.span(p), "0");
-        }
-        kv_reserve_cache = on;
-        return on;
     }
 
     /// The capacity a grow takes: the proportional policy, raised to the reservation when there is one.
@@ -7561,19 +7252,6 @@ pub const KVCache = struct {
             try mlx.check(mlx.mlx_eval(vec));
             _ = mlx.mlx_clear_cache();
         }
-    }
-
-    /// Kill-switch for the growth policy: `SUSHI_KV_GROW=linear` restores
-    /// the pre-#110 fixed +256 growth for same-boot A/Bs.
-    var kv_grow_linear_cache: ?bool = null;
-    fn kvGrowLinear() bool {
-        if (kv_grow_linear_cache) |v| return v;
-        var linear = false;
-        if (std.c.getenv("SUSHI_KV_GROW")) |p| {
-            linear = std.mem.eql(u8, std.mem.span(p), "linear");
-        }
-        kv_grow_linear_cache = linear;
-        return linear;
     }
 
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
@@ -8645,7 +8323,7 @@ const QsaKeyAppendPlan = struct { new_cap: usize, write_at: usize, new_rows: usi
 fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, reserve: usize) QsaKeyAppendPlan {
     const need = rows + add;
     // A reservation raises the first grow to the whole request; past it the proportional policy takes over.
-    const grown = if (need <= cap) cap else @max(KVCache.nextCapacityPolicy(cap, need, false), reserve);
+    const grown = if (need <= cap) cap else @max(KVCache.nextCapacityPolicy(cap, need), reserve);
     return .{
         .new_cap = grown,
         .write_at = rows,
@@ -8662,7 +8340,6 @@ pub var qsa_history_seeds: usize = 0;
 
 /// Ask every live entry's QSA history to hold `tokens` rows up front (same lever as `KVCache.reserve`).
 pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, tokens: usize) void {
-    if (!KVCache.kvReserveEnabled()) return;
     const es = entries orelse return;
     for (es) |*e| {
         if (tokens > e.qsa_reserve_rows) e.qsa_reserve_rows = tokens;
@@ -12620,8 +12297,6 @@ fn qsaSourceHoldsRowsAt(src: *const SSMCheckpoint, pos: c_int, want: c_int) bool
 /// handoff attaches while the live history is ahead of the last stride
 /// snap). Older snaps in `cps` drop any history they carried. No-op when
 /// `cps` is empty or no layer holds QSA history.
-///
-/// The `SUSHI_QSA_HISTORY_SHARE=0` arm: the copy coexists with the live buffer for the whole decode.
 pub fn attachQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
     return attachQsaHistoryToLatestMode(cps, live, s, .copy);
 }
@@ -12635,14 +12310,6 @@ pub const QSA_HANDOFF_MAX_SLACK_ROWS: c_int = 16384;
 /// after, so the entry ends up the buffer's only owner. Too much slack materializes instead.
 pub fn handoffQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
     return attachQsaHistoryToLatestMode(cps, live, s, .share);
-}
-
-/// Every "the slot is about to die" seam: share when the switch is on, copy otherwise.
-pub fn attachQsaHistoryOnHandoff(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
-    return if (qsaHistoryShareEnabled())
-        handoffQsaHistoryToLatest(cps, live, s)
-    else
-        attachQsaHistoryToLatest(cps, live, s);
 }
 
 pub const QsaAttachMode = enum { copy, share };
@@ -23853,21 +23520,9 @@ fn decodeAttnQuantEligible(w_shape: []const c_int, dtype: mlx.mlx_dtype, has_sca
 // `mlx_fast_rope` at the token's offset) extracts the exact floats the stock
 // kernel would use, cached per rope family for the forward (2 probe
 // dispatches replace ~160 removed ones). Bit-identity with the composed
-// chain is the acceptance bar (`qk norm rope fused` parity tests); kill
-// switch SUSHI_QK_NORM_ROPE_FUSED=0.
+// chain is the acceptance bar (`qk norm rope fused` parity tests).
 var qk_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qk_fused_engaged: bool = false;
-pub var qk_fused_override: ?bool = null;
-var qk_fused_env: ?bool = null;
-
-pub fn qkNormRopeFusedEnabled() bool {
-    if (qk_fused_override) |v| return v;
-    if (qk_fused_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_QK_NORM_ROPE_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    qk_fused_env = enabled;
-    return enabled;
-}
 
 // The RMS half mirrors `rms_single_row` at axis 128 / N_READS 4 / one
 // simdgroup (lane l owns [4l, 4l+4), f32 squares in index order, `simd_sum`,
@@ -23946,13 +23601,6 @@ const QkFusedCfgKey = struct { hq: c_int, hk: c_int, rd: c_int, scaled: bool, dt
 var qk_fused_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var qk_fused_cfg_key: QkFusedCfgKey = std.mem.zeroes(QkFusedCfgKey);
 
-/// True when the fused QK-norm+RoPE lever is on — exported so an out-of-file
-/// caller (tts.zig's talker) can skip building the angles row when the kill
-/// switch (SUSHI_QK_NORM_ROPE_FUSED=0) has it declined anyway.
-pub fn qkNormRopeFusedWanted() bool {
-    return qkNormRopeFusedEnabled();
-}
-
 /// One fused dispatch: per-head RMSNorm + RoPE (+ optional mscale) for q AND
 /// k, emitting the transposed [1,H,1,128] layout attention consumes (at L==1
 /// that is the flat buffer relabeled, so the transposes vanish too).
@@ -23971,7 +23619,6 @@ pub fn fusedQkNormRope(
     hk: c_int,
     rd: c_int,
 ) !?[2]mlx.mlx_array {
-    if (!qkNormRopeFusedEnabled()) return null;
     const dt = mlx.mlx_array_dtype(q_flat);
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_flat) != .bfloat16) return null;
     // rd=32 is the qwen3.5/3.6 partial-rotary geometry (0.25 x 128); the
@@ -24106,8 +23753,7 @@ pub fn ropeAngleRows(
 // Output is head-major [B,H,S,D], so the transposes vanish. Covers S 1..32
 // (verify widths + one-chunk tiny-prompt prefills; challenge raised the same
 // gate 16 -> 32 in 033f622).
-// Bit-identity with the composed chain is the acceptance bar; same kill
-// switch as the 128 kernel (SUSHI_QK_NORM_ROPE_FUSED=0).
+// Bit-identity with the composed chain is the acceptance bar.
 const QK_NORM_ROPE_256_SOURCE =
     \\constexpr uint HD = 256;
     \\constexpr uint half_rd = uint(RD) / 2;
@@ -24188,9 +23834,9 @@ const QK_NORM_ROPE_256_SOURCE =
 // S < 3 rows of the next conv state come from the OLD state (row r reads
 // concat(conv_state, qkv)[r + S]); before this generalization the kernel
 // was gated to S >= 3 and decode ran the composed chain. Bit-identity with
-// the composed chain is the acceptance bar; kill switches
-// SUSHI_GDN_PREWORK=0 (whole kernel) and SUSHI_GDN_DECODE_FUSED=0
-// (S < 3, in-kernel gate, norm-gate: the pre-fusion decode path).
+// the composed chain is the acceptance bar. Test seams `gdn_prework_override` (whole kernel)
+// and `gdn_decode_fused_override` (S < 3, in-kernel gate, norm-gate: the pre-fusion decode
+// path) select the composed chain.
 pub const GDN_KERNEL_HEADER =
     \\inline float sushi_log1p(float x) {
     \\    float xp1 = 1.0f + x;
@@ -24299,29 +23945,17 @@ const GDN_PREWORK_SOURCE =
 var gdn_prework_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gdn_prework_engaged: bool = false;
 pub var gdn_prework_override: ?bool = null; // test seam
-var gdn_prework_env: ?bool = null;
 
 fn gdnPreworkEnabled() bool {
-    if (gdn_prework_override) |v| return v;
-    if (gdn_prework_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_GDN_PREWORK");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gdn_prework_env = enabled;
-    return enabled;
+    return gdn_prework_override orelse true;
 }
 
 pub var gdn_decode_fused_override: ?bool = null; // test seam
-var gdn_decode_fused_env: ?bool = null;
 
 /// The decode-width GDN fusions (prework at S < 3, in-kernel gate/beta, the
 /// norm-gate epilogue). Off = the pre-fusion decode path, op for op.
 pub fn gdnDecodeFusedEnabled() bool {
-    if (gdn_decode_fused_override) |v| return v;
-    if (gdn_decode_fused_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_GDN_DECODE_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gdn_decode_fused_env = enabled;
-    return enabled;
+    return gdn_decode_fused_override orelse true;
 }
 
 pub var gdn_decode_recur_override: ?bool = null; // test and fwd-ubench arm seam
@@ -24382,18 +24016,12 @@ pub const GdnPrework = struct {
 pub const GDN_FUSED_MAX_ROWS: c_int = 16;
 
 var gdn_prefill_fused_override: ?bool = null;
-var gdn_prefill_fused_env: ?bool = null;
 var gdn_prefill_engaged = false;
 var gdn_state_f32_logged = false;
 
 fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@import("hc_prefill.zig").max_seq, batch)) return false;
-    if (gdn_prefill_fused_override) |on| return on;
-    if (gdn_prefill_fused_env) |on| return on;
-    const raw = std.c.getenv("SUSHI_GDN_PREFILL_FUSED");
-    const on = raw == null or !std.mem.eql(u8, std.mem.span(raw.?), "0");
-    gdn_prefill_fused_env = on;
-    return on;
+    return gdn_prefill_fused_override orelse true;
 }
 
 /// Inputs of the packed prework. `qkv`/`b`/`a` are read at `(off, stride)`
@@ -24823,7 +24451,6 @@ pub fn fusedQkNormRope256(
     seq: c_int,
     rd: c_int,
 ) !?[2]mlx.mlx_array {
-    if (!qkNormRopeFusedEnabled()) return null;
     if (seq < 1 or seq > 32) return null;
     const dt = mlx.mlx_array_dtype(q_in);
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_in) != .bfloat16) return null;
@@ -35061,8 +34688,6 @@ test "fused hyper-connection read keeps one config set per row count, inject and
     // them builds nothing after the first pass.
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    qwen4_hc.hc_fused_override = true;
-    defer qwen4_hc.hc_fused_override = null;
     const HC: c_int = 4;
     const H: c_int = 512;
     const K: c_int = HC * H;
@@ -35133,8 +34758,6 @@ test "fused hyper-connection read matches the op chain per element" {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x4C0FFEE);
     const rnd = prng.random();
-    qwen4_hc.hc_fused_override = true;
-    defer qwen4_hc.hc_fused_override = null;
 
     const HC: c_int = 4;
     const H: c_int = 512;
@@ -39042,19 +38665,16 @@ test "GDN pipelined route: defaults, overrides, eligibility and kill switch" {
     const saved_pipeline = gdn_pipelined_override;
     const saved_env = gdn_pipelined_env;
     const saved_nax = vqmm_nax_probe_override;
-    const saved_tb = gdn_block_t_cached;
     defer {
         gdn_blocked_override = saved_blocked;
         gdn_pipelined_override = saved_pipeline;
         gdn_pipelined_env = saved_env;
         vqmm_nax_probe_override = saved_nax;
-        gdn_block_t_cached = saved_tb;
     }
     gdn_blocked_override = true;
     gdn_pipelined_override = null;
     gdn_pipelined_env = @as(?[]const u8, null);
     vqmm_nax_probe_override = true;
-    gdn_block_t_cached = 32;
     try testing.expectEqual(GdnRoute.pipelined, gdnPrefillRoute("qwen4_exp", 64, 128, 128, 2, 4, false, 2).route);
     for ([_][]const u8{ "mimo_v2", "qwen3_5", "qwen3_5_moe" }) |model_type| {
         try testing.expectEqual(GdnRoute.blocked, gdnPrefillRoute(model_type, 64, 128, 128, 2, 4, false, 2).route);
@@ -42832,7 +42452,6 @@ test "sushi_attn_pd every arm: a chunked dispatch chain is bit-identical to one 
 
 test "sushi_attn_pd_nax takes a 4x dispatch budget: fewer key chunks than the SIMD kernel" {
     if (mlx.noGpuBackend() or !verifyQmmNaxAvailable() or !qsaNaxOsOk()) return error.SkipZigTest;
-    if (std.c.getenv("SUSHI_FUSED_256_BUDGET") != null) return error.SkipZigTest;
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
@@ -42889,12 +42508,6 @@ test "sushi_attn_pd_nax: rows that start off an 8-byte boundary give the bytes o
     defer _ = mlx.mlx_array_free(got);
     try std.testing.expectEqual(AttnPdArm.nax, attn_pd_last_arm);
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(got, want, s));
-}
-
-test "attnPdNaxEnabledFrom: absent or anything but 0 keeps the NAX arm" {
-    try std.testing.expect(attnPdNaxEnabledFrom(null));
-    try std.testing.expect(attnPdNaxEnabledFrom("1"));
-    try std.testing.expect(!attnPdNaxEnabledFrom("0"));
 }
 
 test "sushi_attn_pd_nax: a failed probe declines to the SIMD kernel by name" {
@@ -43487,8 +43100,6 @@ test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ra
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    qsa_fused_override = true;
-    defer qsa_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x45a45a);
     const rnd = prng.random();
 
@@ -43510,13 +43121,11 @@ test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ra
     defer _ = mlx.mlx_array_free(ref);
     try std.testing.expect(try attn256MaxDiff(fused, ref, s) < 0.005);
 
-    // Wrong mask shape declines; a shape-valid mask under the kill switch too.
+    // Wrong mask shape declines.
     const bad_shape = [_]c_int{ 1, 1, 70, 192 };
     const bad = try attn256RandBf16(rnd, &bad_shape, s);
     defer _ = mlx.mlx_array_free(bad);
     try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, bad)) == null);
-    qsa_fused_override = false;
-    try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, mask)) == null);
 }
 
 /// A materialized `[B,H,T,264]` padded cache sliced on the last axis to `[lo, lo+256)`: a 256-wide view whose
@@ -43544,8 +43153,6 @@ test "fusedSdpa256Masked: an unaligned last-axis slice declines and the fallback
     const s = mlx.gpuStream();
     fused256_override = true;
     defer fused256_override = null;
-    qsa_fused_override = true;
-    defer qsa_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x5E7_5E7);
     const rnd = prng.random();
 
@@ -43597,7 +43204,6 @@ test "gatherQsa256: an unaligned last-axis slice declines and the fallback reads
     defer qsa_gather_override = null;
     qsa_nax_override = false;
     defer qsa_nax_override = null;
-    defer qsa_gather_bk_override = null;
     var prng = std.Random.DefaultPrng.init(0x0FF_5E7);
     const rnd = prng.random();
 
@@ -43943,16 +43549,13 @@ fn qsaBoostLastTileK(
 
 test "qsa prefill floor: NAX serving, widths, unavailable hardware and explicit overrides" {
     const expect = std.testing.expectEqual;
-    try expect(@as(c_int, 2052), qsaPrefillGatherMinKvFrom(16, true, null, null));
-    try expect(@as(c_int, 2052), qsaPrefillGatherMinKvFrom(8192, true, null, null));
+    try expect(@as(c_int, 2052), qsaPrefillGatherMinKvFrom(16, true, null));
+    try expect(@as(c_int, 2052), qsaPrefillGatherMinKvFrom(8192, true, null));
     for ([_]c_int{ 1, 2, 4, 15 }) |width| {
-        try expect(@as(c_int, 8192), qsaPrefillGatherMinKvFrom(width, true, null, null));
+        try expect(@as(c_int, 8192), qsaPrefillGatherMinKvFrom(width, true, null));
     }
-    try expect(@as(c_int, 8192), qsaPrefillGatherMinKvFrom(16, false, null, null));
-    try expect(@as(c_int, 5000), qsaPrefillGatherMinKvFrom(16, true, "5000", null));
-    try expect(@as(c_int, 0), qsaPrefillGatherMinKvFrom(16, true, "0", null));
-    try expect(@as(c_int, 8192), qsaPrefillGatherMinKvFrom(16, true, "invalid", null));
-    try expect(@as(c_int, 4096), qsaPrefillGatherMinKvFrom(16, true, "5000", 4096));
+    try expect(@as(c_int, 8192), qsaPrefillGatherMinKvFrom(16, false, null));
+    try expect(@as(c_int, 4096), qsaPrefillGatherMinKvFrom(16, true, 4096));
 }
 
 test "qsaNaxEnabledFrom: on by default, SUSHI_QSA_NAX=0 restores the stock gather" {
@@ -43995,7 +43598,6 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
     const s = mlx.gpuStream();
     qsa_gather_override = true;
     defer qsa_gather_override = null;
-    defer qsa_gather_bk_override = null;
     var prng = std.Random.DefaultPrng.init(0x9a7e);
     const rnd = prng.random();
 
@@ -44337,13 +43939,12 @@ test "naxArchSupportedFrom: desktop gen>=17, phone gen>=18" {
     try std.testing.expect(!naxArchSupportedFrom(""));
 }
 
-test "gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask (gqa 12, sentinel rows, 16/32 key tiles)" {
+test "gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the expanded mask (gqa 12, sentinel rows)" {
     const s = mlx.gpuStream();
     qsa_gather_override = true;
     defer qsa_gather_override = null;
     qsa_nax_override = false;
     defer qsa_nax_override = null;
-    defer qsa_gather_bk_override = null;
     var prng = std.Random.DefaultPrng.init(0x9a7e);
     const rnd = prng.random();
 
@@ -44366,13 +43967,10 @@ test "gatherQsa256: block-gathered QSA parity vs composed 'array' SDPA over the 
 
     const ref = try attn256Reference(q, k, v, scale, "array", fx.mask, s);
     defer _ = mlx.mlx_array_free(ref);
-    for ([_]c_int{ 16, 32 }) |bk| {
-        qsa_gather_bk_override = bk;
-        const out = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
-        defer _ = mlx.mlx_array_free(out);
-        try std.testing.expect(!qsa_gather_used_nax);
-        try std.testing.expect(try attn256MaxDiff(out, ref, s) < 0.005);
-    }
+    const out = (try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(out);
+    try std.testing.expect(!qsa_gather_used_nax);
+    try std.testing.expect(try attn256MaxDiff(out, ref, s) < 0.005);
 
     // The production expansion (fallback arm + fixture trace) is the same mask.
     const expanded = try qsaMaskFromBlocks(s, fx.blocks, kL, 4);
@@ -45337,9 +44935,6 @@ test "qsa sparse attn: dense and affine strided caches retain the reference erro
     var prng = std.Random.DefaultPrng.init(0x5A17_C0DE);
     const rnd = prng.random();
 
-    qsa_attn_min_s_override = 1;
-    defer qsa_attn_min_s_override = null;
-
     const cases = [_]struct { s: c_int, kv: c_int, kb: c_int, hq: c_int, hkv: c_int }{
         // Decode width: NSPLIT hits the ceiling, most splits are empty.
         .{ .s = 1, .kv = 4096, .kb = 64, .hq = 24, .hkv = 2 },
@@ -45666,45 +45261,6 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     qsa_attn_balanced_override = true;
     try std.testing.expectEqual(true, qsaAttnBalanced());
     qsa_attn_balanced_override = null;
-
-    defer qsa_attn_min_s_override = null;
-    qsa_attn_min_s_override = null;
-    try std.testing.expectEqual(@as(c_int, 1), QSA_ATTN_MIN_S_DEFAULT);
-    try std.testing.expectEqual(@as(c_int, 1), qsaAttnMinS());
-    qsa_attn_min_s_override = 1;
-    try std.testing.expectEqual(@as(c_int, 1), qsaAttnMinS());
-}
-
-test "qsa dispatch: each arm's width floor is its own (MIN_S never moves the union gather)" {
-    // `SUSHI_QSA_ATTN_MIN_S` narrows the fused kernel and must not decide what serves the
-    // widths it gives up. Modelled as the dispatch's own predicates.
-    const Arm = enum { fused, decode_gather, union_gather, packed_gather, dense_gather };
-    const pick = struct {
-        fn f(quant: bool, seq_len: c_int, min_s: c_int) Arm {
-            if (qsaSparseAttnServes(quant, seq_len, min_s)) return .fused;
-            if (seq_len == 1) return .decode_gather;
-            if (seq_len >= 2 and seq_len < FUSED256_MIN_Q_LEN) return .union_gather;
-            return if (quant) .packed_gather else .dense_gather;
-        }
-    }.f;
-
-    try std.testing.expectEqual(Arm.fused, pick(true, 1, QSA_ATTN_MIN_S_DEFAULT));
-    for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.fused, pick(true, sq, QSA_ATTN_MIN_S_DEFAULT));
-    // Past 15 a packed cache stays on packed arms; a dense one gathers from the cache itself.
-    try std.testing.expectEqual(Arm.fused, pick(true, FUSED256_MIN_Q_LEN, QSA_ATTN_MIN_S_DEFAULT));
-    try std.testing.expectEqual(Arm.packed_gather, pick(true, QSA_ATTN_PACKED_MAX_S + 1, QSA_ATTN_MIN_S_DEFAULT));
-    try std.testing.expectEqual(Arm.dense_gather, pick(false, FUSED256_MIN_Q_LEN, QSA_ATTN_MIN_S_DEFAULT));
-
-    // MIN_S=6: S=2..5 must land on the union gather, never on the dense mask.
-    try std.testing.expectEqual(Arm.decode_gather, pick(true, 1, 6));
-    for ([_]c_int{ 2, 3, 4, 5 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(true, sq, 6));
-    for ([_]c_int{ 6, 15 }) |sq| try std.testing.expectEqual(Arm.fused, pick(true, sq, 6));
-
-    try std.testing.expectEqual(Arm.fused, pick(true, 1, 1));
-
-    const off = FUSED256_MIN_Q_LEN;
-    try std.testing.expectEqual(Arm.decode_gather, pick(true, 1, off));
-    for ([_]c_int{ 2, 3, 6, 15 }) |sq| try std.testing.expectEqual(Arm.union_gather, pick(true, sq, off));
 }
 
 test "qsa packed gather: serves while each packed row is staged at most 4 times (the measured crossover)" {
@@ -45717,14 +45273,12 @@ test "qsa packed gather: serves while each packed row is staged at most 4 times 
 }
 
 test "qsa dispatch: dense and quantized decode and verify share the same row body" {
-    const min_s = QSA_ATTN_MIN_S_DEFAULT;
     for ([_]bool{ false, true }) |quant| {
-        for (1..16) |width| try std.testing.expect(qsaSparseAttnServes(quant, @intCast(width), min_s));
-        try std.testing.expect(!qsaSparseAttnServes(quant, 0, min_s));
-        try std.testing.expect(!qsaSparseAttnServes(quant, 1, 2));
-        try std.testing.expectEqual(quant, qsaSparseAttnServes(quant, FUSED256_MIN_Q_LEN, min_s));
-        try std.testing.expectEqual(quant, qsaSparseAttnServes(quant, QSA_ATTN_PACKED_MAX_S, min_s));
-        try std.testing.expect(!qsaSparseAttnServes(quant, QSA_ATTN_PACKED_MAX_S + 1, min_s));
+        for (1..16) |width| try std.testing.expect(qsaSparseAttnServes(quant, @intCast(width)));
+        try std.testing.expect(!qsaSparseAttnServes(quant, 0));
+        try std.testing.expectEqual(quant, qsaSparseAttnServes(quant, FUSED256_MIN_Q_LEN));
+        try std.testing.expectEqual(quant, qsaSparseAttnServes(quant, QSA_ATTN_PACKED_MAX_S));
+        try std.testing.expect(!qsaSparseAttnServes(quant, QSA_ATTN_PACKED_MAX_S + 1));
     }
 }
 
@@ -46137,8 +45691,6 @@ fn qsaWideUbench(kvs: []const c_int, widths: []const c_int, arms_run: []const Qs
 
 test "splitMaskedSdpa256: verify-width array-mask rows split through the vector kernel match one dispatch" {
     const s = mlx.gpuStream();
-    sdpa_split_override = true;
-    defer sdpa_split_override = null;
     var prng = std.Random.DefaultPrng.init(0x5b5b);
     const rnd = prng.random();
     // gqa 12 like qwen4_exp (24/2): qL 4 is the unfused fallback in stock MLX.
@@ -46269,7 +45821,7 @@ test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" 
     // preemption class — with the kv-chunk dispatch budget it wins live
     // (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6% at 8K/16K/32K on the
     // 27B), so causal is default-on now.
-    // SUSHI_FUSED_256_CAUSAL=0 restores composed causal.
+    // SUSHI_FUSED_256=0 restores composed causal.
     std.debug.assert(fused256_override == null);
     const q_shape = [_]c_int{ 1, 6, 64, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -46480,9 +46032,6 @@ fn attn256FiniteMaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !
 test "causal verify attention rows are bit-identical to decode at Qwen3.8 geometry" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
-    const old = sdpa_split_override;
-    sdpa_split_override = true;
-    defer sdpa_split_override = old;
     for ([_]KVQuantConfig{ KVQuantConfig.dense, KVQuantConfig.affine(8) }) |config| {
         for ([_]c_int{ 37, 253, 1022, 2045, 8190 }) |prefix| {
             for (2..9) |wi| {
@@ -46530,8 +46079,6 @@ test "causal verify attention rows are bit-identical to decode at Qwen3.8 geomet
 
 test "splitCausalSdpa: parity vs single causal sdpa at every verify width (q 6..9)" {
     const s = mlx.gpuStream();
-    sdpa_split_override = true;
-    defer sdpa_split_override = null;
     var prng = std.Random.DefaultPrng.init(0x5D9A);
     const rnd = prng.random();
 
@@ -46564,8 +46111,6 @@ test "splitCausalSdpa: parity vs single causal sdpa at every verify width (q 6..
 
 test "splitCausalSdpa: declines outside its envelope" {
     const s = mlx.gpuStream();
-    sdpa_split_override = true;
-    defer sdpa_split_override = null;
     var prng = std.Random.DefaultPrng.init(0x5DEC);
     const rnd = prng.random();
 
@@ -46609,10 +46154,6 @@ test "splitCausalSdpa: declines outside its envelope" {
     const q7 = try attn256RandBf16(rnd, &q7_shape, s);
     defer _ = mlx.mlx_array_free(q7);
     try std.testing.expect((try splitCausalSdpa(s, q7, kshort, kshort, 1.0)) == null);
-
-    // Kill switch -> null even for a conforming call.
-    sdpa_split_override = false;
-    try std.testing.expect((try splitCausalSdpa(s, q7, k, k, 1.0)) == null);
 }
 
 // ── KV cache growth policy (issue #110) ──────────────────────────────────────
@@ -46629,13 +46170,13 @@ test "KVCache growth strands bounded bytes" {
     // per 256 generated tokens.
     const walk = struct {
         const Result = struct { events: usize, superseded: usize, final: usize };
-        fn run(linear: bool) Result {
+        fn run() Result {
             var cap: usize = 0;
             var events: usize = 0;
             var superseded: usize = 0;
             var n: usize = 1;
             while (n <= 100_000) : (n += 1) {
-                const next = KVCache.nextCapacityPolicy(cap, n, linear);
+                const next = KVCache.nextCapacityPolicy(cap, n);
                 if (next != cap) {
                     events += 1;
                     superseded += cap;
@@ -46646,16 +46187,10 @@ test "KVCache growth strands bounded bytes" {
         }
     };
 
-    const prop = walk.run(false);
+    const prop = walk.run();
     try testing.expect(prop.final >= 100_000);
     try testing.expect(prop.events <= 40);
     try testing.expect(prop.superseded <= 8 * prop.final);
-
-    // The linear policy the kill-switch keeps reachable, for contrast — these
-    // are the numbers the fix is measured against.
-    const lin = walk.run(true);
-    try testing.expectEqual(@as(usize, 391), lin.events);
-    try testing.expect(lin.superseded > 100 * lin.final);
 }
 
 test "KV growth does not ratchet the MLX buffer pool" {
@@ -46668,9 +46203,8 @@ test "KV growth does not ratchet the MLX buffer pool" {
     // 4 layers x 2 kv heads x 64 head_dim, bf16 = 2 KiB per token across all K
     // and V buffers. Under the old +256 policy the walk to 20_000 allocates
     // ~810_000 token-slots and frees all but the last ≈ 41 MB. Measured peak
-    // pool: 1544 MB linear vs 274 MB proportional (`SUSHI_KV_GROW=linear`
-    // reproduces the former), so the bar sits between them with ~2x margin
-    // either side rather than on top of the passing number.
+    // pool: 1544 MB linear vs 274 MB proportional, so the bar sits between them
+    // with ~2x margin either side rather than on top of the passing number.
     const s = mlx.gpuStream();
     const LAYERS: u32 = 4;
     const N: usize = 20_000;
@@ -47669,8 +47203,6 @@ fn qkComposedRef(
 
 test "qk norm rope fused: bit-identical at the qwen geometry (rd=32, strided post-split q)" {
     const s = mlx.gpuStream();
-    qk_fused_override = true;
-    defer qk_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x40FD);
     const rnd = prng.random();
 
@@ -48914,8 +48446,6 @@ test "gdn state f32: prefill, decode, a restored bf16 state and verify capture a
 
 test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 incl. strided q" {
     const s = mlx.gpuStream();
-    qk_fused_override = true;
-    defer qk_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x256A);
     const rnd = prng.random();
 
@@ -48977,8 +48507,6 @@ test "qk norm rope fused hd-256: bit-identical at qwen 24q/4kv rd=64, S 1..16 in
 
 test "qk norm rope fused: bit-identical to the composed chain (sliding, rd=128)" {
     const s = mlx.gpuStream();
-    qk_fused_override = true;
-    defer qk_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x40FE);
     const rnd = prng.random();
 
@@ -49021,8 +48549,6 @@ test "qk norm rope fused: bit-identical to the composed chain (sliding, rd=128)"
 
 test "qk norm rope fused: bit-identical incl. YaRN freqs + mscale (rd=64)" {
     const s = mlx.gpuStream();
-    qk_fused_override = true;
-    defer qk_fused_override = null;
     var prng = std.Random.DefaultPrng.init(0x40FF);
     const rnd = prng.random();
 
@@ -49254,13 +48780,6 @@ test "spliceVisionRows: video placeholders are scattered like image rows (Qwen v
     try std.testing.expectEqual(@as(f32, 0), ptr[4]); // text untouched
     try std.testing.expectEqual(@as(f32, 51), ptr[8]); // video row 1
     try std.testing.expectEqual(@as(f32, 52), ptr[12]); // video row 2
-}
-
-test "naxSdpaPreferredFrom: default follows NAX availability, SUSHI_NAX_SDPA overrides both ways" {
-    try testing.expect(naxSdpaPreferredFrom(true, null));
-    try testing.expect(!naxSdpaPreferredFrom(false, null));
-    try testing.expect(!naxSdpaPreferredFrom(true, "0"));
-    try testing.expect(naxSdpaPreferredFrom(false, "1"));
 }
 
 test "sdpaForceFusedFor: only shapes MLX has a fused kernel for (hd 256, > 8 rows, q <= k)" {
@@ -54214,11 +53733,9 @@ test "qsa score fused: a probe mismatch latches the composed arm" {
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const saved_override = qsa_score_fused_override;
     const saved_flip = qsa_score_probe_flip_override;
-    const saved_env = qsa_score_fused_env;
     defer {
         qsa_score_fused_override = saved_override;
         qsa_score_probe_flip_override = saved_flip;
-        qsa_score_fused_env = saved_env;
         qsaScoreFusedProbeReset();
     }
     qsa_score_fused_override = true;
@@ -54262,17 +53779,12 @@ test "qsa score fused: probe passes on this machine" {
     try testing.expect(qsaScoreFusedActive());
 }
 
-test "qsa score fused: default on engages, =0 declines" {
+test "qsa score fused: default on engages, the override declines" {
     const saved_override = qsa_score_fused_override;
-    const saved_env = qsa_score_fused_env;
-    defer {
-        qsa_score_fused_override = saved_override;
-        qsa_score_fused_env = saved_env;
-    }
+    defer qsa_score_fused_override = saved_override;
     qsa_score_fused_override = null;
-    qsa_score_fused_env = null;
     try testing.expect(qsaScoreFusedEnabled());
-    qsa_score_fused_env = false;
+    qsa_score_fused_override = false;
     try testing.expect(!qsaScoreFusedEnabled());
     if (mlx.noGpuBackend()) return;
     const s = mlx.gpuStream();
@@ -54283,7 +53795,6 @@ test "qsa score fused: default on engages, =0 declines" {
     defer _ = mlx.mlx_array_free(pooled);
     try mlx.check(mlx.mlx_array_eval(pooled));
     try testing.expect((try qsaScoreFused(s, q, pooled)) == null);
-    qsa_score_fused_env = null;
     qsa_score_fused_override = true;
     if (verifyQmmNaxAvailable() and qsaScoreTf32Enabled()) {
         const got = (try qsaScoreFused(s, q, pooled)) orelse return error.ScoreKernelDeclined;
@@ -54669,7 +54180,7 @@ test "generation past the reserved headroom takes the +25% growth policy, never 
     try t.expect(cap_at_prefill_end >= reserved);
     try t.expectEqual(total, cache.entries[0].offset);
     try t.expect(allocs >= 2);
-    try t.expectEqual(KVCache.nextCapacityPolicy(cap_at_prefill_end, cap_at_prefill_end + 1, false), cache.nextCapacityReserved(cap_at_prefill_end, cap_at_prefill_end + 1));
+    try t.expectEqual(KVCache.nextCapacityPolicy(cap_at_prefill_end, cap_at_prefill_end + 1), cache.nextCapacityReserved(cap_at_prefill_end, cap_at_prefill_end + 1));
     try t.expect(last_cap >= total);
 }
 
@@ -54685,7 +54196,7 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     while (pos < seq) {
         const end = @min(pos + chunk, seq);
         if (end > cap) {
-            cap = KVCache.nextCapacityPolicy(cap, end, false);
+            cap = KVCache.nextCapacityPolicy(cap, end);
             grows += 1;
         }
         pos = end;
@@ -54751,7 +54262,7 @@ test "a reserved KV cache grows ONCE: no old+new buffer coexists during a long p
     defer small.deinit();
     small.reserve(@intCast(KVCache.reservedTokens(4096, 2048, chunk, 0)));
     try t.expectEqual(
-        KVCache.nextCapacityPolicy(1024, 2048, KVCache.kvGrowLinear()),
+        KVCache.nextCapacityPolicy(1024, 2048),
         small.nextCapacityReserved(1024, 2048),
     );
 }
@@ -54919,11 +54430,7 @@ test "diagEnvOnCached answers once and latches" {
     try testing.expectEqual(true, diagEnvOnCached(&cache, "SUSHI_NO_SUCH_DIAG_SWITCH_PROBE"));
 }
 
-test "qsa select tg policy: a pure function of rows, forced width wins" {
-    const saved = qsa_select_tg_override;
-    defer qsa_select_tg_override = saved;
-    qsa_select_tg_override = null;
-    qsa_select_tg_cached = 0;
+test "qsa select tg policy: a pure function of rows" {
     try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(4096));
     try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(1024));
     try testing.expectEqual(@as(c_int, 256), qsaSelectTgFor(256));
@@ -54932,10 +54439,6 @@ test "qsa select tg policy: a pure function of rows, forced width wins" {
     try testing.expectEqual(@as(c_int, 1024), qsaSelectTgFor(63));
     try testing.expectEqual(@as(c_int, 1024), qsaSelectTgFor(16));
     try testing.expectEqual(@as(c_int, 1024), qsaSelectTgFor(1));
-    qsa_select_tg_override = 512;
-    try testing.expectEqual(@as(c_int, 512), qsaSelectTgFor(4096));
-    try testing.expectEqual(@as(c_int, 512), qsaSelectTgFor(1));
-    qsa_select_tg_cached = null;
 }
 
 fn expectRowsByteEqual(alloc: std.mem.Allocator, s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array, tag: []const u8) !void {
@@ -56468,7 +55971,7 @@ test "hc prefill: pending write, normalized streams, native inject reduction and
         defer _ = mlx.mlx_array_free(w);
         const iw = try attn256RandBf16(rnd, &.{ width, hc }, s);
         defer _ = mlx.mlx_array_free(iw);
-        try testing.expectEqual(hp.enabled(), hp.eligible(b, seq, xfm.config.hc_count, xfm.config.hidden_size, iw, .bfloat16));
+        try testing.expect(hp.eligible(b, seq, xfm.config.hc_count, xfm.config.hidden_size, iw, .bfloat16));
         const ones = try standinOnes(&.{hidden}, s);
         defer _ = mlx.mlx_array_free(ones);
         const x = try attn256RandBf16(rnd, &.{ b, seq, hc, hidden }, s);
@@ -56521,7 +56024,7 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
     const hp = @import("hc_prefill.zig");
     const inject = mlx.mlx_array_new_data(&[_]u16{0}, &.{1}, 1, .bfloat16);
     defer _ = mlx.mlx_array_free(inject);
-    try testing.expectEqual(hp.enabled(), hp.eligible(2, 4351, 4, 128, inject, .bfloat16));
+    try testing.expect(hp.eligible(2, 4351, 4, 128, inject, .bfloat16));
     try testing.expect(!hp.eligible(2, 4352, 4, 128, inject, .bfloat16));
     for ([_][4]u32{ .{ 0, 17, 4, 2560 }, .{ 3, 17, 4, 2560 }, .{ 1, 16, 4, 2560 }, .{ 1, 8704, 4, 2560 }, .{ 1, 17, 0, 2560 }, .{ 1, 17, 9, 2560 }, .{ 1, 17, 4, 64 }, .{ 1, 17, 4, 4097 }, .{ 1, 17, 4, 129 } }) |shape| {
         try testing.expect(!hp.eligible(@intCast(shape[0]), @intCast(shape[1]), shape[2], shape[3], inject, .bfloat16));
@@ -56531,7 +56034,6 @@ test "hc prefill: unsupported configuration and coalesced chunk bounds decline" 
 
 test "hc prefill: incompatible read writes immediately" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const hp = @import("hc_prefill.zig");
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 0);
     defer cache.deinit();
@@ -56562,7 +56064,7 @@ test "hc prefill: incompatible read writes immediately" {
             var pending: ?HcPending = null;
             defer if (pending) |*p| p.deinit();
             try xfm.hcWriteOrDefer(&h, out, inj, 1, 17, iw, &pending);
-            const can_defer = hp.enabled() and dtype == .bfloat16 and inject_dtype == .bfloat16;
+            const can_defer = dtype == .bfloat16 and inject_dtype == .bfloat16;
             try testing.expectEqual(can_defer, pending != null);
             try xfm.hcFlush(&h, 1, 17, &pending);
             const expected = try xfm.hcWrite(try standinRef(h0), out, inj, 1, 17);

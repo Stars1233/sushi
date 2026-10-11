@@ -74,8 +74,7 @@ check "qsa engaged line" "$(grep -c '\[qsa\] sparse attention engaged' "$LOG")" 
 check "needle recovered" "$(echo "$la" | grep -c 'PELICAN-42')" "1"
 # Assert the invariant (some QSA attention arm engaged), never one kernel's name.
 check "qsa prefill attention arm engaged (gather kernel or sushi_attn_p256 mask arm)" "$(grep -cE '\[qsa-gather\] engaged|\[qsa-fused\] engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
-# Decode (S=1): `[qsa-decode-gather] engaged` serves it, since the fused kernel
-# floors at S=2 — `SUSHI_QSA_ATTN_MIN_S=1` hands the row to `[qsa-attn]`.
+# Decode (S=1) is served by the fused split-K kernel or the decode gather.
 check "qsa decode attention arm engaged (S=1 subset rows)" "$(grep -cE '\[qsa-decode-gather\] engaged|\[qsa-attn\] engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 echo "[5b] MTP past the QSA budget (verify rows under the QSA mask)"
 longm=$(echo "$long" | python3 -c "import sys,json; d=json.load(sys.stdin); d['enable_mtp']=True; print(json.dumps(d))")

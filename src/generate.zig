@@ -283,7 +283,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
         // (+8% prefill for +3 GB peak here); every other MoE keeps the measured 4096 cap.
         return @min(base_chunk, if (is_moe and !long_ctx_gated) @as(usize, 4096) else @as(usize, 8192));
     }
-    // Composed-causal fallback (SUSHI_FUSED_256_CAUSAL=0): SMALL chunks
+    // Composed-causal fallback (SUSHI_FUSED_256=0): SMALL chunks
     // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
     // M4 Max): 8K 225 -> 235.8 tok/s and peak 28.9 -> 19.8 GB at chunk
     // 2048; 32K 205.4 -> 209.3. Chunk boundaries ARE block-level causal
@@ -1496,7 +1496,7 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 /// Tokens of KV capacity this prefill reserves up front (#353): removes the grow transient a
 /// long prefill pays, at the price of allocating generation headroom early. Gated on
 /// `longCtxGated`; every other arch keeps proportional growth (`reserve_tokens` stays 0).
-/// `SUSHI_KV_RESERVE=0` turns it off inside the gate. `server.prefillRequestTerms` bills it.
+/// `server.prefillRequestTerms` bills it.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
@@ -2873,7 +2873,7 @@ pub const Generator = struct {
                             sink.forwarded = ssm_cp_offset + pos;
                             if (ssm_checkpoints.items.len > 0) {
                                 if (ctx.ssm_entries) |ents| {
-                                    transformer_mod.attachQsaHistoryOnHandoff(ssm_checkpoints.items, ents, xfm.s) catch {};
+                                    transformer_mod.handoffQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
                                 }
                                 if (ssm_checkpoints.toOwnedSlice(allocator)) |owned| {
                                     sink.checkpoints = owned;
@@ -3205,13 +3205,6 @@ pub const Generator = struct {
                         dropped.deinit(allocator);
                     }
                 }
-                // One copy of the QSA key history on the latest snap. Stride
-                // captures skipped it so a 400k prefill is not 32× the
-                // indexer buffer. With the share switch on nothing is attached here: the newest
-                // snap takes a view of the live buffer at commit (`handoffQsaHistoryToLatest`).
-                if (ssm_checkpoints.items.len > 0 and !transformer_mod.qsaHistoryShareEnabled()) if (ctx.ssm_entries) |entries| {
-                    try transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, entries, xfm.s);
-                };
             }
         }
 
@@ -14808,7 +14801,7 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
     // A real hd-256 MoE keeps its own measured 4096 branch.
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 32, 8192, false, true, false));
 
-    // SUSHI_FUSED_256_CAUSAL=0: composed scores are back and so is the
+    // SUSHI_FUSED_256=0: composed scores are back and so is the
     // budget, unchanged — guards and dispatch move on ONE switch.
     transformer_mod.fused256_override = false;
     defer transformer_mod.fused256_override = null;
@@ -14891,7 +14884,7 @@ test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 
 }
 
 test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + score formula" {
-    // SUSHI_FUSED_256_CAUSAL=0 restores composed causal, where SMALLER
+    // SUSHI_FUSED_256=0 restores composed causal, where SMALLER
     // chunks measured faster on the 27B ladder (2026-07-12, M4 Max): 8K
     // prompt 225 -> 235.8 tok/s at chunk 2048 (peak 28.9 -> 19.8 GB).
     // Chunking IS block-level causal skipping for composed attention, and

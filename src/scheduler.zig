@@ -6021,7 +6021,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // of the capacity buffer (the slot is torn down right after). A failure commits the
     // entry history-less, which a QSA arch treats as a miss.
     if (ssm_cps_opt) |cps| {
-        if (transformer_mod.qsaHistoryShareEnabled() and !transformer_mod.checkpointHasQsaPooled(&cps[cps.len - 1])) {
+        if (!transformer_mod.checkpointHasQsaPooled(&cps[cps.len - 1])) {
             if (slot.ssm_entries) |ents| {
                 if (slot.model.transformer) |xf| {
                     transformer_mod.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {

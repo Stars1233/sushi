@@ -160,7 +160,7 @@ fi
 # argmax flips between them — the sanctioned INT4 divergence class. Measured on
 # Muse-Glimmer-30B: the 8-bit build is byte-identical 6/6, the 4-bit build
 # diverges reproducibly while each arm stays perfectly self-consistent, and the
-# divergence is unchanged with SUSHI_SLIDING_BLOCK_TRIM=0.
+# divergence is unchanged without the sliding block trim.
 #
 # So: byte-equality at 8-bit or wider; at narrower widths assert what must still
 # hold — each arm REPRODUCIBLE (a broken verify or rollback shows as run-to-run

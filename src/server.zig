@@ -4241,7 +4241,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
 
 /// The SSD bytes one cached token costs this model at these settings, from the serialized geometry:
 /// the KV rows at the served width, the one pooled QSA history the entry writes, and the MTP head's KV
-/// and history where the head is on. Execution state (the QSA score bank, a second history copy) is
+/// and history where the head is on. Execution state (the QSA score bank) is
 /// RAM-only and never enters it; GLM's KDA checkpoints, DFlash2 window and MiMo's rings are fixed per entry.
 pub fn diskBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     const rows = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| config.qsaHistoryBytesPerToken();
@@ -4282,11 +4282,7 @@ test "diskBytesPerToken: the serialized geometry, whatever the QSA execution swi
     const saved_mtp = configured_mtp;
     defer configured_mtp = saved_mtp;
     const saved_fused = transformer_mod.qsa_score_fused_override;
-    const saved_share = transformer_mod.qsa_history_share_override;
-    defer {
-        transformer_mod.qsa_score_fused_override = saved_fused;
-        transformer_mod.qsa_history_share_override = saved_share;
-    }
+    defer transformer_mod.qsa_score_fused_override = saved_fused;
     var q = qwen4DeployedTestConfig();
     // kv8 rows plus the one pooled history; the head is off.
     configured_mtp = false;
@@ -4296,15 +4292,14 @@ test "diskBytesPerToken: the serialized geometry, whatever the QSA execution swi
     configured_mtp = true;
     try t.expectEqual(@as(u64, 13_824) + head, diskBytesPerToken(&q, 8));
     try t.expect(diskBytesPerToken(&q, 16) > diskBytesPerToken(&q, 8));
-    // The score bank and a second history copy are execution state, never in an entry.
-    for ([_]?bool{ true, false }) |fused| for ([_]?bool{ true, false }) |share| {
+    // The score bank is execution state, never in an entry.
+    for ([_]?bool{ true, false }) |fused| {
         transformer_mod.qsa_score_fused_override = fused;
-        transformer_mod.qsa_history_share_override = share;
         for ([_]bool{ false, true }) |mtp| {
             configured_mtp = mtp;
             try t.expectEqual(@as(u64, 13_824) + (if (mtp) head else 0), diskBytesPerToken(&q, 8));
         }
-    };
+    }
     transformer_mod.qsa_score_fused_override = false;
     configured_mtp = false;
     try t.expect(sessionBytesPerToken(&q, 8) > diskBytesPerToken(&q, 8));
@@ -4628,9 +4623,6 @@ test "bf16 expert cache admission bills cache workspace bounce and resident trun
 test "bf16 expert load admission includes 65k KV and QSA serving terms" {
     const fused_guard = qsaScoreFusedOffGuard();
     defer fused_guard.deinit();
-    const saved_share = transformer_mod.qsa_history_share_override;
-    defer transformer_mod.qsa_history_share_override = saved_share;
-    transformer_mod.qsa_history_share_override = true;
     var config = qwen4RequestTestConfig();
     config.expert_streaming = true;
     config.expert_fill_peak_bytes = 11_852_000_000;
@@ -5392,8 +5384,6 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     var cfg = qwen4RequestTestConfig();
     cfg.mtp_override = false; // the MTP head's own term: `the load-time bill prices the MTP head ...`
     const MiB: u64 = 1 << 20;
-    transformer_mod.qsa_history_share_override = true;
-    defer transformer_mod.qsa_history_share_override = null;
     transformer_mod.qsa_score_fused_override = false;
     defer transformer_mod.qsa_score_fused_override = null;
     try t.expectEqual(@as(u64, 2_304), statePerTokenBilled(&cfg));
@@ -5586,8 +5576,6 @@ test "the per-token widths the request chooser is built on" {
     const cfg = qwen4RequestTestConfig();
     try t.expectEqual(@as(u32, 12), cfg.attnCacheLayerCount());
     try t.expectEqual(@as(u64, 13_056), kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8));
-    transformer_mod.qsa_history_share_override = true;
-    defer transformer_mod.qsa_history_share_override = null;
     transformer_mod.qsa_score_fused_override = false;
     defer transformer_mod.qsa_score_fused_override = null;
     try t.expectEqual(@as(u64, 768), cfg.qsaHistoryBytesPerToken());
@@ -5601,8 +5589,6 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
     const t = std.testing;
-    transformer_mod.qsa_history_share_override = true;
-    defer transformer_mod.qsa_history_share_override = null;
     transformer_mod.qsa_score_fused_override = false;
     defer transformer_mod.qsa_score_fused_override = null;
     const cfg = qwen4ExpOomConfig();
@@ -6176,9 +6162,7 @@ fn attnLayersPerEvalWindow(config: *const model_mod.ModelConfig, window: u32) u3
 fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq: u64, reserved: u64, kv_per_tok: u64) u64 {
     if (warm.grows(seq)) return oldBuffersInEvalWindow(config, warm.capacity_tokens, seq -| warm.matched_tokens, kv_per_tok);
     if (warm.decodeOutgrows(seq, reserved)) {
-        // Unreserved, the first decode step past C grows every layer inside one forward.
-        if (!transformer_mod.KVCache.kvReservationEnabled()) return warm.capacity_tokens *| kv_per_tok;
-        // Reserved, the prefill grows each layer first (`KVCache.growToReservation`), one eval at a
+        // The prefill grows each layer first (`KVCache.growToReservation`), one eval at a
         // time; a share's old rows stay the entry's.
         return if (warm.will_donate) oldBuffersInEvalWindow(config, warm.capacity_tokens, 1 << 20, kv_per_tok) else 0;
     }
@@ -6345,15 +6329,13 @@ fn prefillFfnWidth(config: *const model_mod.ModelConfig) u64 {
 /// `kv_override` is the per-request `kv_quant` body field where the surface
 /// parses one (chat/messages/responses); null falls back to the process default.
 /// Per-token bytes of the arch's out-of-cache request state as billed: the QSA indexer history
-/// at the copies a live slot holds (one by default; two with `SUSHI_QSA_HISTORY_SHARE=0`
-/// or `SUSHI_KV_RESERVE=0`), plus the f32 block-score bank the two-copy slack used to
-/// hide. One helper because the auto-context sizer and the admission guard must agree.
+/// at the one copy a live slot holds, plus the f32 block-score bank. One helper because the
+/// auto-context sizer and the admission guard must agree.
 pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
     const one = config.qsaHistoryBytesPerToken();
     if (config.isGlm5()) return one;
     if (one == 0) return 0;
-    const copies: u64 = if (transformer_mod.qsaHistoryShareEnabled() and transformer_mod.KVCache.kvReservationEnabled()) 1 else 2;
-    return one * copies + config.qsaScoreBankBytesPerToken();
+    return one + config.qsaScoreBankBytesPerToken();
 }
 
 /// Tokens of cache capacity a request reserves at admission (prompt + generation + one chunk
@@ -6971,7 +6953,7 @@ pub const PREFILL_WIDEN_PROBES: u8 = 2;
 
 /// What one chunk of `width` costs beyond what is already resident: its transient envelope
 /// plus the per-token state the chunk is about to write. The growth term is billed even under
-/// the default reservation (`SUSHI_KV_RESERVE=0` and short prompts do grow per chunk).
+/// the reservation (short prompts do grow per chunk).
 pub fn prefillChunkCost(
     config: *const model_mod.ModelConfig,
     kv_bits: u64,
@@ -23883,7 +23865,7 @@ test "the admission probe bills the request's OWN kv-quant and chunking, not the
     try t.expect(bill8.needed < bill16.needed);
 }
 
-test "the QSA history is billed at the copies a slot HOLDS: one with the commit handoff, two with a lever off, plus the score bank" {
+test "the QSA history is billed at the one copy a slot HOLDS, plus the score bank" {
     const t = std.testing;
     const cfg = qwen4ExpOomConfig();
     transformer_mod.qsa_score_fused_override = false;
@@ -23892,12 +23874,7 @@ test "the QSA history is billed at the copies a slot HOLDS: one with the commit 
     const bank = cfg.qsaScoreBankBytesPerToken();
     try t.expect(one > 0);
     try t.expect(bank > 0);
-    defer transformer_mod.qsa_history_share_override = null;
-    transformer_mod.qsa_history_share_override = true;
     try t.expectEqual(one + bank, statePerTokenBilled(&cfg));
-    transformer_mod.qsa_history_share_override = false;
-    try t.expectEqual(one * 2 + bank, statePerTokenBilled(&cfg));
-    transformer_mod.qsa_history_share_override = true;
 
     const seq: u64 = 458_832;
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, 4096, .{});

@@ -218,7 +218,7 @@ pub fn hcReadVerifyRows(self: *Transformer, rows: anytype, w: *const HcWeights) 
 pub fn hcWriteOrDefer(self: *Transformer, h: *mlx.mlx_array, out: mlx.mlx_array, inj: mlx.mlx_array, batch: c_int, seq_len: c_int, inject_flat: mlx.mlx_array, pending: *?HcPending) !void {
     std.debug.assert(pending.* == null);
     const prefill = @import("hc_prefill.zig").eligible(batch, seq_len, self.config.hc_count, self.config.hidden_size, inject_flat, mlx.mlx_array_dtype(h.*)) and mlx.mlx_array_dtype(inj) == .bfloat16;
-    if ((prefill or (batch * seq_len <= HC_FUSED_MAX_ROWS and hcFusedEnabled())) and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
+    if ((prefill or (batch * seq_len <= HC_FUSED_MAX_ROWS)) and mlx.mlx_array_dtype(h.*) == mlx.mlx_array_dtype(out)) {
         var pd: HcPending = undefined;
         pd.out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(pd.out);
@@ -781,19 +781,6 @@ pub var hc_fused_eps_val: f32 = 0;
 
 pub var hc_fused_engaged = false;
 
-pub var hc_fused_env: ?bool = null;
-
-pub var hc_fused_override: ?bool = null;
-
-pub fn hcFusedEnabled() bool {
-    if (hc_fused_override) |v| return v;
-    if (hc_fused_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_HC_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    hc_fused_env = enabled;
-    return enabled;
-}
-
 pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
 
 /// A deferred `hcWrite`: the next read's N kernel applies `stream + out*inj`
@@ -862,7 +849,7 @@ pub fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: 
 }
 
 pub fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {
-    if (!hcFusedEnabled() or !mlx.streamIsGpu(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
+    if (!mlx.streamIsGpu(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
     if (x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, width, 10240 })) return null;
     const arrays = [_]mlx.mlx_array{ x, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, if (pending) |pd| pd.out else x, if (pending) |pd| pd.inj else x };
     const shapes = .{ &[_]c_int{ 4, 2560 }, &[_]c_int{ 320, 2560 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 10240, 80 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 4 } };
@@ -1004,7 +991,6 @@ pub fn hcReadFused(
     group_size: u32,
     pend: ?HcPending,
 ) !?HcFusedOut {
-    if (!hcFusedEnabled()) return null;
     if (!mlx.streamIsGpu(s)) return null;
     if (bits != 2 and bits != 4 and bits != 8) return null;
     const rows = batch * seq;
@@ -1169,7 +1155,7 @@ pub fn hcReadFused(
     }
     if (!hc_fused_engaged) {
         hc_fused_engaged = true;
-        log.info("[qwen4] fused hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d} (SUSHI_HC_FUSED=0 restores the chain)\n", .{ hc, hidden, R, bits, group_size });
+        log.info("[qwen4] fused hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d}\n", .{ hc, hidden, R, bits, group_size });
     }
     return .{ .mixed = mixed, .inj = inj_out, .stream = stream_out };
 }

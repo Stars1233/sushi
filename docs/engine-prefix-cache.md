@@ -134,8 +134,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
     idempotent `pinAutoContext`), so the line, `/props` and `/v1/models` name one number; free disk =
     `kv_disk_cache.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
   - bytes_per_token = `server.diskBytesPerToken`, from the SERIALIZED geometry: KV rows at the served width, the one
-    pooled QSA history an entry writes, and the MTP head's KV and history where the head is on. The QSA score bank and a
-    second history copy are execution state and never count, so no QSA switch moves it. GLM's KDA checkpoints and
+    pooled QSA history an entry writes, and the MTP head's KV and history where the head is on. The QSA score bank is
+    execution state and never counts, so no QSA switch moves it. GLM's KDA checkpoints and
     DFlash2 window, Qwen's GDN checkpoints and MiMo's ring files are fixed per entry, not per token; the 2 GB slack is
     all the formula leaves them.
   - **The tier's own bytes on disk count as free** (`kv_disk_cache.tierBytes` is added to the volume's free space at

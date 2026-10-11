@@ -74,11 +74,9 @@ const moeRouterFusedEnabled = trf.moeRouterFusedEnabled;
 const mtp_mod = trf.mtp_mod;
 const noteExpertDeferred = trf.noteExpertDeferred;
 const noteQsaArmForSlots = qwen4_qsa.noteQsaArmForSlots;
-const qkNormRopeFusedEnabled = trf.qkNormRopeFusedEnabled;
 const qkvAttnDecodeKernel = trf.qkvAttnDecodeKernel;
 const qkvAttnVerifyKernel = trf.qkvAttnVerifyKernel;
 const qsaAlignedSparseAttn = qwen4_qsa.qsaAlignedSparseAttn;
-const qsaAttnMinS = trf.qsaAttnMinS;
 const qsaDecodeGatherAttn = trf.qsaDecodeGatherAttn;
 const qsaHistoryRows = trf.qsaHistoryRows;
 const qsaLeftoverAt = trf.qsaLeftoverAt;
@@ -318,7 +316,6 @@ pub fn gdnGateClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_
 
 /// qwen4_exp: compile the four hyper-connection elementwise tails.
 pub fn compileQwen4Hc(self: *Transformer) void {
-    if (std.c.getenv("QWEN4_NO_HCFUSE") != null) return;
     const specs = .{
         .{ &self.compiled_hc_silu, &Transformer.hcSiluCallback, true },
         .{ &self.compiled_hc_mix, &Transformer.hcMixCallback, false },
@@ -2262,7 +2259,7 @@ pub fn gatedFullAttnProjected(
     var fused_qk = false;
     if (batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_cos_cur == null and
         fa.q_norm.ctx != null and fa.k_norm.ctx != null and
-        self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
+        self.rms_eps_arr.ctx != null)
     blk: {
         const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
         const angles = self.qkAngleFor(rope_family, rope_dims, rope_base, rope_freqs, eff_off, 1.0) catch break :blk;
@@ -2283,7 +2280,7 @@ pub fn gatedFullAttnProjected(
     if (!fused_qk and batch == 1 and hd == 256 and seq_len <= 32 and
         ctx.mrope_cos_cur == null and
         fa.q_norm.ctx != null and fa.k_norm.ctx != null and
-        self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
+        self.rms_eps_arr.ctx != null)
     blk: {
         const eff_off: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
         // The kernel has no mscale slot: YaRN's factor is uniform across the
@@ -2445,11 +2442,8 @@ pub fn gatedFullAttnProjected(
         // verify widths (and a declined gather) run under the bool mask.
         const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
         var gathered: ?mlx.mlx_array = null;
-        // Three arms, three independent widths: `fused_min_s` gates the fused kernel only
-        // (gating the whole block on it dropped S=2..5 onto the dense mask).
         const qsa_ok = ctx.qsa_blocks.ctx != null and ctx.qsa_mask.ctx == null and !qwen4Standin().attn_sdpa;
-        const fused_min_s = qsaAttnMinS();
-        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, fused_min_s)) {
+        if (qsa_ok and qsaSparseAttnServes(kv_view.has_quant_triple, seq_len)) {
             // One fused dispatch per layer: each row indexes its own selection + tail.
             gathered = try qsaAlignedSparseAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, ratio, attn_scale, @intCast(self.config.indexer_budget));
             if (self.cost_trace_active and gathered != null) self.cost_attention |= 1;

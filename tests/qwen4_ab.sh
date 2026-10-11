@@ -5,7 +5,7 @@
 #   tests/qwen4_ab.sh mtp <tag> [server flags...]     MTP vs serial per prompt, 3 reps interleaved, then MTP + plain concurrent
 #   tests/qwen4_ab.sh batched <tag> [server flags...] serial 3 reps per prompt, then 2-/4-stream prose + 2-stream 8.5k aggregate
 # Env: QWEN4_MODEL (pack), SUSHI_BIN, QWEN4_AB_OUT (default ~/.sushi/runs/qwen4-ab), QWEN4_AB_PORT.
-# Engine env (SUSHI_MTP_TRACE, SUSHI_HC_FUSED, ...) passes through to the server; depth flags (--mtp-min-depth/--mtp-max-depth) ride the server flags.
+# Engine env (SUSHI_MTP_TRACE, ...) passes through to the server; depth flags (--mtp-min-depth/--mtp-max-depth) ride the server flags.
 setopt nonomatch
 mode=$1; tag=$2; shift 2
 D=${0:A:h}/fixtures/qwen4_ab

@@ -10,15 +10,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Decode kernels
 
-- A custom kernel can be LATENCY-bound rather than op-bound (qwen4 fused hc read, `SUSHI_HC_FUSED=0`; `hcWrite`
+- A custom kernel can be LATENCY-bound rather than op-bound (qwen4 fused hc read; `hcWrite`
   DEFERS into the next read).
 - A kernel keyed on `batch*seq == 1` declines every verify row AND batched slot, so the grid carries the rows
   (`HC_FUSED_MAX_ROWS`/`GDN_FUSED_MAX_ROWS` 16).
-- GDN decode = three fused dispatches (`SUSHI_GDN_DECODE_FUSED=0`; S 1..9 bit-identity is SAMPLING). At B=1,
+- GDN decode = three fused dispatches (S 1..9 bit-identity is SAMPLING). At B=1,
   decode (S=1) and capturing verify (S 2..8) run two: `gdn_decode.step` (prework + recurrence, mlx-serve #517)
   then the norm-gate, bit-identical to the chain, ~0.4 ms per forward
-  ([perf-baselines](qwen4-perf.md#gdn-decode-recur)); either chain switch off keeps the chain. A/B seam:
-  `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
+  ([perf-baselines](qwen4-perf.md#gdn-decode-recur)). A/B seam: `SUSHI_DECODE_FWD_UBENCH_GDN_ARMS=1`.
 - Capturing GDN verify (B=1, S=2, separate projections) folds the norm-gate and rollback convolution history
   into the recurrence. A per-width pipeline probe uses independent inputs so a deferred PLE leaf stays lazy;
   an unsupported threadgroup limit falls back to the existing recurrence and epilogue (an M1 declines S 3..8 and
@@ -84,7 +83,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
     ~20 ms per dispatch at qL 4096) cuts the carries 4x.
   - A chunked chain is bit-identical to one dispatch on either arm.
   - Gate `attnPdNaxServes`: NAX + macOS 26.3 + a one-tile probe of both instantiations (causal, band + sinks)
-    against an f32 reference; a failed probe declines by name. `SUSHI_ATTN_PD_NAX=0` = SIMD.
+    against an f32 reference; a failed probe declines to the SIMD kernel by name.
 - At 128k keys its time is ~69% matmul issue, ~18% load instructions (Q reloaded each key block, K/V fragments per
   simdgroup) and ~12% softmax; K/V memory traffic is ~1% (`SUSHI_ATTN_PD_UBENCH_ABL=1`,
   [perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)).
@@ -103,7 +102,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   stride 8*LDK halves, one bank. Bit-identical output.
 - hd 256 stays off the NAX attn_pd arm: the same kernel at 256/256 (O in 128 registers per lane) ran 3.2x slower
   than MLX's stock NAX sdpa (2048x16384: 150.9 vs 45.9 ms), which already serves hd-256 causal prefill.
-- On NAX the stock sdpa is the hd-256 kernel (`naxSdpaPreferred`, `SUSHI_NAX_SDPA=0|1`).
+- On NAX the stock sdpa is the hd-256 kernel (`naxSdpaPreferred`).
 - MLX sdpa has a WIDTH WALL at hd 256 (dense causal q 6..9 ride `splitCausalSdpa`); `use_fallback` has NO fused arm
   for an hd-256 ARRAY mask (`splitMaskedSdpa256`).
 - MiMo's FP8 trunk at 9-128 rows (`fp8_block` tile, serving forwards only, NAX only): 8 simdgroups split K over
@@ -114,8 +113,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   the dequant + MLX GEMM route serves. `kld capture` keeps that route at every width (`fp8_block.reference_route`),
   so teacher fixtures reproduce; GLM's raw-FP8 trunk keeps `fp8_block.linear`.
   [perf-baselines](mimo2-perf.md#mimo-fp8-tile) has the audit.
-- Qwen4 HC + GDN prefill fusions take the chunk WIDTH as a scalar INPUT (`SUSHI_HC_PREFILL=0` /
-  `SUSHI_GDN_PREFILL_FUSED=0`).
+- Qwen4 HC + GDN prefill fusions take the chunk WIDTH as a scalar INPUT.
 - GDN prefill (S >= 64) takes one of three recurrences (`GdnRoute`): stock, blocked-seq, or oMLX's software-pipelined
   kernel (mlx-serve #641; 8 lanes per value row, 12-token blocks prefetched), the default for qwen4_exp on NAX GPUs.
   `SUSHI_GDN_PIPELINED=0` keeps the blocked kernel, `=1` forces it; not bit-identical (dot order).
