@@ -24,6 +24,7 @@ experts at W12 (K2.25 unless the row says K2.5; the shipped row is W14), BF16 ML
 | A8 experiment (not shipped) | A8 g128 | 0.091519 | 88.87% | 0.4318 | 0.0441 / 0.1389 | 96.30 GB | same binary |
 | Sushi-2.45bpw | raw FP8 block-128 | 0.091266 | 88.62% | 0.4304 | 0.0439 / 0.1386 | 102.51 GB | `56017748`, TF32 off, `sushi kld compare` |
 | Sushi-2.5bpw (K2.5) | A6 g128 | 0.072071 | 89.94% | 0.4075 | 0.0314 / 0.1127 | 103.59 GB | `00668fcb`, `sushi kld compare` defaults; 2.3bpw reproduces its row bit for bit there |
+| Sushi-2bpw (K2.0 W14, tuned) | A5 g128 | 0.103666 | 88.18% | 0.4406 | 0.0517 / 0.1556 | 83.53 GB | `69356b92`, TF32 off, `sushi kld compare --kv-quant 16` |
 
 Against the NAX-path teacher (`glm5_model.enterTeacher()`, binary `177c526f`, TF32 off; decode attention is the only
 arm that changes this capture), students at BF16 latent, same 4x512 prompts:
