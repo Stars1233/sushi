@@ -241,8 +241,8 @@ pub const LoadedModel = struct {
     /// render+tokenize results, keyed by a digest of (messages, tools,
     /// flags). Targets the warm-reuse path where Jinja+BPE was
     /// observed at 240 ms on a 1813-tok Gemma prompt — 7× the actual
-    /// Metal prefill on a KV-cache hit. Null when --tokenize-cache-entries
-    /// is 0 (caller disables for tests / debugging).
+    /// Metal prefill on a KV-cache hit. Null when the load's
+    /// `tokenize_cache_entries` is 0 (a test disables it).
     tokenize_cache: ?TokenizeCache = null,
 
     /// Grammar-mask token-byte table for this model's vocabulary, and the

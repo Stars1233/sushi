@@ -533,7 +533,7 @@ pub const KvAttnMode = enum { dense, fused, auto };
 /// at 8K context and wins from ~16K on every measured geometry (48/8 and
 /// 32/8 at hd 128, 16/8 at hd 256), so `auto` engages fused reads from 8K
 /// prompt tokens. One constant to start (per the plan); the per-request
-/// `kv_attn_mode` field and an explicit --kv-attn-mode outrank it.
+/// `kv_attn_mode` field outranks it.
 pub const KV_ATTN_AUTO_CROSSOVER_TOKENS: usize = 8192;
 
 /// Pure resolution core (unit-tested): explicit per-request choice >
@@ -597,8 +597,8 @@ pub const ServerConfig = struct {
     /// N-gram match key length for PLD.
     default_pld_key_len: u32 = 3,
     /// docs/kv-quant-perf.md Phase 2: how quantized-KV requests READ the
-    /// cache at decode. `--kv-attn-mode dense|fused|auto`; per-request
-    /// `kv_attn_mode` body field ("dense"/"fused") outranks it. Only takes
+    /// cache at decode. The per-request `kv_attn_mode` body field
+    /// ("dense"/"fused") outranks it. Only takes
     /// effect at `--kv-quant 4|8` (.affine cache scheme); other schemes
     /// always read dense. `auto` (the default) engages fused reads when the
     /// prompt is at/above the measured crossover — see `resolveKvAttnFused`.
@@ -1268,13 +1268,11 @@ test "PldDefaults: ServerConfig built from it reports the CLI values" {
     try std.testing.expectEqual(@as(u32, 4), cfg.default_pld_key_len);
 }
 
-/// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
-/// chat-template tokenize cache. 0 disables (every request re-renders +
-/// re-tokenizes, restoring pre-Iteration-2 behavior). Default 4 is small
-/// because real chat conversations mutate the messages list every turn;
-/// the cache catches warm-reuse benches + repeated agent probes without
-/// hoarding token buffers across a long session.
-pub var tokenize_cache_entries: u32 = 4;
+/// LRU capacity of the per-LoadedModel chat-template tokenize cache. Small
+/// because real chat conversations mutate the messages list every turn; it
+/// catches warm-reuse benches and repeated agent probes without hoarding
+/// token buffers across a long session.
+pub const tokenize_cache_entries: u32 = 4;
 
 pub fn parseOnOff(word: []const u8) ?bool {
     if (std.mem.eql(u8, word, "on")) return true;

@@ -422,21 +422,6 @@ fn qwen4PackTripleMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, 
     return @as(u64, @intCast(ws[1])) * 32 == k * 4;
 }
 
-/// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
-/// others `last_window 8192` above a 16384-token threshold): prompts whose
-/// forwarded tail exceeds the threshold only build MTP history for the LAST
-/// n positions — earlier chunks skip the full-hidden capture AND the head
-/// forward entirely (and become eligible for the compiled trunk forward).
-/// A history that starts mid-sequence is already a supported state: warm
-/// hot-cache hits produce exactly that (RoPE offsets are cache-relative).
-/// DEFAULT IS FULL HISTORY (0): the A/B failed for windowing on the stock
-/// Qwen head — 64K ctx measured 68.2% -> 54.0% per-draft acceptance and
-/// -4.2 decode tok/s for zero prefill benefit.
-/// `SUGGESTED_HISTORY_WINDOW` is what to pass when
-/// experimenting with window-trained sidecars.
-pub const SUGGESTED_HISTORY_WINDOW: usize = 8192;
-pub const HISTORY_WINDOW_THRESHOLD: usize = 16384;
-
 /// One linear: quantized (w packed u32, s/b bf16) when `s.ctx != null`,
 /// otherwise a pre-transposed bf16 weight `[in, out]` for plain matmul.
 pub const QLinear = struct {

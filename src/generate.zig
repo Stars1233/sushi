@@ -52,7 +52,6 @@ pub var prefill_chunk_override: usize = 8192;
 /// without this flag the default 8192 is indistinguishable from a request.
 /// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
 pub var prefill_chunk_explicit: bool = false;
-pub var prefill_trace_force: bool = false;
 
 /// Set once by the serve CLI before request construction. Direct callers may
 /// override it through InitOptions; exact remains the library default.
@@ -164,14 +163,6 @@ pub const AdaptiveWidthState = struct {
     width_max: u32 = 0,
 };
 
-/// MTP prefill-history window (`--mtp-history-window`; 0 = full history).
-/// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
-/// DEFAULT 0 (full): the A/B gate failed for windowing — at 64K ctx on the
-/// stock Qwen3.6-27B head, window 8192 cost 14 acceptance points (68.2% ->
-/// 54.0%) and 4.2 decode tok/s for ZERO prefill benefit (184.7 vs 185.1
-/// tok/s); at 32K it was a wash. Qwen's stock head drafts from deep history.
-pub var mtp_history_window_override: usize = 0;
-
 /// `--max-mtp-ctx N`: MTP stays off past N context tokens (0 = unlimited). Read by the HTTP
 /// admission gate and by `nextMtp` per round (`mtp.mtpCtxWithinLimit`).
 pub var max_mtp_ctx: u32 = 0;
@@ -187,24 +178,6 @@ pub const SpecDisableReason = enum {
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
 };
-
-/// Effective MTP history window for a prefill forwarding `prefix_len`
-/// positions: 0 (capture everything) unless windowing is on AND the tail is
-/// past the threshold — short/medium prompts keep byte-identical behavior.
-pub fn effectiveMtpHistoryWindow(prefix_len: usize, window: usize) usize {
-    if (window == 0 or prefix_len <= mtp_mod.HISTORY_WINDOW_THRESHOLD) return 0;
-    return window;
-}
-
-/// Does prefill chunk [pos, end) contribute MTP history? Zero window = all
-/// chunks; otherwise only chunks overlapping the last `window` positions of
-/// the prefix (a boundary chunk contributes whole — the window is a floor,
-/// never an exact cut, so acceptance never loses mid-chunk context).
-pub fn chunkNeedsMtpHistory(pos: usize, end: usize, prefix_len: usize, window: usize) bool {
-    _ = pos;
-    if (window == 0) return true;
-    return end > prefix_len - @min(window, prefix_len);
-}
 
 /// One layer's materialized-score budget for unfused-SDPA prefill (see
 /// boundedPrefillChunk). 4 GiB keeps the full 8K chunk for every context up
@@ -1766,7 +1739,7 @@ pub const Generator = struct {
     glm_prefill_window: ?GlmSpecWindow = null,
     /// Cumulative GLM DFlash2 drafts proposed and round phases, for `[spec-stats]`.
     glm_round: struct { drafted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, replay_ns: u64 = 0, commit_ns: u64 = 0 } = .{},
-    /// Effective block size (assistant config, clamped by --draft-block-size).
+    /// Effective block size (assistant config, capped by the machine's verify lanes).
     /// Drafts per round = dflash_block_size - 1.
     dflash_block_size: u32 = 0,
     /// Request-class break-even yield, normalized by the scheduler to the
@@ -2360,7 +2333,7 @@ pub const Generator = struct {
         /// Non-owning pointer to the loaded DFlash assistant.
         dflash: ?*DflashModel = null,
         /// Effective DFlash block size (loader-resolved: assistant config
-        /// clamped by --draft-block-size). 0 → the assistant config's value.
+        /// capped by the machine's verify lanes). 0 → the assistant config's value.
         dflash_block_size: u32 = 0,
         /// Accepted drafts/round required after warmup. Scheduler scales the
         /// M5/block-16 calibration to the effective draft width and lowers it
@@ -2617,12 +2590,8 @@ pub const Generator = struct {
             xfm.config.longCtxGated(),
             options.pinned_prefill_chunk,
         ), options.decode_share_width_cap);
-        // Phase-level prefill instrumentation. Enabled at debug level OR via
-        // --prefill-trace (which forces the trace line at info).
-        // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
-        // time goes (chunked-forward vs eval vs last-token-forward).
-        const trace_force: bool = prefill_trace_force;
-        const trace_enabled = log.isDebug() or trace_force;
+        // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
+        const trace_enabled = log.isDebug();
         var prefill_sw = io_util.Stopwatch.init(io);
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;
@@ -2789,10 +2758,6 @@ pub const Generator = struct {
             adapt_state.width_min = @intCast(default_chunk);
             adapt_state.width_max = @intCast(default_chunk);
             var cur_chunk: usize = default_chunk;
-            // Last-window MTP history: chunks entirely before the window skip
-            // the full-hidden capture AND the head forward (see
-            // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
-            const mtp_hist_window = effectiveMtpHistoryWindow(prefix_len, mtp_history_window_override);
 
             // Reserve the whole request's cache capacity before the first chunk writes: a grow
             // is not in place, so a long prefill's peak carried a second copy of everything so
@@ -2879,8 +2844,6 @@ pub const Generator = struct {
                 defer _ = mlx.mlx_array_free(chunk_input);
 
                 const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
-                // History windowing: a chunk before the window needs no capture.
-                const mtp_capture = mtp_active and chunkNeedsMtpHistory(pos, end, prefix_len, mtp_hist_window);
                 var chunk_hidden_all = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(chunk_hidden_all);
                 if (dflash_active) {
@@ -2890,7 +2853,7 @@ pub const Generator = struct {
                 errdefer if (dflash_active) {
                     for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
                 };
-                const chunk_logits = if (mtp_capture) blk: {
+                const chunk_logits = if (mtp_active) blk: {
                     var last_unused = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(last_unused);
                     break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
@@ -2907,7 +2870,7 @@ pub const Generator = struct {
                 if (trace_enabled) {
                     const dt = prefill_sw.read() - chunk_start_ns;
                     chunked_ns += dt;
-                    std.debug.print(
+                    log.debug(
                         "  [prefill-trace] chunk pos={d} end={d} width={d} ms={d}\n",
                         .{ pos, end, end - pos, dt / std.time.ns_per_ms },
                     );
@@ -2917,7 +2880,7 @@ pub const Generator = struct {
                 // tokens [pos+1, end+1) — prompt_ids[end] always exists since
                 // the chunk loop spans [0, prefix_len) and prompt_ids has
                 // prefix_len + 1 entries.
-                if (mtp_capture) {
+                if (mtp_active) {
                     if (!mtp_history_started) {
                         std.debug.assert(mtp_cache.?.step() == 0);
                         mtp_position_base = ssm_cp_offset + pos;
@@ -2992,7 +2955,7 @@ pub const Generator = struct {
                     eval_ns += eval_dt;
                     var mem_buf: [256]u8 = undefined;
                     const line = formatPrefillMemLine(&mem_buf, pos, end, eval_dt / std.time.ns_per_ms, mlxPrefillMem());
-                    std.debug.print("{s}", .{line});
+                    log.debug("{s}", .{line});
                 }
 
                 // This chunk's latch, read before anything persists it, snapshots it or yields
@@ -3257,7 +3220,7 @@ pub const Generator = struct {
             const last_ns = prefill_sw.read() - last_start_ns;
             const total_ns = prefill_sw.read();
             const ms = std.time.ns_per_ms;
-            std.debug.print(
+            log.debug(
                 "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunk_widths={d}..{d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}{s}\n",
                 .{
                     prompt_ids.len,
@@ -14640,29 +14603,6 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
     // 4 GiB / (32 * 38201 * 2) = 1757 -> floored to the 512 grain.
     try testing.expectEqual(@as(usize, 1536), boundedPrefillChunk(8192, 192, 32, 38_201, false, true, false));
     try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 192, 32, 262_144, false, true, false));
-}
-
-test "MTP history window: threshold gate and chunk membership" {
-    // Below/at the 16384 threshold the window never engages — behavior (and
-    // temp-0 output) stays byte-identical to full-history capture.
-    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(1000, 8192));
-    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(16384, 8192));
-    try testing.expectEqual(@as(usize, 8192), effectiveMtpHistoryWindow(16385, 8192));
-    try testing.expectEqual(@as(usize, 8192), effectiveMtpHistoryWindow(65536, 8192));
-    // 0 = full history at any length (the --mtp-history-window 0 escape).
-    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(65536, 0));
-
-    // Chunk membership at prefix 32768, window 8192: the window starts at
-    // 24576. Chunks entirely before it skip capture; the boundary chunk
-    // (ending past 24576) captures WHOLE.
-    try testing.expect(!chunkNeedsMtpHistory(0, 8192, 32768, 8192));
-    try testing.expect(!chunkNeedsMtpHistory(16384, 24576, 32768, 8192));
-    try testing.expect(chunkNeedsMtpHistory(24576, 32768, 32768, 8192));
-    try testing.expect(chunkNeedsMtpHistory(20000, 24577, 32768, 8192));
-    // Zero window: every chunk captures.
-    try testing.expect(chunkNeedsMtpHistory(0, 8192, 32768, 0));
-    // Window >= prefix degenerates to full capture (no underflow).
-    try testing.expect(chunkNeedsMtpHistory(0, 512, 4096, 8192));
 }
 
 test "boundedPrefillChunk: never raises a caller-lowered base chunk" {

@@ -34,8 +34,7 @@ fi
 
 # Test 1: --model + --model-dir → discovery enriches /v1/models
 "$BINARY" --model "$MODELS_ROOT/$LOADED_MODEL" --model-dir "$MODELS_ROOT" \
-    --serve --port "$PORT" --ctx-size 4096 --log-level warn \
-    --no-warmup-eager > /tmp/test_disc.log 2>&1 &
+    --serve --port "$PORT" --ctx-size 4096 --log-level warn > /tmp/test_disc.log 2>&1 &
 PID=$!
 for _ in $(seq 1 240); do
     curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
@@ -103,8 +102,7 @@ wait "$PID" 2>/dev/null
 # Test 3: --model-dir alone (no --model) auto-selects first discovered
 echo "=== Test 3: --model-dir auto-select ==="
 "$BINARY" --model-dir "$MODELS_ROOT" \
-    --serve --port "$PORT" --ctx-size 4096 --log-level info \
-    --no-warmup-eager > /tmp/test_disc2.log 2>&1 &
+    --serve --port "$PORT" --ctx-size 4096 --log-level info > /tmp/test_disc2.log 2>&1 &
 PID=$!
 for _ in $(seq 1 240); do
     curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break

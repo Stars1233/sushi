@@ -878,8 +878,6 @@ fn parseLaunchArgs(args: []const []const u8) !LaunchArgs {
             out.port = std.fmt.parseInt(u16, args[i], 10) catch return error.Usage;
         } else if (std.mem.eql(u8, arg, "--print")) {
             out.print_only = true;
-        } else if (std.mem.eql(u8, arg, "--no-start")) {
-            // Accepted for existing scripts: a down server is never auto-started.
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             return error.Usage;
         } else {
@@ -1239,6 +1237,10 @@ test "launch args: passthrough after --, unknown agent named, url trailing slash
     try t.expectError(error.UnknownAgent, parseLaunchArgs(&.{"cursor"}));
     // The rebrand alias from issue #188's own wording.
     try t.expectEqual(AgentKind.codex, (try parseLaunchArgs(&.{"chatgpt"})).kind);
+}
+
+test "launch args: the removed --no-start is a usage error" {
+    try t.expectError(error.Usage, parseLaunchArgs(&.{ "codex", "--no-start" }));
 }
 
 test "launch args: the default port is sushi's own, clear of mlx-serve's 11234" {

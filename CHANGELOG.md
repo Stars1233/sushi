@@ -10,6 +10,16 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Cleanup**: `SUSHI_GDN_PIPELINED` is removed; the software-pipelined GDN prefill kernel is always the route of Flash-Next on NAX GPUs.
 - **Cleanup**: `SUSHI_SSD_WRITE_THROUGH` is removed; the prefill write-through to the SSD prefix cache is always on when its gates pass, and behaviour is unchanged.
 - **Cleanup**: `SUSHI_FUSED_256` is removed; the fused head-dim-256 prefill attention is always on, and output is unchanged.
+- **Flags**: `--no-safety` is removed (it had no effect).
+- **Flags**: `--warmup-eager` and `--no-warmup-eager` are removed; the boot warmup always runs.
+- **Flags**: `--kv-attn-mode` is removed; `auto` is always the server default and a request's `kv_attn_mode` field still forces `dense` or `fused`.
+- **Flags**: `--decode-attn-quant` is removed (it is the default); `--no-decode-attn-quant` still turns it off.
+- **Flags**: `--mtp-depth` (already rejected with a message naming `--mtp-min-depth` and `--mtp-max-depth`) is removed; it now fails as an unknown flag.
+- **Flags**: `--mtp-history-window` is removed; the MTP head always sees the full prompt history.
+- **Flags**: `--draft-block-size` is removed; the DFlash assistant's block is always capped by the machine automatically.
+- **Flags**: `--tokenize-cache-entries` is removed; the per-model prompt render cache is fixed at 4 entries.
+- **Flags**: `--prefill-trace` is removed; `--log-level debug` writes the `[prefill-trace]` lines to the log.
+- **Flags**: `sushi launch --no-start` is removed (it did nothing).
 - **Flags**: `--hf-overrides` is removed; it was another name for `--config-overrides`.
 - **Flags**: `--mtp-cascade` is removed; it was another name for `--mtp-tokenv3`.
 - **Flags**: `--no-prefix-cache-ram` is now `--prefix-cache-mem off`.

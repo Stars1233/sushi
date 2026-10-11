@@ -88,7 +88,7 @@ def main():
         thread.start()
         try:
             base = f"http://127.0.0.1:{server.server_port}"
-            command = [str(Path(options.bin).resolve()), "launch", "zcode", "--no-start", "--url", base]
+            command = [str(Path(options.bin).resolve()), "launch", "zcode", "--url", base]
             result = run(command + ["--model", MODELS[0]["id"], "--print", "--", "--prompt", "it's a prompt"], env=env)
             config_file = root / ".sushi/zcode/provider_config.json"
             config = json.loads(config_file.read_text())["config"]

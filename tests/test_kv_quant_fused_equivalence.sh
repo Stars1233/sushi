@@ -3,7 +3,7 @@
 # Fused quant-attention equivalence test (Plan ricky Phase 2).
 #
 # Verifies that running the same greedy chat-completion request against the
-# server with `--kv-attn-mode dense` (default) and `--kv-attn-mode fused`
+# server with the request field `kv_attn_mode: "dense"` and `"fused"`
 # produces the same first-N tokens at `--kv-quant 4`. Both paths read the
 # same quantized K/V triples; the only difference is whether SDPA dequantizes
 # into a dense tensor first (dense) or consumes the triples directly via
@@ -70,10 +70,15 @@ print(json.dumps({
 }))
 ")
 
+with_mode() {
+    # Args: dense|fused, payload. The read path is a per-request field.
+    echo "$2" | python3 -c "import sys,json; d=json.load(sys.stdin); d['kv_attn_mode']='$1'; print(json.dumps(d))"
+}
+
 run_and_tokenize() {
     # Args: label, extra-flags, out-var-completion, out-var-tokens, [payload]
     # (payload defaults to $JSON_PAYLOAD). Spec flags ride in extra-flags —
-    # the serial sections pass --no-pld, the spec section leaves PLD on.
+    # the serial sections pass --no-pld, the spec section passes --pld.
     # Side channel: ENGAGED_FUSED / ENGAGED_KERNEL / ENGAGED_SPEC /
     # ENGAGED_TQ are set from the server log before the log is deleted.
     local label="$1" extra="$2" out_compl="$3" out_tok="$4" payload="${5:-$JSON_PAYLOAD}"
@@ -165,7 +170,7 @@ fi
 
 DENSE_COMPL=""
 DENSE_TOK=""
-run_and_tokenize "dense" "--kv-attn-mode dense --no-pld" DENSE_COMPL DENSE_TOK || exit 1
+run_and_tokenize "dense" "--no-pld" DENSE_COMPL DENSE_TOK "$(with_mode dense "$JSON_PAYLOAD")" || exit 1
 N_DENSE=$(echo "$DENSE_TOK" | tr ',' '\n' | wc -l | tr -d ' ')
 echo "  dense: $(echo "$DENSE_COMPL" | wc -c) bytes, $N_DENSE tokens"
 if [ "${ENGAGED_FUSED:-0}" != "0" ] || [ "${ENGAGED_KERNEL:-0}" != "0" ]; then
@@ -177,7 +182,7 @@ sleep 2
 
 FUSED_COMPL=""
 FUSED_TOK=""
-run_and_tokenize "fused" "--kv-attn-mode fused --no-pld" FUSED_COMPL FUSED_TOK || exit 1
+run_and_tokenize "fused" "--no-pld" FUSED_COMPL FUSED_TOK "$(with_mode fused "$JSON_PAYLOAD")" || exit 1
 N_FUSED=$(echo "$FUSED_TOK" | tr ',' '\n' | wc -l | tr -d ' ')
 echo "  fused: $(echo "$FUSED_COMPL" | wc -c) bytes, $N_FUSED tokens"
 if [ "${ENGAGED_FUSED:-0}" = "0" ]; then
@@ -243,7 +248,7 @@ print(json.dumps({
 sleep 2
 SPEC_DENSE_COMPL=""
 SPEC_DENSE_TOK=""
-run_and_tokenize "spec dense" "--kv-attn-mode dense --pld" SPEC_DENSE_COMPL SPEC_DENSE_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "spec dense" "--pld" SPEC_DENSE_COMPL SPEC_DENSE_TOK "$(with_mode dense "$SPEC_PAYLOAD")" || exit 1
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} spec dense arm never logged '[spec-stats] mode=pld' — speculation did not engage, the arm proves nothing."
     exit 1
@@ -252,7 +257,7 @@ fi
 sleep 2
 SPEC_FUSED_COMPL=""
 SPEC_FUSED_TOK=""
-run_and_tokenize "spec fused" "--kv-attn-mode fused --pld" SPEC_FUSED_COMPL SPEC_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "spec fused" "--pld" SPEC_FUSED_COMPL SPEC_FUSED_TOK "$(with_mode fused "$SPEC_PAYLOAD")" || exit 1
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} spec fused arm never logged '[spec-stats] mode=pld' — speculation did not engage, the arm proves nothing."
     exit 1
@@ -291,7 +296,7 @@ MODEL="$VERIFY_MODEL"
 sleep 2
 VER_DENSE_COMPL=""
 VER_DENSE_TOK=""
-run_and_tokenize "verify dense" "--kv-attn-mode dense --pld" VER_DENSE_COMPL VER_DENSE_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "verify dense" "--pld" VER_DENSE_COMPL VER_DENSE_TOK "$(with_mode dense "$SPEC_PAYLOAD")" || exit 1
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} verify-arm dense boot never engaged PLD — the arm proves nothing."
     exit 1
@@ -299,7 +304,7 @@ fi
 sleep 2
 VER_FUSED_COMPL=""
 VER_FUSED_TOK=""
-run_and_tokenize "verify fused" "--kv-attn-mode fused --pld" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "verify fused" "--pld" VER_FUSED_COMPL VER_FUSED_TOK "$(with_mode fused "$SPEC_PAYLOAD")" || exit 1
 MODEL="$SAVED_MODEL"
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} verify-arm fused boot never engaged PLD — the arm proves nothing."
@@ -318,9 +323,9 @@ if ! compare_first_n_tokens "verify-kernel fused vs dense" "$VER_DENSE_TOK" "$VE
 a='$VER_DENSE_TOK'.split(','); b='$VER_FUSED_TOK'.split(',')
 print(next(i for i,(x,y) in enumerate(zip(a,b)) if x!=y))")
     MODEL="$VERIFY_MODEL"
-    LP_PAYLOAD=$(echo "$SPEC_PAYLOAD" | python3 -c "import sys,json; d=json.load(sys.stdin); d.update(max_tokens=$IDX+1, logprobs=True, top_logprobs=2); print(json.dumps(d))")
+    LP_PAYLOAD=$(echo "$SPEC_PAYLOAD" | python3 -c "import sys,json; d=json.load(sys.stdin); d.update(max_tokens=$IDX+1, logprobs=True, top_logprobs=2, kv_attn_mode='dense'); print(json.dumps(d))")
     echo "  starting server (verify tie probe)..." >&2
-    SUSHI_KV_ATTN_MIN_TK=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 --kv-attn-mode dense --no-pld > /dev/null 2>&1 &
+    SUSHI_KV_ATTN_MIN_TK=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 --no-pld > /dev/null 2>&1 &
     TP_PID=$!
     for i in $(seq 1 60); do curl -s -f "$BASE/health" > /dev/null 2>&1 && break; sleep 1; done
     GAP=$(echo "$LP_PAYLOAD" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" | python3 -c "

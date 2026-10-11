@@ -19,9 +19,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
   the default.
 - GLM (`glm5_next`) takes the kv8 default too, through its own MLA latent backend (`glm5_latent.zig`,
   [glm5-arch](glm5-arch.md#scope)); kv4 is refused.
-- `--kv-attn-mode auto|dense|fused` picks the packed-read arm (`auto` from an 8K PROMPT, fixed at admission); MiMo's
-  global-layer decode ignores it and picks per step from the cache's length. `--decode-attn-quant` (default ON,
-  LOSSY) requants dense attention at decode AND verify.
+- The packed-read arm is `auto` (fused from an 8K PROMPT, fixed at admission); a request's `kv_attn_mode` field
+  (`dense` or `fused`) overrides it. MiMo's global-layer decode ignores both and picks per step from the cache's
+  length. Decode-attn-quant (default ON, LOSSY; `--no-decode-attn-quant` restores dense) requants dense attention at
+  decode AND verify.
 
 ## The kv-quant contract
 

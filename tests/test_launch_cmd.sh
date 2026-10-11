@@ -5,7 +5,7 @@
 #
 # Pins:
 #   [1] unknown agent → error naming the choices
-#   [2] no server + --no-start → instructions to start one, exit 1
+#   [2] no server → instructions to start one, exit 1
 #   [3] launch omp --print against a live server: script exports the pi-spelled
 #       agent dir var, targets the served model, and the written models.yml
 #       carries the server's ADVERTISED context (never a hardcoded one)
@@ -53,12 +53,12 @@ else
     run_test "unknown agent errors naming the choices" FAIL "$OUT"
 fi
 
-# ── [2] no server, --no-start ──
-OUT=$("$BIN" launch omp --no-start --url http://127.0.0.1:59999 2>&1)
+# ── [2] no server ──
+OUT=$("$BIN" launch omp --url http://127.0.0.1:59999 2>&1)
 if [ $? -ne 0 ] && echo "$OUT" | grep -qi "sushi serve"; then
-    run_test "dead server + --no-start instructs how to start one" PASS
+    run_test "dead server instructs how to start one" PASS
 else
-    run_test "dead server + --no-start instructs how to start one" FAIL "$OUT"
+    run_test "dead server instructs how to start one" FAIL "$OUT"
 fi
 
 echo "Starting server..."

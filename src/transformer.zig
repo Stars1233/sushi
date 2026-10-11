@@ -7120,7 +7120,7 @@ pub const KVCache = struct {
         //    lazy, so the dequant graph below costs nothing unless SDPA
         //    actually reads `.k`/`.v`. (Engagement bug class: the decode
         //    forward calls update(), not denseView() — omitting the triples
-        //    here made `--kv-attn-mode fused` a silent no-op.)
+        //    here made `kv_attn_mode: "fused"` a silent no-op.)
         const dense_k = try kv_quant.dequantizeAffine(s, trip[0], trip[1], trip[2], group_size, bits);
         errdefer _ = mlx.mlx_array_free(dense_k);
         const dense_v = try kv_quant.dequantizeAffine(s, trip[3], trip[4], trip[5], group_size, bits);
@@ -14378,7 +14378,7 @@ pub fn logKvAttnFusedEngaged(view: *const DenseKVView, q: mlx.mlx_array, t_q: c_
     const h_q: c_int = if (q_shape.len >= 4) q_shape[1] else 0;
     const k_shape = mlx.getShape(view.k_triple_q);
     const h_kv: c_int = if (k_shape.len >= 4) k_shape[1] else 0;
-    log.info("[kv-attn] fused engaged: bits={d} gs={d} Hq={d} Hkv={d} Tq={d} (SUSHI_KV_ATTN_FUSED=0 or --kv-attn-mode dense restores dense reads)\n", .{ view.bits, view.group_size, h_q, h_kv, t_q });
+    log.info("[kv-attn] fused engaged: bits={d} gs={d} Hq={d} Hkv={d} Tq={d} (SUSHI_KV_ATTN_FUSED=0 or a request's kv_attn_mode of dense restores dense reads)\n", .{ view.bits, view.group_size, h_q, h_kv, t_q });
 }
 
 // ── Transformer ──
@@ -22795,7 +22795,7 @@ fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp: Qua
 // four projections are ~3 GB/token of a ~4 GB/token read. An INT8 group-32
 // affine side copy halves that traffic. LOSSY BY DESIGN — a real
 // requantization of weights the checkpoint ships dense, so this is a
-// user-facing toggle (--decode-attn-quant / app Settings), never a sanctioned
+// user-facing toggle (--no-decode-attn-quant / app Settings), never a sanctioned
 // bit-identical class. Prefill, spec-verify and every other multi-token
 // forward keep the authoritative dense weight (a quality anchor: KV built by
 // prefill stays exact; only decode-step projections carry the perturbation).
@@ -22818,8 +22818,7 @@ const QkAngleSlot = struct {
 };
 
 var attn_dq_engaged: bool = false;
-/// Set by the CLI (`--decode-attn-quant` / `--no-decode-attn-quant`) before
-/// any load; a transformer-level global so every serve path (headless
+/// Set by the CLI (`--no-decode-attn-quant`) before any load; a transformer-level global so every serve path (headless
 /// included — the runHeadlessServe flag-eater class) sees one value.
 pub var decode_attn_quant_flag: ?bool = null;
 pub var decode_attn_quant_override: ?bool = null; // test seam
@@ -22831,16 +22830,6 @@ var decode_attn_quant_cached: ?bool = null;
 /// wording-level divergence only). Flip together with the mirrored Swift
 /// `ServerOptions` default.
 pub const DECODE_ATTN_QUANT_DEFAULT = true;
-
-/// Whether the user EXPLICITLY asked for --decode-attn-quant (CLI flag or app
-/// toggle) as opposed to riding the silent default. Archs whose
-/// characterization showed ANSWER MOVEMENT under the requant gate on this
-/// form (dsv4 comp_in: one duplicated paragraph on 1/7 greedy prompts,
-/// 2026-08-01); laguna's clean characterization keeps the plain default.
-pub fn decodeAttnQuantExplicit() bool {
-    if (decode_attn_quant_override) |v| return v; // test seam counts as explicit
-    return decode_attn_quant_flag orelse false;
-}
 
 pub fn decodeAttnQuantEnabled() bool {
     if (decode_attn_quant_override) |v| return v;
@@ -22855,7 +22844,7 @@ fn attnProjRouted(config: *const ModelConfig, moe_forward: bool) bool {
     return moe_forward and !config.isMla() and !config.isGemma4Layers();
 }
 
-/// Whether `--decode-attn-quant` has anything to requantize: a text-trunk attention
+/// Whether decode-attn-quant has anything to requantize: a text-trunk attention
 /// projection shipped dense. Fully quantized packs decode exactly as without it.
 pub fn weightsHaveDenseAttnProj(weights: *const Weights) bool {
     const projs = [_][]const u8{ ".q_proj.weight", ".k_proj.weight", ".v_proj.weight", ".o_proj.weight", ".q_k_v_proj.weight", ".wq_du.weight", ".wk_dv.weight", ".wv_dv.weight", ".wo_ud.weight", ".wr_du.weight" };
@@ -28789,8 +28778,8 @@ test "KVCache sliding window views return last max_seq entries" {
 test "KVCache updateAffine returns quant triples so fused attention can engage" {
     // Engagement-bug guard (docs/kv-quant-perf.md Phase 0/1): the decode
     // forward calls `cache.update(...)`, NOT `denseView`, so the triples must
-    // ride the update path's DenseKVView too — otherwise `--kv-attn-mode
-    // fused` silently never engages (output-identical to dense mode, which is
+    // ride the update path's DenseKVView too — otherwise `kv_attn_mode:
+    // "fused"` silently never engages (output-identical to dense mode, which is
     // why an equivalence test can't see it).
     const s = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(testing.allocator, 1, kv_quant.KVQuantConfig.affine(8));
@@ -44523,7 +44512,6 @@ test "decode-attn-quant: only the launch flag decides, never the environment" {
     _ = setenv("SUSHI_DECODE_ATTN_QUANT", "1", 1);
     decode_attn_quant_cached = null;
     try t.expect(!decodeAttnQuantEnabled());
-    try t.expect(!decodeAttnQuantExplicit());
 }
 
 test "decode-attn-quant: int8 side copy tracks the dense projection (and is honestly lossy)" {

@@ -87,7 +87,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - **`--mtp-min-depth N` / `--mtp-max-depth N` bound every depth the planner picks** (`src/mtp_depth_bounds.zig`): the
   EV plan's base and extension (`mtpPlanInBounds`), the windowed controller, the grouped planner's row widths
   (`plannerWidth`; a plain tick is not a depth and stays), the width trial, and a prompt lookup's draft count. Both are
-  1..8; `min > max` and the removed `--mtp-depth` exit at startup. The boot logs `[mtp] depth range lo..hi (source)`.
+  1..8; `min > max` exits at startup. The boot logs `[mtp] depth range lo..hi (source)`.
 - **Defaults are the planner's own**: min 1, max the cost profile's cap (8 on an eligible M5 NAX target, else 6, lower on
   a measured per-silicon row, 3 under `SUSHI_MTP_ADAPTIVE=0`). An explicit max is also the table's ceiling (no
   trusted-width climb past it), and a min above the default cap lifts it. A MiMo head count or verify row budget below

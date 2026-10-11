@@ -197,7 +197,7 @@ fn printUsage(io: std.Io) void {
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV). No effect on MiMo, whose
         \\                        heads keep a dense sliding window.
-        \\  --decode-attn-quant / --no-decode-attn-quant
+        \\  --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
         \\                      INT8 group-32. Cuts their per-token weight
@@ -240,11 +240,6 @@ fn printUsage(io: std.Io) void {
         \\                        bound is inclusive (<n> itself still drafts)
         \\                        and it outranks `enable_mtp:true` in the
         \\                        request body. MTP only — PLD is unaffected.
-        \\  --mtp-history-window <n>
-        \\                      MTP prefill-history window: prompts forwarding
-        \\                        more than 16384 tokens only build head history
-        \\                        for the last <n> (default: 0 = full history;
-        \\                        windowing costs acceptance on stock Qwen heads).
         \\  --qwen-gdn <fp32|bf16>
         \\                      Qwen only: store its GatedDeltaNet recurrent
         \\                      state in fp32 between tokens (default bf16). A
@@ -259,16 +254,6 @@ fn printUsage(io: std.Io) void {
         \\                          model's model-settings.json `kv_quant`.
         \\                          Per-request override via the `kv_quant`
         \\                          body field.
-        \\  --kv-attn-mode {{auto|dense|fused}}
-        \\                      Decode read path for quantized KV. `dense`
-        \\                        dequantizes K/V before SDPA; `fused` reads
-        \\                        the packed cache in place at decode width
-        \\                        (spec verify + prefill always read dense);
-        \\                        `auto` (default) picks fused from 8K prompt
-        \\                        tokens. Only effective at --kv-quant 4 or 8;
-        \\                        per-request `kv_attn_mode` field overrides.
-        \\                        MiMo's global layers read packed from 4096
-        \\                        cached keys in every mode.
         \\  --prefill-chunk <n> Maximum tokens forwarded per prefill chunk
         \\                        (default: 8192). Auto-capped further per model
         \\                        so one layer's attention scores stay within
@@ -327,11 +312,6 @@ fn printUsage(io: std.Io) void {
         \\                        is at least (1 - n) x the missed one's. 0..0.6;
         \\                        0.3 is a mild setting. A sigmoid router (MiMo)
         \\                        compares sigmoid probabilities.
-        \\  --tokenize-cache-entries <n>
-        \\                      Per-model LRU cache of chat-template render +
-        \\                        tokenize results (default: 4). Skips re-
-        \\                        rendering identical messages on warm reuse.
-        \\                        0 disables.
         \\  --expert-cache-gb <n>
         \\                      Stream routed experts from SSD (Sushi pack or
         \\                        source checkpoint) with a decimal-GB cache.
@@ -532,8 +512,6 @@ pub fn main(init: std.process.Init) !void {
     var pld_key_len: u32 = 3;
     var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
     var no_drafter = false; // --no-drafter: never load one, merged-in ones included
-    var draft_block_size: u32 = 4;
-    var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     // --mtp: force the head ON where requests do not default to it: an SSD-streamed
     // pack and inherited MoE arches (server.defaultEnableMtp).
@@ -543,16 +521,8 @@ pub fn main(init: std.process.Init) !void {
     var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = null;
     var mtp_tokenv3_raw: ?[]const u8 = null;
-    // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
-    // Default ON in serve mode — small boot-time cost, big cold-prefill win.
-    // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
-    var warmup_eager: bool = true;
     var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default;
     var kv_quant_explicit = false;
-    // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
-    // mlx_quantized_matmul instead of dequantizing through DenseKVView.
-    // Off by default — only the `.affine` cache scheme has a fused path.
-    var kv_attn_mode: server_mod.KvAttnMode = .auto;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -691,8 +661,6 @@ pub fn main(init: std.process.Init) !void {
             sleep_inhibit_mod.setEnabled(false);
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
-        } else if (std.mem.eql(u8, args[i], "--no-safety")) {
-            // Accepted as a no-op so launchers that pass it keep booting.
         } else if (std.mem.eql(u8, args[i], "--pld")) {
             enable_pld = true;
             pld_explicit = true;
@@ -712,10 +680,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--drafter") and i + 1 < args.len) {
             i += 1;
             drafter_dir = args[i];
-        } else if (std.mem.eql(u8, args[i], "--draft-block-size") and i + 1 < args.len) {
-            i += 1;
-            draft_block_size = try std.fmt.parseInt(u32, args[i], 10);
-            draft_block_size_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--metrics")) {
             metrics_enabled = true;
         } else if (std.mem.eql(u8, args[i], "--api-key") and i + 1 < args.len) {
@@ -754,13 +718,8 @@ pub fn main(init: std.process.Init) !void {
             mtp_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
-        } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
-            transformer_mod.decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
             transformer_mod.decode_attn_quant_flag = false;
-        } else if (std.mem.eql(u8, args[i], "--mtp-depth")) {
-            log.err("{s}\n", .{depth_bounds.removed_flag_message});
-            std.process.exit(1);
         } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
             i += 1;
@@ -783,12 +742,6 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-mtp-ctx") and i + 1 < args.len) {
             i += 1;
             generate_mod.max_mtp_ctx = try std.fmt.parseInt(u32, args[i], 10);
-        } else if (std.mem.eql(u8, args[i], "--mtp-history-window") and i + 1 < args.len) {
-            i += 1;
-            // 0 = full history; otherwise the last-N-token window applied
-            // above mtp.HISTORY_WINDOW_THRESHOLD (set-once module override,
-            // same contract as --prefill-chunk).
-            generate_mod.mtp_history_window_override = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
@@ -810,10 +763,6 @@ pub fn main(init: std.process.Init) !void {
             server_mod.host_managed = true;
         } else if (std.mem.eql(u8, args[i], "--no-update-check")) {
             no_update_check = true;
-        } else if (std.mem.eql(u8, args[i], "--warmup-eager")) {
-            warmup_eager = true;
-        } else if (std.mem.eql(u8, args[i], "--no-warmup-eager")) {
-            warmup_eager = false;
         } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
             i += 1;
             // `explicit` disables the machine-sized pin, so only a real width
@@ -825,8 +774,6 @@ pub fn main(init: std.process.Init) !void {
                     generate_mod.prefill_chunk_explicit = true;
                 }
             } else |_| {}
-        } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
-            generate_mod.prefill_trace_force = true;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
             i += 1;
             server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -869,12 +816,6 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--preserve-thinking: expected on or off; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--tokenize-cache-entries") and i + 1 < args.len) {
-            // Iteration 2 (perf-plan Phase 4 #3): caps the per-LoadedModel
-            // chat-template tokenize cache. 0 = off (every request re-
-            // renders+re-tokenizes, mirrors pre-Iteration-2 behavior).
-            i += 1;
-            server_mod.tokenize_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-stride") and i + 1 < args.len) {
             // Phase 1 (perf-plan): per-position SSM/conv state snapshots during
             // chunked prefill enable multi-turn warm reuse on hybrid SSM
@@ -978,18 +919,6 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--ssd-budget-gb: expected an integer in 1..512; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
-        } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
-            i += 1;
-            if (std.mem.eql(u8, args[i], "dense")) {
-                kv_attn_mode = .dense;
-            } else if (std.mem.eql(u8, args[i], "fused")) {
-                kv_attn_mode = .fused;
-            } else if (std.mem.eql(u8, args[i], "auto")) {
-                kv_attn_mode = .auto;
-            } else {
-                log.err("--kv-attn-mode: expected 'dense', 'fused' or 'auto'; got '{s}'\n", .{args[i]});
-                std.process.exit(1);
-            }
         } else {
             // Nothing above consumed it. This loop used to end here with no
             // else at all, so an unrecognized argument was dropped in SILENCE
@@ -1220,7 +1149,6 @@ pub fn main(init: std.process.Init) !void {
         .top_p = top_p_flag,
         .top_k = top_k_flag,
         .pld = cli_pld,
-        .kv_attn_mode = kv_attn_mode,
     };
 
     // Echo the resolved arguments — makes drafter/target mismatches obvious
@@ -1228,11 +1156,7 @@ pub fn main(init: std.process.Init) !void {
     // the parent's process listing.
     log.info("[args] model: {s}\n", .{model_dir});
     if (drafter_dir) |dir| {
-        log.info("[args] drafter: {s} (block_size={d}{s})\n", .{
-            dir,
-            draft_block_size,
-            if (draft_block_size_explicit) "" else ", auto",
-        });
+        log.info("[args] drafter: {s}\n", .{dir});
     } else {
         log.debug("[args] drafter: <none>\n", .{});
     }
@@ -1251,7 +1175,6 @@ pub fn main(init: std.process.Init) !void {
         .off => log.info("[args] kv-quant: off\n", .{}),
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
-    log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
     if (model_settings_mod.fast) {
         // The launch layer only: a model's own settings resolve at its load.
         const mtp = model_settings_mod.MtpChoice.resolve(model_settings_mod.launchFlag(bool, enable_mtp, mtp_explicit), null, true);
@@ -1503,9 +1426,6 @@ pub fn main(init: std.process.Init) !void {
             .mtp_head_kv_quant = mtp_head_kv_quant,
             .mtp_depth = depth_bounds.active.max,
             .load_vision = load_vision,
-            .warmup_eager = warmup_eager,
-            .draft_block_size = draft_block_size,
-            .draft_block_size_explicit = draft_block_size_explicit,
             .kv_quant_config = kv_quant_config,
             .kv_quant_explicit = kv_quant_explicit,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
@@ -1700,7 +1620,6 @@ const LaunchServe = struct {
     top_p: ?f32,
     top_k: ?u32,
     pld: server_mod.PldDefaults,
-    kv_attn_mode: server_mod.KvAttnMode,
 
     fn serverConfig(self: LaunchServe) server_mod.ServerConfig {
         return .{
@@ -1715,7 +1634,6 @@ const LaunchServe = struct {
             .pld_explicit = self.pld.explicit,
             .default_pld_draft_len = self.pld.draft_len,
             .default_pld_key_len = self.pld.key_len,
-            .kv_attn_mode = self.kv_attn_mode,
         };
     }
 };
@@ -1808,7 +1726,6 @@ fn runHeadlessServe(
         .no_initial_load = true,
         .load_vision = false,
         .warmup_eager = false,
-        .draft_block_size = 0,
         .kv_quant_config = kv_quant_config,
         .kv_quant_explicit = kv_quant_explicit,
         .mtp_enabled = enable_mtp,
@@ -1887,13 +1804,11 @@ test "both boot modes build their server defaults from the same launch flags" {
         .top_p = 0.8,
         .top_k = 20,
         .pld = server_mod.PldDefaults.fromCli(true, 7, 4),
-        .kv_attn_mode = .dense,
     };
     const cfg = launch.serverConfig();
     try std.testing.expectEqual(@as(?f32, 0.3), cfg.default_temperature);
     try std.testing.expectEqual(@as(?f32, 0.8), cfg.default_top_p);
     try std.testing.expectEqual(@as(?u32, 20), cfg.default_top_k);
-    try std.testing.expectEqual(server_mod.KvAttnMode.dense, cfg.kv_attn_mode);
     try std.testing.expectEqual(@as(u32, 4096), cfg.default_max_tokens);
     try std.testing.expectEqual(@as(u32, 7), cfg.default_pld_draft_len);
     try std.testing.expectEqual(@as(u32, 4), cfg.default_pld_key_len);

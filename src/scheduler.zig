@@ -137,12 +137,6 @@ pub const LoadParams = struct {
     /// the decode path on the inference thread. Adds ~600-900 ms at boot but
     /// keeps the first user request fast.
     warmup_eager: bool = true,
-    /// Drafter block size (caller computed via `drafter.recommendedBlockSize`).
-    /// Ignored when `drafter_dir` is empty.
-    draft_block_size: u32 = 4,
-    /// Whether the user passed --draft-block-size explicitly (used for
-    /// human-readable startup logging). Ignored when `drafter_dir` is empty.
-    draft_block_size_explicit: bool = false,
     /// KV-cache storage backend: `--kv-quant`, else the kv8 engine default. Stored on every
     /// per-slot KVCache and consulted at every read/write boundary.
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default,
@@ -1166,8 +1160,6 @@ pub const LoadRequest = struct {
 
     load_vision: bool = false,
     warmup_eager: bool = true,
-    draft_block_size: u32 = 4,
-    draft_block_size_explicit: bool = false,
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.engine_default,
     kv_quant_explicit: bool = false,
     prefix_cache_capacity: u32 = 1,
@@ -1299,8 +1291,6 @@ pub const Scheduler = struct {
     no_drafter: bool,
     drafter_dir: []const u8,
     primary_model_dir: []const u8,
-    draft_block_size: u32,
-    draft_block_size_explicit: bool,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     drafter_path: []const u8,
@@ -1474,7 +1464,7 @@ pub const Scheduler = struct {
             .xfm = null,
             .weights = null,
             .vision_encoder = null,
-            .drafter_block_size = params.draft_block_size,
+            .drafter_block_size = 0,
             .kv_quant_config = params.kv_quant_config,
             .kv_quant_explicit = params.kv_quant_explicit,
             .ctx_size_flag = params.ctx_size,
@@ -1496,8 +1486,6 @@ pub const Scheduler = struct {
             .no_drafter = params.no_drafter,
             .drafter_dir = params.drafter_dir,
             .primary_model_dir = params.model_dir,
-            .draft_block_size = params.draft_block_size,
-            .draft_block_size_explicit = params.draft_block_size_explicit,
             .drafter_path = params.drafter_dir,
             .hot_prefix_cache = null,
             .max_concurrent = cap,
@@ -1974,14 +1962,12 @@ pub const Scheduler = struct {
             .tok = owned.tok,
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
-            // `--no-drafter` / `--drafter` / `--draft-block-size` reach cold
-            // loads too; the path itself is scoped by `coldLoadDrafterDir`.
+            // `--no-drafter` / `--drafter` reach cold loads too; the path
+            // itself is scoped by `coldLoadDrafterDir`.
             .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
             .no_drafter = self.no_drafter,
             .load_vision = coldLoadVision(owned.config, false),
             .warmup_eager = true,
-            .draft_block_size = self.draft_block_size,
-            .draft_block_size_explicit = self.draft_block_size_explicit,
             .kv_quant_config = self.kv_quant_config,
             .kv_quant_explicit = self.kv_quant_explicit,
             // Cold loads get the SAME prefix-cache configuration as the
@@ -3718,10 +3704,9 @@ test "the cold-load LoadRequest re-applies EVERY retained launch setting" {
         "kv_quant_config",           "prefix_cache_capacity", "prefix_cache_mem_bytes",
         "prefix_cache_disk_bytes",   "ssm_checkpoint_stride", "ssm_checkpoint_max",
         "mtp_enabled",               "mtp_head_kv_quant",     "mtp_depth",
-        "no_drafter",                "draft_block_size",      "draft_block_size_explicit",
-        "prefix_cache_mem_resolver", "expert_cache_bytes",    "expert_cache_fit_resolver",
-        "ssd_budget_bytes",          "kv_quant_explicit",     "mtp_explicit",
-        "prefix_cache_disk_resolver",
+        "no_drafter",                "prefix_cache_mem_resolver", "expert_cache_bytes",
+        "expert_cache_fit_resolver", "ssd_budget_bytes",          "kv_quant_explicit",
+        "mtp_explicit",              "prefix_cache_disk_resolver",
     }) |field| {
         const needle = "." ++ field ++ " = self" ++ "." ++ field ++ ",";
         try testing.expect(std.mem.indexOf(u8, src, needle) != null);
@@ -4010,9 +3995,8 @@ test "the eviction gate bills weights plus 10% headroom" {
 /// `params` is duck-typed (`anytype`): both `LoadParams` (startup) and
 /// `*LoadRequest` (on-demand) supply the same field set — `entry`,
 /// `config`/`tok`/`chat_config` (heap pointers), `model_dir`,
-/// `drafter_dir`, `load_vision`, `warmup_eager`, `draft_block_size`,
-/// `draft_block_size_explicit`, `kv_quant_config`, `prefix_cache_capacity`,
-/// `prefix_cache_mem_bytes`. The function reads them by name.
+/// `drafter_dir`, `load_vision`, `warmup_eager`, `kv_quant_config`,
+/// `prefix_cache_capacity`, `prefix_cache_mem_bytes`. The function reads them by name.
 ///
 /// On any error the partial state has already been freed via errdefer; the
 /// caller decides how to surface (startup → recordLoadError + signal
@@ -4604,17 +4588,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         dflash_ptr = d;
         const wide_lane = dflash_mod.wideVerifyLaneAvailable();
         const block_cap = dflash_mod.blockCapForMachine(chip_mod.chipBrand());
-        sch.drafter_block_size = dflash_mod.resolveBlockSize(
-            d.config.block_size,
-            params.draft_block_size,
-            params.draft_block_size_explicit,
-            wide_lane,
-            block_cap.cap,
-        );
+        sch.drafter_block_size = dflash_mod.resolveBlockSize(d.config.block_size, wide_lane, block_cap.cap);
         var cap_note_buf: [96]u8 = undefined;
-        const cap_note: []const u8 = if (params.draft_block_size_explicit)
-            ", user-clamped"
-        else if (!wide_lane and d.config.block_size > sch.drafter_block_size)
+        const cap_note: []const u8 = if (!wide_lane and d.config.block_size > sch.drafter_block_size)
             std.fmt.bufPrint(&cap_note_buf, ", capped ({s} cap {d})", .{
                 block_cap.label,
                 block_cap.cap,

@@ -20,10 +20,6 @@ pub const Bounds = struct {
 /// Process-wide, set once from the launch flags before a model loads.
 pub var active: Bounds = .{};
 
-pub const removed_flag_message =
-    "--mtp-depth was replaced by --mtp-min-depth <n> and --mtp-max-depth <n>: the planner works inside that range, " ++
-    "and the same value for both pins one depth";
-
 pub fn parseDepth(text: []const u8, max_depth: u32) error{NotADepth}!u32 {
     const n = std.fmt.parseInt(u32, text, 10) catch return error.NotADepth;
     if (n < 1 or n > max_depth) return error.NotADepth;

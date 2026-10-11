@@ -14,7 +14,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - `src/cli.zig`: alias → HF repo, resumable pull into `~/.sushi/models/<org>/<repo>`, `list`, `run` REPL.
 - `pull` takes top-level files, `mtp/` and GLM's `GLM-5.3-Flash-DFlash2/` assistant (the loader auto-detects that folder; a
   pull that skips it serves GLM with DFlash2 off, logged as `[glm-dflash] off: no assistant found`).
-- Headless and `--model` boots build their `ServerConfig` defaults from one `LaunchServe` (sampling, PLD, `--kv-attn-mode`,
+- Headless and `--model` boots build their `ServerConfig` defaults from one `LaunchServe` (sampling, PLD,
   context, timeout): a flag one mode parses and the other drops is the class. `--no-drafter`/`--drafter` reach both too.
 - **The embedded REPL uses in-process HTTP**: never fork `curl` from the resident engine for readiness checks or chat
   turns. Test `run` on a real TTY; a serving-only smoke test does not exercise its client.
@@ -120,8 +120,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `--mtp-greedy-tail`, `--ssd-budget-gb/--expert-cache-gb`, `--preserve-thinking`, `--think-penalty`, `--logit-bias-file`, `--vision/--no-vision`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
-  `model-settings.json` key; a removed `--mtp-depth` exits naming the two
-  ([engine-mtp](engine-mtp.md#depth-range)).
+  `model-settings.json` key ([engine-mtp](engine-mtp.md#depth-range)).
 - **`--no-mtp-lookup` is launch-only too** (no `model-settings.json` key): it turns off the prompt-lookup drafts in MTP
   rounds (Qwen, MiMo) and GLM DFlash2's lookup chains. Standalone PLD keeps `--pld`/`--no-pld`; neither implies the other.
 - **`--fast` is a flag profile, ranked between the flags and the file**: an explicit flag > `--fast` >

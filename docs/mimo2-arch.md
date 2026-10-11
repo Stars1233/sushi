@@ -152,7 +152,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   takes the split-K arm on an M5 for A/B.
 - **The arm is chosen per decode STEP from the cache's current key count**, never from the request's admission-time
   `kv_attn_fused` (`auto` resolves that from the PROMPT, so a short prompt that grew long stayed on the rebuild,
-  unbilled, and at 256k drove wired memory to the limit). `--kv-attn-mode` and the per-request field no longer reach
+  unbilled, and at 256k drove wired memory to the limit). The per-request `kv_attn_mode` field no longer reaches
   these layers; `SUSHI_KV_ATTN_FUSED=0` still does, and `kvDequantScratchBytes` then bills the whole-cache rebuild
   (`mimoGlobalDecodeRebuildMaxKeys`). The older SIMD `qkvAttnDecodeKernel` cannot stage gqa 16 x qk 192.
   Attention-only microbench (9 layers, kv8) vs the per-call dequant+SDPA rebuild: split-K 0.62x at 4k, 0.50x at 16k,

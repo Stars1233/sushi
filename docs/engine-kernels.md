@@ -124,7 +124,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - `vqmmLaneFor`: split-K M 2–7 / wide tile N≥100K / NAX m16 M 8–16; parity = fp32-dequant per width, never vs
   stock's worst element (`VerifyQmmParity`); a verify lane is never byte-identical to stock. Sub-4-bit weights fall
   outside it (a 4/5/6-bit specialisation).
-- `--decode-attn-quant` (default ON, LOSSY) requants dense attention at decode AND verify.
+- Decode-attn-quant (default ON, LOSSY; `--no-decode-attn-quant` restores dense) requants dense attention at decode AND verify.
 
 ## NAX and Metal pitfalls
 

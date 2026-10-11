@@ -128,8 +128,8 @@ Kept because the launch flag cannot express what the env does.
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
-| `SUSHI_KV_ATTN_FUSED` | `transformer.zig:14237` | `0` disables fused quantized-KV attention. The only switch for MiMo's global-layer decode: `--kv-attn-mode` does not reach it | once | yes: mimo2-arch |
-| `SUSHI_KV_ATTN_KERNEL`, `SUSHI_KV_ATTN_VERIFY` | `transformer.zig` | `0` drops the decode / verify kernel and falls to the composed packed-qmm chain, which `--kv-attn-mode dense` (a dense rebuild) is not | once | yes: engine-kv-cache |
+| `SUSHI_KV_ATTN_FUSED` | `transformer.zig:14248` | `0` disables fused quantized-KV attention. The only switch for MiMo's global-layer decode: a request's `kv_attn_mode` does not reach it | once | yes: mimo2-arch |
+| `SUSHI_KV_ATTN_KERNEL`, `SUSHI_KV_ATTN_VERIFY` | `transformer.zig` | `0` drops the decode / verify kernel and falls to the composed packed-qmm chain, which `kv_attn_mode: "dense"` (a dense rebuild) is not | once | yes: engine-kv-cache |
 | `SUSHI_MTP_ADAPTIVE` | `generate.zig:8895` | `0` selects the windowed depth controller, a different algorithm that can also disable MTP; `--mtp-min-depth n --mtp-max-depth n` pins a depth but cannot express it | once | yes: engine-mtp, tests/CLAUDE, --help |
 | `SUSHI_PREFIX_CACHE_DIR` | `kv_disk_cache.zig:4332` | absolute directory for the SSD prefix cache (default under `~/.sushi`); `--prefix-cache-disk` sets a size, not a directory | boot | yes: engine-prefix-cache, tests/CLAUDE, --help |
 
@@ -150,7 +150,7 @@ Cut from the code with the arm only they reached; the defaults are unchanged.
 - *A launch flag is the control*: `SUSHI_DFLASH` (`--no-drafter`), `SUSHI_MTP_TOKENV3` and `SUSHI_MTP_TYPICAL` (`--mtp-tokenv3`, `--mtp-typical`), `SUSHI_PREFILL_CHUNK` (`--prefill-chunk`; the env also bypassed the safety cap), `SUSHI_PREFILL_DECODE_SHARE`, `SUSHI_PREFILL_TRACE`, `SUSHI_NO_UPDATE_CHECK`, `SUSHI_DECODE_ATTN_QUANT` (the env outranked the flag).
 - *Duplicates of another env*: `SUSHI_KVQ_FORCE_SPLITK`, `SUSHI_MOE_GATHER_QMV_OFF`, `SUSHI_VERIFY_QMM_NAX`.
 - *Rejected or never-adopted experiments*: `SUSHI_DFLASH_CHOOSER`, `_DRAFT_HEAD_BITS`, `_SAMPLED_DRAFTS`, `SUSHI_MTP_ADAPTIVE_REENTRY_TOKENS`, `SUSHI_MTP_BATCHED_QWEN4`, `SUSHI_FUSED_QKV`, `SUSHI_LMHEAD_PRUNE`, `_PRUNE_TRACE`, `SUSHI_LMHEAD_UBENCH` (its meter), `SUSHI_MOE_BATCHED_DECODE`, `SUSHI_MOE_VERIFY_PAIRED_GU`, `SUSHI_VERIFY_QMM_CROSSROW`, `SUSHI_ADD_RMSNORM_FUSED` (the gated entry only; the kernel stays, MiMo wires it), `SUSHI_COMPILE_FORWARD`.
-- *The nvfp4 tail of `--decode-attn-quant`*: `SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM`, with the tail itself (every side copy is int8 group-32).
+- *The nvfp4 tail of decode-attn-quant*: `SUSHI_DECODE_ATTN_QUANT_NVFP4_FROM`, with the tail itself (every side copy is int8 group-32).
 - *Kill switches of adopted arms*: `SUSHI_FUSED_256` (the hd-256 `sushi_attn_p256` kernel; the composed path still serves declined shapes and is the tests' parity oracle) and `SUSHI_SSD_WRITE_THROUGH` (the prefill write-through to the SSD tier, always on once its gates pass).
 - *Measured, then adopted or dropped*: `SUSHI_GDN_PIPELINED` (the software-pipelined GDN prefill kernel is the NAX Qwen route, +3.8% prefill at 32K) and `SUSHI_QSA_ATTN_BALANCED` (the balanced split-K arm: no gain, not bit-identical; [qwen4-perf](qwen4-perf.md#gdn-pipelined)).
 - *Dead or leftover*: `CODEX_SANDBOX`, `HY3_MODEL_DIR`, `MINICPM5_MODEL_DIR`, `PERF_REPORT`, `REAL_BLOB`, `SUSHI_DSV4_DSPARK`, and the `--dspark` flag that only set it.
