@@ -403,48 +403,24 @@ pub fn specAdoptPlan(base_pos: usize, snap_step: usize, matched: usize, has_head
     return .{ .head = want };
 }
 
-var ssd_first_env_cached: ?bool = null;
-/// Test/bench override for `ssdFirstEnabled()`. Null = read the environment.
+/// Test seam: forces SSD-first mode off (or on); null = on, armed only where
+/// `ModelConfig.ssdFirstCapable()`.
 pub var ssd_first_override: ?bool = null;
 
-/// Resolve this module's lazily-cached env reads once, from the main thread.
-pub fn warmEnvCaches() void {
-    _ = ssdFirstEnabled();
-    _ = restoreMoveEnabled();
-}
-
-/// SSD-first prefix cache mode (`SUSHI_PREFIX_SSD_FIRST=0` restores RAM-first); armed only
-/// where `ModelConfig.ssdFirstCapable()`.
 pub fn ssdFirstEnabled() bool {
-    if (ssd_first_override) |v| return v;
-    if (ssd_first_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_PREFIX_SSD_FIRST") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    ssd_first_env_cached = v;
-    return v;
+    return ssd_first_override orelse true;
 }
 
-var restore_move_env_cached: ?bool = null;
-/// Test/bench override for `restoreMoveEnabled()`. Null = read the environment.
+/// Test seam: forces the refcount share (false) whose first append copies the whole prefix;
+/// null = restore by move, armed where `HotPrefixCache.ssd_first` is, or on demand when a share
+/// does not fit (`checkoutRestored`).
 pub var restore_move_override: ?bool = null;
 
-/// Restore by move. `SUSHI_RESTORE_MOVE=0` restores the refcount share whose first append
-/// copies the whole prefix. Armed where `HotPrefixCache.ssd_first` is, or on demand when a share
-/// does not fit (`checkoutRestored`).
 pub fn restoreMoveEnabled() bool {
-    if (restore_move_override) |v| return v;
-    if (restore_move_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_RESTORE_MOVE") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    restore_move_env_cached = v;
-    return v;
+    return restore_move_override orelse true;
 }
 
-/// The SSD-first predicate: arch, env switch, AND a disk tier. Without the tier the mode used
+/// The SSD-first predicate: arch, the mode switch, AND a disk tier. Without the tier the mode used
 /// to arm with nowhere to spill and a budget floor sized for a tier that did not exist. The
 /// budget resolver asks `--prefix-cache-disk > 0`, the arming asks `disk != null`.
 pub fn ssdFirstActive(config: *const model_mod.ModelConfig, has_disk: bool, ram_enabled: bool) bool {
@@ -10879,7 +10855,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         try testReadKeyRows(&slot, 0, 596, &moved_bytes);
     }
 
-    // Arm B: the kill switch, the refcount share, same bytes by a different buffer.
+    // Arm B: the refcount share, same bytes by a different buffer.
     {
         restore_move_override = false;
         defer restore_move_override = null;
@@ -11178,7 +11154,7 @@ test "restore by move: a checked-out entry is invisible to a second slot, to evi
     hc.releaseCheckout(42, "test teardown");
 }
 
-test "restore by move: the policy is off outside the SSD-first arm and under the kill switch" {
+test "restore by move: the policy is off outside the SSD-first arm and with the move forced off" {
     // Eligible: SSD-first, enabled, no pending flush, whole entry matched, something to append.
     try testing.expect(HotPrefixCache.checkoutEligible(true, true, false, 600, 600, 608, true));
     try testing.expect(!HotPrefixCache.checkoutEligible(false, true, false, 600, 600, 608, true));

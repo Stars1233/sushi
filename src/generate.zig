@@ -1067,17 +1067,10 @@ pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) voi
 /// Derive + install the reserved-token suppression mask on a freshly-built
 /// Transformer (both the serve load path and the CLI run path call this).
 /// The id set is `tokenizer.reservedOutputIds`: `special: true` added tokens
-/// minus EOS/stop ids minus template-emitted markers. Kill switch
-/// `SUSHI_SUPPRESS_RESERVED=0`. Never fails a load — any error logs and
+/// minus EOS/stop ids minus template-emitted markers. Never fails a load — any error logs and
 /// leaves the mask null (suppression off), and engagement is one-shot-logged
 /// so a silent no-op is visible (the silent-fallback class).
 pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_template: []const u8, eos_ids: []const u32) void {
-    if (std.c.getenv("SUSHI_SUPPRESS_RESERVED")) |v| {
-        if (v[0] == '0') {
-            log.info("[suppress] reserved-token suppression disabled by env\n", .{});
-            return;
-        }
-    }
     const ids = tokenizer_mod.reservedOutputIds(xfm.allocator, tok.flagged_specials, chat_template, eos_ids) catch |err| {
         log.warn("[suppress] derivation failed ({s}); reserved-token suppression off\n", .{@errorName(err)});
         return;

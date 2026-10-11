@@ -3415,7 +3415,7 @@ pub const DiskTier = struct {
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
-    /// the synchronous legacy arm or under `SUSHI_SSD_CHUNK_SHARE=0`.
+    /// the synchronous legacy arm.
     fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig) ?ChunkDonor {
         if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         var best: ?ChunkDonor = null;
@@ -4378,19 +4378,11 @@ pub fn commonPrefixLen(a: []const u32, b: []const u32) usize {
     return i;
 }
 
-var chunk_share_env_cached: ?bool = null;
+/// Test seam: false makes every commit write all its chunks instead of hard-linking a donor's.
 pub var chunk_share_override: ?bool = null;
 
-/// `SUSHI_SSD_CHUNK_SHARE=0` restores the write-everything commit (SSD-first arm only).
 pub fn chunkShareEnabled() bool {
-    if (chunk_share_override) |v| return v;
-    if (chunk_share_env_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_SSD_CHUNK_SHARE") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    chunk_share_env_cached = v;
-    return v;
+    return chunk_share_override orelse true;
 }
 
 fn statFile(io: std.Io, abs_path: []const u8) ?std.Io.File.Stat {

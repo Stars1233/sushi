@@ -3523,19 +3523,6 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
-var ctx_bar_cached: ?bool = null;
-
-/// `SUSHI_PREFILL_CHUNK_CTX_BAR=0` restores the share-only rung cap.
-pub fn ctxBarEnabled() bool {
-    if (ctx_bar_cached) |v| return v;
-    const v = blk: {
-        const raw = std.c.getenv("SUSHI_PREFILL_CHUNK_CTX_BAR") orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    ctx_bar_cached = v;
-    return v;
-}
-
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
 /// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
@@ -3573,7 +3560,7 @@ const HOT_CACHE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 /// is the KV a pinned context has already spoken for (0 under auto-context).
 /// The byte cap one prefill forward's transient may claim, and the one place the sizer's two
 /// changes (dropping the ask, adding the ctx bar) are gated by arch; every other arch keeps
-/// the previous arithmetic. `SUSHI_PREFILL_CHUNK_CTX_BAR=0` drops the ctx bar inside the gate.
+/// the previous arithmetic.
 pub fn prefillChunkCap(
     config: *const model_mod.ModelConfig,
     ceiling: u64,
@@ -3591,7 +3578,7 @@ pub fn prefillChunkCap(
     const share_bar: u64 = serving_budget / PREFILL_RESERVE_BUDGET_SHARE;
     // The ctx bar can only ever narrow; `--ctx-size` is a cap, not an allocation, so it can pin
     // chunk 512 for the life of a process. The narrowing is logged.
-    const ctx_bar: u64 = if (ctxBarEnabled()) (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES else share_bar;
+    const ctx_bar: u64 = (serving_budget -| ctx_kv_bytes) -| HOT_CACHE_FLOOR_BYTES;
     return @min(share_bar, ctx_bar);
 }
 
@@ -3864,10 +3851,10 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
             pin_override,
         );
         // Say when the ctx bar is the binding one.
-        if (ctxBarEnabled() and config.longCtxGated() and explicitPrefillChunk() == 0) {
+        if (config.longCtxGated() and explicitPrefillChunk() == 0) {
             const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, 0, hot_cache_ask);
             if (share_only > config.pinned_prefill_chunk) {
-                log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; SUSHI_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });
+                log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d})\n", .{ config.pinned_prefill_chunk, share_only });
             }
         }
         // Say it once per model, wherever the model was pinned from (startup
@@ -3886,7 +3873,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
 pub fn prefillChunkLoadLine(buf: []u8, config: *const model_mod.ModelConfig, pinned: u32, launch: usize) ?[]const u8 {
     if (perRequestPrefillChunkEnabled(config) and generate_mod.envPrefillChunk() == 0) {
         const widest = rungWidth(config, 1, cappedRung(PREFILL_CHUNK_LADDER[0], ladderTop(config, explicitPrefillChunk())), config.longCtxGated());
-        return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d} (SUSHI_PREFILL_CHUNK_PER_REQUEST=0)\n", .{ widest, pinned }) catch null;
+        return std.fmt.bufPrint(buf, "Prefill chunk: per request, up to {d} at a short prompt (the widest rung each request's bill admits); load-time fallback {d}\n", .{ widest, pinned }) catch null;
     }
     if (pinned >= launch) return null;
     if (config.isGlm5() and pinned == @import("glm5_forward.zig").prefill_chunk)
@@ -5844,7 +5831,7 @@ test "an explicit --prefill-chunk is the widest width a request may run, not a p
     generate_mod.prefill_chunk_override = 256;
     try t.expectEqual(@as(u32, 256), chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, explicitPrefillChunk(), .{}));
 
-    // `SUSHI_PREFILL_CHUNK_PER_REQUEST=0`: the explicit width is the pin again, on the bill and the forward.
+    // Per-request picking off: the explicit width is the pin again, on the bill and the forward.
     generate_mod.prefill_chunk_override = 4096;
     per_request_chunk_override = false;
     defer per_request_chunk_override = null;
@@ -6267,8 +6254,8 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     const envelope: u64 = @max(3 * mlp, mlp + fwd * stream_per_tok);
     // The dequant+GEMM prefill route (transformer.prefillDqGemm) materializes
     // a bf16 copy of the weight it is about to multiply plus its transpose,
-    // and only at forwards wide enough to take that route. Kill-switch A/B
-    // (SUSHI_PREFILL_DQ_GEMM=0): +0.51 GB on the qwen3_5 27B at chunk
+    // and only at forwards wide enough to take that route. Measured against
+    // the route off: +0.51 GB on the qwen3_5 27B at chunk
     // 2048, +0.17-0.21 on the lfm2 2.6B, ~0 at chunk 8192 where the envelope
     // already dominates.
     const dq_weights: u64 = if (fwd >= transformer_mod.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
@@ -6855,15 +6842,12 @@ pub fn prefillNeededAtChunk(
 /// Narrower rungs keep the plain bill, so no other admission decision moves.
 pub const PREFILL_WIDE_RUNG_MARGIN_PCT: u64 = 22;
 
-/// Test hook for `perRequestPrefillChunkEnabled`'s kill switch.
+/// Test seam: false makes the load-time pin the width again.
 pub var per_request_chunk_override: ?bool = null;
 
-/// The arch capability AND the kill switch (`SUSHI_PREFILL_CHUNK_PER_REQUEST=0` restores the load-time pin).
 pub fn perRequestPrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
     if (!config.perRequestPrefillChunk()) return false;
-    if (per_request_chunk_override) |v| return v;
-    const raw = std.c.getenv("SUSHI_PREFILL_CHUNK_PER_REQUEST") orelse return true;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    return per_request_chunk_override orelse true;
 }
 
 /// The widest ladder rung this request can afford, priced by the same estimator that admits
@@ -6968,20 +6952,17 @@ pub fn requestPrefillChunkNow(
     return chosen;
 }
 
-/// Test hook for `adaptivePrefillChunkEnabled`'s kill switch.
+/// Test seam: false turns the per-chunk adaptive width off.
 pub var adaptive_chunk_override: ?bool = null;
 
-/// The per-chunk adaptive width: subordinate to the per-request gate, plus
-/// `SUSHI_PREFILL_CHUNK_ADAPTIVE=0`, plus "no operator pinned a width".
+/// The per-chunk adaptive width: subordinate to the per-request gate, plus "no operator pinned a width".
 pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
     // Arch first: the cheapest and most selective, and this runs once per chunk boundary.
     if (!config.perRequestPrefillChunk()) return false;
     if (explicitPrefillChunk() > 0) return false;
     if (generate_mod.envPrefillChunk() > 0) return false;
     if (!perRequestPrefillChunkEnabled(config)) return false;
-    if (adaptive_chunk_override) |v| return v;
-    const raw = std.c.getenv("SUSHI_PREFILL_CHUNK_ADAPTIVE") orelse return true;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    return adaptive_chunk_override orelse true;
 }
 
 /// Consecutive supporting probes a widening needs: the probe is taken after `mlx_clear_cache`
@@ -24539,7 +24520,7 @@ test "the warm KV credit fires ONLY where the restore checked its entry out" {
         (CheckoutCase{ .shared = 700_000 }).warm(matched, capacity),
         // (3) a non-qwen4 arch: a checkout can never be taken there.
         (CheckoutCase{ .ssd_first = false }).warm(matched, capacity),
-        // (4) `SUSHI_RESTORE_MOVE=0`: the refcount share.
+        // (4) restore by move off: the refcount share.
         (CheckoutCase{ .move_enabled = false }).warm(matched, capacity),
         // (5) a pending disk record shares the same buffers.
         (CheckoutCase{ .pending_disk = true }).warm(matched, capacity),

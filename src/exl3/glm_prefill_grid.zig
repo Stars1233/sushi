@@ -77,8 +77,7 @@ fn eligible(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr
 }
 pub fn tryMoe(s: mlx.mlx_stream, x: Arr, bank: api.Bank, indices: Arr, scores: Arr, dec: api.format.Decode, limit: c_int) !?Arr {
     if (dec.codebook != .mcg or limit != 10 or !eligible(s, x, bank, indices, scores)) return null;
-    if (std.c.getenv("SUSHI_EXL3_GEMM_WIN")) |value| if (!std.mem.eql(u8, std.mem.span(value), "32")) return null;
-    if (std.c.getenv("SUSHI_EXL3_WIN_ALIGN")) |value| if (value[0] == '0') return null;
+    if (base.gemmWindowRows() != 32 or !base.gemmWindowAligned()) return null;
     base.setDecodeParams(dec);
     if (!support.available()) return null;
     const result = try moe(s, x, bank, indices, scores, dec);

@@ -1157,7 +1157,7 @@ fn resolveGemmWindowRows(raw: ?[]const u8) ?c_int {
     return n;
 }
 
-fn gemmWindowRows() c_int {
+pub fn gemmWindowRows() c_int {
     if (gemm_win_cached) |v| return v;
     const v = blk: {
         const p = std.c.getenv("SUSHI_EXL3_GEMM_WIN") orelse break :blk GEMM_WINDOW_ROWS;
@@ -1170,7 +1170,7 @@ fn gemmWindowRows() c_int {
     return v;
 }
 
-fn gemmWindowAligned() bool {
+pub fn gemmWindowAligned() bool {
     if (gemm_align_cached) |v| return v;
     var on = true;
     if (std.c.getenv("SUSHI_EXL3_WIN_ALIGN")) |p| {
@@ -1245,6 +1245,16 @@ fn gpuArch(buf: []u8) ?[]const u8 {
     return buf[0..arch.len];
 }
 
+var force_fallback_cached: ?bool = null;
+
+// Tests flip the env between calls; a served process reads it once.
+fn forceFamilyFallback() bool {
+    if (!@import("builtin").is_test) if (force_fallback_cached) |v| return v;
+    const v = if (std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK")) |p| p[0] == '1' else false;
+    force_fallback_cached = v;
+    return v;
+}
+
 fn gemmNaxOn() bool {
     return !gemm_nax_failed and gemmNaxAvailable();
 }
@@ -1252,10 +1262,7 @@ fn gemmNaxOn() bool {
 // Capability is independent of the dispatch failure latch: tests must still
 // probe the real kernel after an earlier dispatch fell back to SIMD.
 fn gemmNaxAvailable() bool {
-    if (std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK")) |p| {
-        const v = std.mem.span(p);
-        if (v.len > 0 and v[0] == '1') return false;
-    }
+    if (forceFamilyFallback()) return false;
     if (gemm_nax_cached) |v| return v;
     var buf: [128]u8 = undefined;
     const arch = gpuArch(&buf) orelse {

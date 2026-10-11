@@ -171,7 +171,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 ## Compute
 
 - bf16 checkpoint → `expert_bf16_kernels` (`downKernelPreferred(rows) = rows >= 2`: the in-dispatch k-reduction tail
-  loses at one row; `SUSHI_EXPERT_BF16_KERNELS=0` restores the `gather_mm` composite).
+  loses at one row; ticks past the kernels' row/top-k limits take the `gather_mm` composite).
 - Quantized packs → the RESIDENT fused kernels over the slab with remapped ids, bit-identical to the resident load
   (bytes and top-20 logprobs on greedy prompts). A warm quantized forward pays the per-layer barrier, not the fills.
 

@@ -282,8 +282,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   (`boundedPrefillChunk`). At 64k the two widths prefill within ~2% of each other
   ([perf-baselines](mimo2-perf.md#mimo-longctx-prefill-attn)), but their bytes differ, so the output of a
   prompt longer than 2048 tokens depends on the width memory allowed. The ungated load-time pin subtracts the
-  hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback
-  (`SUSHI_PREFILL_CHUNK_PER_REQUEST=0`), and the load line says so.
+  hot-cache ask first and lands on 512, 1024 or 2048 with the memory active at load. It is only the fallback,
+  and the load line says so.
 - **A MiMo prefill evicts the hot cache to be admitted** (`admissionEvictsHotCache`): the warm credit is the restored
   global rows only (`kvBytesPerToken` and `residentCapacityTokens` skip the ring), the ring and the slot's checkpoint
   copies are billed whole every turn, and a shared or SSD restore credits nothing. Adaptive width and mid-prefill

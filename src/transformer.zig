@@ -639,7 +639,6 @@ fn gdnPrefillRoute(model_type: []const u8, seq_len: c_int, dk: c_int, dv: c_int,
 // else falls through to stock qmm. Numerics: fp32 accumulate in a different
 // order than stock → bf16 tail-ULP class differences (same accepted class
 // as every fused kernel here); parity pinned by the verifyQmm test.
-// Kill switch: SUSHI_VERIFY_QMM=0.
 //
 // NAX lane (M5-class machines): on "applegpu_g17" GPUs under macOS >= 26.2
 // a fixed 16x32x16 tensor-ops tile (MetalPerformancePrimitives matmul2d on
@@ -654,12 +653,8 @@ fn gdnPrefillRoute(model_type: []const u8, seq_len: c_int, dk: c_int, dv: c_int,
 // NEVER built — not just never dispatched — where the probe is false:
 // matmul2d<.., execution_simdgroup> pipeline creation can fail on non-G17
 // hardware. Switches: SUSHI_VERIFY_QMM_NAX=0 kills the lane;
-// SUSHI_FORCE_GPU_FAMILY_
-// FALLBACK=1 pretends the units are absent (QA rehearsal of the exact
-// M1-M4 path on an M5); SUSHI_VERIFY_QMM_NAX_MIN_M lowers the NAX
-// takeover width (default 8) for the M5-day A/B of routing M 5..7 to NAX
-// (their dispatcher keeps plain SIMD through M=6; our SIMD lanes differ —
-// measure, don't inherit).
+// SUSHI_FORCE_GPU_FAMILY_FALLBACK=1 pretends the units are absent (QA
+// rehearsal of the exact M1-M4 path on an M5).
 /// Comptime codegen of the per-M split-K kernel body. The row loads, weight
 /// loads, and dequant+FMA chains are emitted as NAMED SCALARS with LITERAL
 /// accumulator indices — the ledger's load-bearing constraint: array-indexed
@@ -1147,22 +1142,10 @@ fn runVerifyQmmCrossrow(
 /// divisibility by bn. Measured per (M, bn) by the width-sweep µbench.
 pub const VQMM_BN_CHOICES = [_]c_int{ 2, 4, 8 };
 
-/// Forced column tile for A/Bs (`SUSHI_VQMM_BN`), 0 = per-M default.
-/// Test seam: the parity test drives every tile without touching the env.
+/// Test seam: forces a column tile (0 = per-M default) so the parity test drives every tile.
 pub var vqmm_bn_test_override: ?c_int = null;
-var vqmm_bn_override_cache: ?c_int = null;
 fn vqmmBnOverride() c_int {
-    if (vqmm_bn_test_override) |v| return v;
-    if (vqmm_bn_override_cache) |v| return v;
-    var v: c_int = 0;
-    if (std.c.getenv("SUSHI_VQMM_BN")) |p| {
-        const parsed = std.fmt.parseInt(c_int, std.mem.span(p), 10) catch 0;
-        for (VQMM_BN_CHOICES) |c| {
-            if (c == parsed) v = parsed;
-        }
-    }
-    vqmm_bn_override_cache = v;
-    return v;
+    return vqmm_bn_test_override orelse 0;
 }
 
 /// Column tile per M: 4 columns through M=6 (24 accumulators, the measured
@@ -1175,29 +1158,16 @@ fn vqmmBnOverride() c_int {
 /// 4-bit trunk shapes it is 5-8% SLOWER at every width (M=5: 45.9 ms vs 43.0
 /// whole-forward, same direction at M 2/3/4). The x rows are 66 KB and stay
 /// cache-resident, so the "traffic" was never leaving the cache — the extra
-/// accumulators just cost occupancy. `SUSHI_VQMM_BN` keeps the sweep
-/// available for other shapes; the ceiling below admits the 8-column tile
-/// only under that override.
+/// accumulators just cost occupancy. The ceiling below admits the 8-column
+/// tile only through the test override.
 pub const VQMM_MAX_ACC: c_int = 40;
 
 /// Simdgroups per threadgroup, each owning a K partition. Wide-N shapes
 /// already emit N/bn threadgroups, so the grid does not need more
 /// parallelism there — 2 keeps the reduction cheap, and the sweep agrees:
 /// on the Muse trunk shapes at M=5 the whole-forward estimate is 42.4 ms at
-/// 2, 42.5 at 1, 44.5 at 4, 49.0 at 8. `SUSHI_VQMM_KPARTS` (1..8) forces
-/// a value for that sweep.
-var vqmm_kparts_override_cache: ?c_int = null;
+/// 2, 42.5 at 1, 44.5 at 4, 49.0 at 8.
 fn vqmmKParts(N: c_int) c_int {
-    const forced = vqmm_kparts_override_cache orelse blk: {
-        var v: c_int = 0;
-        if (std.c.getenv("SUSHI_VQMM_KPARTS")) |p| {
-            const parsed = std.fmt.parseInt(c_int, std.mem.span(p), 10) catch 0;
-            if (parsed >= 1 and parsed <= 8) v = parsed;
-        }
-        vqmm_kparts_override_cache = v;
-        break :blk v;
-    };
-    if (forced != 0) return forced;
     return if (N >= 4096) 2 else 4;
 }
 
@@ -1372,18 +1342,9 @@ test "vqmm scalar cache never evicts a scalar the caller is still holding" {
     }
 }
 
-var verify_qmm_enabled_cache: ?bool = null;
 pub var verify_qmm_override: ?bool = null;
 pub fn verifyQmmEnabled() bool {
-    if (verify_qmm_override) |v| return v;
-    if (verify_qmm_enabled_cache) |v| return v;
-    var on = true;
-    if (std.c.getenv("SUSHI_VERIFY_QMM")) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    verify_qmm_enabled_cache = on;
-    return on;
+    return verify_qmm_override orelse true;
 }
 
 pub const VqmmLane = enum { none, splitk, msg, nax, crossrow };
@@ -1424,7 +1385,7 @@ fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// the byte-addressed unpack does strictly more ALU per value than the 4-bit
 /// nibble path, so the shapes where it beats stock differ from the NAX tile's
 /// (`mixedNaxShapeEnabled` exists because that tile LOSES on the 1024-wide K/V
-/// projections). `SUSHI_VERIFY_QMM_MIXED_PLAIN=0|1` forces the A/B arms.
+/// projections).
 ///
 /// MEASURED, Qwen3.8-27B on an M4 Max (no NAX lane, so the plain-SIMD tiles are
 /// all this machine has), MTP on, decode tok/s from the server's own timings,
@@ -1445,10 +1406,10 @@ fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// harness can resolve, and a lane that only adds dispatch surface for that is
 /// not worth defaulting. 5-bit has the kernel arm and the parity test but no
 /// pack on this box to measure, so it stays off for the same reason rather
-/// than riding 6-bit's number. Both flip with one env var.
+/// than riding 6-bit's number.
 ///
 /// The N floor is where the whole result lives: forcing every shape on
-/// (`MIXED_PLAIN=1`, which adopts the 1024-wide K/V projections too) measured
+/// (which adopts the 1024-wide K/V projections too) measured
 /// only 1.01-1.05x on the same pack. Excluding them is worth ~10 points.
 pub fn mixedPlainShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
     if (bits == 4) return true;
@@ -1461,20 +1422,6 @@ pub fn mixedPlainShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// the win.
 pub const MIXED_PLAIN_MIN_N: c_int = 5120;
 
-var vqmm_mixed_plain_env_cache: ?u8 = null;
-/// 0 = forced off, 1 = forced on, 2 = follow `mixedPlainShapeEnabled`.
-fn mixedPlainEnvMode() u8 {
-    if (vqmm_mixed_plain_env_cache) |v| return v;
-    var mode: u8 = 2;
-    if (std.c.getenv("SUSHI_VERIFY_QMM_MIXED_PLAIN")) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') mode = 0;
-        if (val.len > 0 and val[0] == '1') mode = 1;
-    }
-    vqmm_mixed_plain_env_cache = mode;
-    return mode;
-}
-
 var vqmm_mixed_plain_engaged: bool = false;
 
 /// Test seam: the parity test drives the plain-SIMD mixed-width arms without
@@ -1483,11 +1430,7 @@ pub var vqmm_mixed_plain_test_force: ?bool = null;
 
 fn mixedPlainEnabled(bits: u32, group_size: u32, n: c_int) bool {
     if (vqmm_mixed_plain_test_force) |v| return v;
-    return switch (mixedPlainEnvMode()) {
-        0 => false,
-        1 => bits == 5 or bits == 6 or bits == 8 or bits == 4,
-        else => mixedPlainShapeEnabled(bits, group_size, n),
-    };
+    return mixedPlainShapeEnabled(bits, group_size, n);
 }
 
 /// Pure lane selection for the verify-qmm family (hermetically pinned by
@@ -1495,7 +1438,7 @@ fn mixedPlainEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// projections — GDN ba proj, MoE routers — gain nothing over stock qmv
 /// while the per-call kernel-node build ~10us is real; ~50 such calls ride
 /// every verify round). Lanes:
-/// - nax: M >= nax_min_m (default 8, SUSHI_VERIFY_QMM_NAX_MIN_M) when
+/// - nax: M >= nax_min_m (default 8, see `naxMinMForBits`) when
 ///   the M5-class probe is live AND the m16 tile's stricter geometry holds
 ///   (K % 256 == 0, N % 32 == 0) — the lm_head N=151936 qualifies natively,
 ///   so no msg variant is needed past M=7.
@@ -1559,7 +1502,7 @@ pub fn verifyQmm(
     if (lane == .crossrow and (bits != 4 or group_size != 64)) return null;
     if (bits != 4) switch (lane) {
         .crossrow => return null, // unreachable after the gate above; explicit
-        .nax => if (!naxMixedBitsEnvEnabled() or !mixedNaxShapeEnabled(bits, group_size, N)) return null,
+        .nax => if (!mixedNaxShapeEnabled(bits, group_size, N)) return null,
         // The plain-SIMD tiles now carry the same byte-addressed unpack the
         // NAX tile validated, so 5/6/8-bit no longer fall through to stock on
         // every M1-M4 machine — but adoption is per-shape and measured.
@@ -1570,7 +1513,7 @@ pub fn verifyQmm(
             // log rather than from the env it was launched with.
             if (!vqmm_mixed_plain_engaged) {
                 vqmm_mixed_plain_engaged = true;
-                log.info("[vqmm] plain-SIMD verify lane engaged at {d}-bit: lane={s} M={d} K={d} N={d} gs={d} (SUSHI_VERIFY_QMM_MIXED_PLAIN=0 restores stock)\n", .{ bits, @tagName(lane), m, K, N, group_size });
+                log.info("[vqmm] plain-SIMD verify lane engaged at {d}-bit: lane={s} M={d} K={d} N={d} gs={d}\n", .{ bits, @tagName(lane), m, K, N, group_size });
             }
         },
         .none => return null,
@@ -1885,8 +1828,7 @@ pub fn sdpaForceFused(q: mlx.mlx_array, k: mlx.mlx_array) bool {
 var nax_sdpa_dispatch_logged = false;
 
 var vqmm_nax_env_cache: ?bool = null;
-/// Lane kill switch: SUSHI_VERIFY_QMM_NAX=0 (the family-wide
-/// SUSHI_VERIFY_QMM=0 also covers it via verifyQmm's entry gate).
+/// Lane kill switch: SUSHI_VERIFY_QMM_NAX=0.
 pub fn naxLaneEnvEnabled() bool {
     if (vqmm_nax_env_cache) |v| return v;
     var on = true;
@@ -1898,60 +1840,18 @@ pub fn naxLaneEnvEnabled() bool {
     return on;
 }
 
-var vqmm_nax_mixed_env_cache: ?bool = null;
-/// Mixed-width NAX A/B seam: keep the q4 NAX lane live while routing affine
-/// q5/q6/q8 back through stock qmm. This isolates the byte-unpack kernel
-/// contribution without changing controller state or disabling q4 NAX.
-fn naxMixedBitsEnvEnabled() bool {
-    if (vqmm_nax_mixed_env_cache) |v| return v;
-    var on = true;
-    if (std.c.getenv("SUSHI_VERIFY_QMM_NAX_MIXED")) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    vqmm_nax_mixed_env_cache = on;
-    return on;
-}
-
-/// Family-wide NAX readiness: family kill switch, lane kill switch, and the
-/// hardware probe all pass. This intentionally says nothing about a specific
+/// Family-wide NAX readiness: the lane kill switch and the hardware probe pass. This intentionally says nothing about a specific
 /// M/K/N dispatch; controller decisions use verifyQmmNaxEnabledForM instead.
 pub fn verifyQmmNaxEnabled() bool {
     return verifyQmmEnabled() and naxLaneEnvEnabled() and verifyQmmNaxAvailable();
 }
 
-/// SUSHI_VERIFY_QMM_NAX_MIN_M parse: explicit M width where the NAX tile
-/// takes over from the plain-SIMD lanes. Without an override q4/q6 start at
-/// M=8 and q8 at its measured M=7. Clamped to [2,16]; disabling is the lane
-/// kill switch's job.
-fn naxMinMOverrideFrom(val: ?[]const u8) ?c_int {
-    const v = val orelse return null;
-    const parsed = std.fmt.parseInt(c_int, v, 10) catch return null;
-    return @min(16, @max(2, parsed));
-}
-
-pub fn naxMinMForBitsFrom(bits: u32, val: ?[]const u8) c_int {
-    if (naxMinMOverrideFrom(val)) |m| return m;
+/// M width where the NAX tile takes over from the plain-SIMD lanes.
+pub fn naxMinMForBits(bits: u32) c_int {
     // The byte-per-value q8 NAX tile wins already at M=7 (+6.09% over the
     // plain lane, five thermally-settled counterbalanced pairs). Packed q4/q6
     // still lose there, so their measured takeover remains M=8.
     return if (bits == 8) 7 else 8;
-}
-
-pub fn naxMinMFrom(val: ?[]const u8) c_int {
-    return naxMinMForBitsFrom(4, val);
-}
-
-var vqmm_nax_min_m_cache: ?c_int = null;
-var vqmm_nax_min_m_env_checked = false;
-fn naxMinMForBits(bits: u32) c_int {
-    if (!vqmm_nax_min_m_env_checked) {
-        vqmm_nax_min_m_cache = naxMinMOverrideFrom(
-            if (std.c.getenv("SUSHI_VERIFY_QMM_NAX_MIN_M")) |p| std.mem.span(p) else null,
-        );
-        vqmm_nax_min_m_env_checked = true;
-    }
-    return vqmm_nax_min_m_cache orelse naxMinMForBitsFrom(bits, null);
 }
 
 fn naxMinM() c_int {
@@ -15735,7 +15635,6 @@ pub const Transformer = struct {
             .qwen4_mixer = qwen4_mixer,
             .qwen4_mtp = qwen4_mtp,
             .expert_stream = expert_stream,
-            .expert_bf16_kernels = expertBf16KernelsEnabled(),
             .imatrix = imatrix,
             .lm_head_w = lm_head_w,
             .lm_head_s = lm_head_s,
@@ -16312,13 +16211,12 @@ pub const Transformer = struct {
     /// together and only then post-processes them.
     const ProjOrder = enum { interleaved, hoisted };
 
-    fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bool, mixed_bits: bool) bool {
+    fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bool) bool {
         if (self.config.isMoe()) return false;
         if (self.config.hidden_size > std.math.maxInt(c_int)) return false;
         if (self.config.quant_mode != .affine) return false;
         if (self.config.quant_bits != 4 and self.config.quant_bits != 6 and self.config.quant_bits != 8) return false;
         if (self.config.quant_group_size != 64) return false;
-        if (mixed_bits and !naxMixedBitsEnvEnabled()) return false;
         if (self.lm_head_w.ctx == null or
             self.lm_head_s.ctx == null or
             self.lm_head_b.ctx == null) return false;
@@ -16373,7 +16271,7 @@ pub const Transformer = struct {
             self.emb_b,
             self.config.hidden_size,
             self.config.vocab_size,
-        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
+        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk);
     }
 
     /// Uniform q4/gs64 Qwen3.8 target with its measured dense-bf16 token
@@ -16385,12 +16283,11 @@ pub const Transformer = struct {
             self.emb_b,
             self.config.hidden_size,
             self.config.vocab_size,
-        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
+        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk);
     }
 
-    /// Uniform q6/gs64 Qwen3.8 target with a quantized token embedding. The
-    /// mixed-width kill switch revokes this profile because the measured
-    /// depth-8 surface depends on q6 NAX at M=8 and M=9.
+    /// Uniform q6/gs64 Qwen3.8 target with a quantized token embedding; the
+    /// measured depth-8 surface depends on q6 NAX at M=8 and M=9.
     pub fn mtpNaxQ6Gs64ProfileEnabled(self: *const Transformer) bool {
         const embedding_match = mtpNaxAffineProjectionMatches(
             &self.config,
@@ -16400,7 +16297,7 @@ pub const Transformer = struct {
             self.config.hidden_size,
             self.config.vocab_size,
         );
-        const trunk = self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, true);
+        const trunk = self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk);
         return self.config.quant_bits == 6 and embedding_match and trunk;
     }
 
@@ -16414,12 +16311,10 @@ pub const Transformer = struct {
             self.emb_b,
             self.config.hidden_size,
             self.config.vocab_size,
-        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, true);
+        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk);
     }
 
-    /// Exact oQ4e mixed q4/q5/q6 target profile. The q5/q6 lane kill switch
-    /// also revokes the cost profile so auto depth never assumes unavailable
-    /// mixed-bit acceleration.
+    /// Exact oQ4e mixed q4/q5/q6 target profile.
     pub fn mtpOqeNaxProfileEnabled(self: *const Transformer) bool {
         return self.config.quant_bits == 4 and mtpNaxAffineProjectionMatches(
             &self.config,
@@ -16428,7 +16323,7 @@ pub const Transformer = struct {
             self.emb_b,
             self.config.hidden_size,
             self.config.vocab_size,
-        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_oqe_affine_trunk, true);
+        ) and self.mtpNaxProfileEnabledForTrunk(self.mtp_oqe_affine_trunk);
     }
 
     pub inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -22638,8 +22533,7 @@ pub fn sigmoidBiasRoutingChain(
 // differs (a simd tree vs MLX's N_READS blocking), which cannot move a bf16
 // result except at an exact rounding boundary.
 //
-// Kill switch: SUSHI_MOE_ROUTER_FUSED=0. Engagement is LOGGED, never
-// inferred — a declined kernel is output-identical to the chain.
+// Engagement is LOGGED, never inferred — a declined kernel is output-identical to the chain.
 /// `sigmoid_bias_grouped` is `sigmoid_bias` with a GROUP LIMIT spliced
 /// between the bias and the top-k: the experts are split into NG equal groups,
 /// each group is scored by the SUM OF ITS TOP TWO, and every expert outside the
@@ -22967,16 +22861,10 @@ const RouterCfgSlot = struct {
 var router_cfg_cache: [4]RouterCfgSlot = .{ .{}, .{}, .{}, .{} };
 
 pub var moe_router_fused_override: ?bool = null;
-var moe_router_fused_env: ?bool = null;
 var moe_router_engaged: bool = false;
 
 pub fn moeRouterFusedEnabled() bool {
-    if (moe_router_fused_override) |v| return v;
-    if (moe_router_fused_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_MOE_ROUTER_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    moe_router_fused_env = enabled;
-    return enabled;
+    return moe_router_fused_override orelse true;
 }
 
 /// The shared-expert gate's logit folded into a softmax router: one `x` row and the flat weight vector `w`.
@@ -23294,7 +23182,6 @@ pub fn decodeProfileSession(rows: c_int) void {
 // "eligibility predicate silently adopts every matching shape" kernel rule.
 //
 // Policy (pure, unit-tested by `batchedExpertDecodePolicy` test):
-//   - SUSHI_MOE_GATHER_DECODE=1  → hard force gather (beats everything).
 //   - SUSHI_MOE_BATCHED_DECODE=1 → hard force batched (for A/B on any arch).
 //   - otherwise                      → stock gather, on every arch.
 //
@@ -23303,13 +23190,11 @@ pub fn decodeProfileSession(rows: c_int) void {
 // Re-measured on the fixed tree it loses on both Laguna models (see the
 // `batchedExpertDecodePolicy` test for the numbers), so no arch opts in by
 // default any more. Both alternatives stay one env var away.
-fn batchedExpertDecodePolicy(model_type: []const u8, gather_force: bool, batched_force: bool) bool {
+fn batchedExpertDecodePolicy(model_type: []const u8, batched_force: bool) bool {
     _ = model_type;
-    if (gather_force) return false;
     return batched_force;
 }
 
-var moe_gather_force_env: ?bool = null;
 var moe_batched_force_env: ?bool = null;
 /// PRESENCE semantics: `FOO=0` reads as ON. Never substitute this for
 /// `diagEnvOnCached` — a harness exporting `FOO=0` would arm the switch.
@@ -23755,15 +23640,8 @@ pub fn diagEnvOnCached(cache: *?bool, name: [*:0]const u8) bool {
 fn useBatchedExpertDecode(self: *const Transformer) bool {
     return batchedExpertDecodePolicy(
         self.config.model_type,
-        envFlagCached(&moe_gather_force_env, "SUSHI_MOE_GATHER_DECODE"),
         envFlagCached(&moe_batched_force_env, "SUSHI_MOE_BATCHED_DECODE"),
     );
-}
-
-/// `SUSHI_MOE_GATHER_DECODE=1` — force stock `gather_qmm` everywhere,
-/// the A/B control arm for any arch wiring the gather-qmv kernels in.
-pub fn gatherDecodeForcedStock() bool {
-    return envFlagCached(&moe_gather_force_env, "SUSHI_MOE_GATHER_DECODE");
 }
 
 /// Whether decode should try the in-place gather-qmv kernels at all.
@@ -23777,11 +23655,8 @@ pub fn gatherDecodeForcedStock() bool {
 /// So the eligibility predicate is deliberately NARROW — silu activation
 /// (baked into the kernel), matching quant geometry on gate and up — rather
 /// than a model_type list. An arch that does not meet it, gemma4's gelu MoE
-/// included, keeps stock gather and cannot regress. `SUSHI_MOE_GATHER_DECODE=1`
-/// forces stock everywhere; `SUSHI_MOE_GATEUP_FUSED=0` disables just the
-/// fused kernel, which also drops this predicate back to false.
+/// included, keeps stock gather and cannot regress.
 fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp: QuantParams) bool {
-    if (envFlagCached(&moe_gather_force_env, "SUSHI_MOE_GATHER_DECODE")) return false;
     if (useBatchedExpertDecode(self)) return true; // explicit batched opt-in still tries it first
     if (self.config.hidden_act != .silu) return false;
     if (!gatherQmvGateUpEnabled()) return false;
@@ -26068,8 +25943,7 @@ var attn_gate_cfg_key: AttnGateCfgKey = std.mem.zeroes(AttnGateCfgKey);
 // compiled elementwise fusion does not reproduce the chain's intermediate
 // rounding. This kernel does: MLX's `Sigmoid` (the two-sided form) evaluated
 // and ROUNDED TO T, then two `Multiply`s each promoting to float and rounding
-// back, exactly as the three op kernels do. Kill switch:
-// SUSHI_SWIGLU_FUSED=0.
+// back, exactly as the three op kernels do.
 // The sigmoid is a TABLE LOOKUP, not a recomputation, and that is the whole
 // trick. Writing MLX's `Sigmoid` source verbatim is not enough to reproduce it:
 // MLX's own kernels live in a metallib built with a different Metal math mode
@@ -26134,15 +26008,9 @@ fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Alloc
 var swiglu_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var swiglu_engaged: bool = false;
 pub var swiglu_fused_override: ?bool = null;
-var swiglu_fused_env: ?bool = null;
 
 fn swigluFusedEnabled() bool {
-    if (swiglu_fused_override) |v| return v;
-    if (swiglu_fused_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_SWIGLU_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    swiglu_fused_env = enabled;
-    return enabled;
+    return swiglu_fused_override orelse true;
 }
 
 fn getSwigluKernel() !mlx.mlx_fast_metal_kernel {
@@ -26589,15 +26457,9 @@ var gateup_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_cfg_key: GateUpCfgKey = std.mem.zeroes(GateUpCfgKey);
 var gqmv_gateup_engaged: bool = false;
 pub var gqmv_gateup_override: ?bool = null;
-var gqmv_gateup_env: ?bool = null;
 
 fn gatherQmvGateUpEnabled() bool {
-    if (gqmv_gateup_override) |v| return v;
-    if (gqmv_gateup_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_MOE_GATEUP_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gqmv_gateup_env = enabled;
-    return enabled;
+    return gqmv_gateup_override orelse true;
 }
 
 /// One kernel for `silu(gather(gate) @ x) * (gather(up) @ x)` at decode width.
@@ -26787,17 +26649,11 @@ var gateup_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_rows_cfg_key: GateUpRowsCfgKey = std.mem.zeroes(GateUpRowsCfgKey);
 var gqmv_gateup_rows_engaged: bool = false;
 pub var moe_rows_fused_override: ?bool = null;
-var moe_rows_fused_env: ?bool = null;
 pub var moe_rows_fused_layers: u32 = 0;
 pub var moe_sorted_layers: u32 = 0;
 
 fn moeRowsFusedEnabled() bool {
-    if (moe_rows_fused_override) |v| return v;
-    if (moe_rows_fused_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_MOE_ROWS_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    moe_rows_fused_env = enabled;
-    return enabled;
+    return moe_rows_fused_override orelse true;
 }
 
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
@@ -27084,9 +26940,8 @@ pub fn gatherQmv(
 // replaces three, and the [K, hidden] round-trip never happens.
 //
 // Each simdgroup owns one top-K slot and computes ROWS consecutive output
-// rows for it (mlxfast tuned 1-vs-4 rows per simd; 4 won). Kill switch
-// SUSHI_MOE_DOWN_REDUCE_FUSED=0; bit-identity pinned by the
-// "down+reduce" parity tests.
+// rows for it (mlxfast tuned 1-vs-4 rows per simd; 4 won). Bit-identity is
+// pinned by the "down+reduce" parity tests.
 fn gatherQmvDownReduceSource(comptime nvfp4: bool) [:0]const u8 {
     // LPR lanes share one output row and ROWS = 32 / LPR rows ride one simdgroup
     // in parallel: K is short (the MoE intermediate), so one 32-lane reduction
@@ -27187,15 +27042,9 @@ var downred_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_cfg_key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey);
 var downred_engaged: bool = false;
 pub var downred_override: ?bool = null;
-var downred_env: ?bool = null;
 
 fn downReduceFusedEnabled() bool {
-    if (downred_override) |v| return v;
-    if (downred_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_MOE_DOWN_REDUCE_FUSED");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    downred_env = enabled;
-    return enabled;
+    return downred_override orelse true;
 }
 
 /// Fused down-projection + router weighting + K-reduction at decode width.
@@ -27797,14 +27646,6 @@ const ImatrixTap = struct {
 
 var streamed_expert_kernels_engaged: bool = false;
 
-fn expertBf16KernelsEnabledFor(raw: ?[*:0]const u8) bool {
-    return raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-}
-
-fn expertBf16KernelsEnabled() bool {
-    return expertBf16KernelsEnabledFor(std.c.getenv("SUSHI_EXPERT_BF16_KERNELS"));
-}
-
 fn expertSlabAligned(slab: mlx.mlx_array) !void {
     try mlx.check(mlx.mlx_array_eval(slab));
     const p = mlx.mlx_array_data_uint8(slab) orelse return error.ExpertSlabUnaligned;
@@ -28068,21 +27909,14 @@ fn concatRows(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
 // steel GEMM. The transient repeats identical sizes per layer, so the MLX
 // allocator cache recycles it; numerics differ from in-kernel dequant only
 // by the bf16 rounding of w = s*q + b (pinned no-worse-than-stock by test).
-// Decode (M=1) and spec-verify widths never route. Kill switch:
-// SUSHI_PREFILL_DQ_GEMM=0.
+// Decode (M=1) and spec-verify widths never route.
 pub const PREFILL_DQ_GEMM_MIN_M: usize = 2048;
 
 /// Test seam: forces the route on/off without the environment.
 pub var prefill_dq_gemm_override: ?bool = null;
-var prefill_dq_gemm_env_cached: ?bool = null;
 
 pub fn prefillDqGemmEnabled() bool {
-    if (prefill_dq_gemm_override) |v| return v;
-    if (prefill_dq_gemm_env_cached) |v| return v;
-    const raw = std.c.getenv("SUSHI_PREFILL_DQ_GEMM");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    prefill_dq_gemm_env_cached = enabled;
-    return enabled;
+    return prefill_dq_gemm_override orelse true;
 }
 
 /// Test seam: engagement is counted, never inferred from output equality.
@@ -28842,7 +28676,7 @@ pub fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_ar
     var total: c_int = 0;
     for (widths) |width| {
         if (width < 2 or width > (if (wide) @as(c_int, 6) else 7)) return null;
-        if (wide and verifyQmmEnabled() and naxLaneEnvEnabled() and naxMixedBitsEnvEnabled() and
+        if (wide and verifyQmmEnabled() and naxLaneEnvEnabled() and
             mixedNaxShapeEnabled(8, 64, n) and width >= naxMinMForBits(8) and @mod(k, 256) == 0) return null;
         total += width;
     }
@@ -37519,16 +37353,13 @@ test "batchedExpertDecodePolicy: stock gather is the default on EVERY arch" {
     // default should be anything but stock gather. Both kernels stay reachable
     // by env for A/B — the finding is about the DEFAULT, and the next arch
     // with a genuinely bank-dominated decode can be measured back in.
-    try testing.expect(!batchedExpertDecodePolicy("laguna", false, false));
-    try testing.expect(!batchedExpertDecodePolicy("gemma4_text", false, false));
-    try testing.expect(!batchedExpertDecodePolicy("qwen3_5_moe", false, false));
-    try testing.expect(!batchedExpertDecodePolicy("hy_v3", false, false));
+    try testing.expect(!batchedExpertDecodePolicy("laguna", false));
+    try testing.expect(!batchedExpertDecodePolicy("gemma4_text", false));
+    try testing.expect(!batchedExpertDecodePolicy("qwen3_5_moe", false));
+    try testing.expect(!batchedExpertDecodePolicy("hy_v3", false));
     // SUSHI_MOE_BATCHED_DECODE forces it on for any arch (experimentation A/B).
-    try testing.expect(batchedExpertDecodePolicy("gemma4_text", false, true));
-    try testing.expect(batchedExpertDecodePolicy("laguna", false, true));
-    // SUSHI_MOE_GATHER_DECODE is the hard override: still beats the force.
-    try testing.expect(!batchedExpertDecodePolicy("laguna", true, false));
-    try testing.expect(!batchedExpertDecodePolicy("gemma4_text", true, true));
+    try testing.expect(batchedExpertDecodePolicy("gemma4_text", true));
+    try testing.expect(batchedExpertDecodePolicy("laguna", true));
 }
 
 test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
@@ -39918,9 +39749,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
             // Kernel path — must ENGAGE for every listed M, at EVERY column
-            // tile the sweep can force. `SUSHI_VQMM_BN` is an A/B lever,
-            // so a tile that silently computed the wrong thing would only
-            // show up mid-measurement; null forces the shipped per-M default.
+            // tile the test override can force; null takes the shipped per-M default.
             for ([_]?c_int{null} ++ [_]?c_int{ 2, 4, 8 }) |bn_force| {
                 if (bn_force) |bn| {
                     // The NAX tile ignores bn; only the split-K rows sweep.
@@ -40177,9 +40006,8 @@ test "vqmmLaneFor: NAX dispatch table (M 8..16 route to the m16 tile only when t
     try testing.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, nax_on, 8, false)); // M=1 stays qmv
     try testing.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 480, nax_on, 8, false)); // tiny-N floor holds for NAX too
 
-    // The M5-day A/B knob (SUSHI_VERIFY_QMM_NAX_MIN_M=5): M 5..7 route
-    // to NAX, M 4 keeps split-K, and the tile geometry is still required —
-    // a lowered width never bypasses it, it falls back to the SIMD lanes.
+    // A lowered takeover width (5): M 5..7 route to NAX, M 4 keeps split-K,
+    // and the tile geometry is still required, else the SIMD lanes serve.
     try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(5, 5120, 17408, nax_on, 5, false));
     try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5, false));
     try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5, false));
@@ -40686,24 +40514,10 @@ test "verifyQmmNaxAvailable: false on every non-G17 device (kernel is never buil
     }
 }
 
-test "naxMinMFrom: default 8, clamped to [2,16], garbage ignored" {
-    try testing.expectEqual(@as(c_int, 8), naxMinMFrom(null));
-    try testing.expectEqual(@as(c_int, 5), naxMinMFrom("5"));
-    try testing.expectEqual(@as(c_int, 16), naxMinMFrom("16"));
-    try testing.expectEqual(@as(c_int, 2), naxMinMFrom("1"));
-    try testing.expectEqual(@as(c_int, 2), naxMinMFrom("0"));
-    try testing.expectEqual(@as(c_int, 16), naxMinMFrom("99"));
-    try testing.expectEqual(@as(c_int, 8), naxMinMFrom("abc"));
-    try testing.expectEqual(@as(c_int, 8), naxMinMFrom(""));
-}
-
-test "naxMinMForBitsFrom: q8 defaults to measured M7 and explicit override wins" {
-    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(4, null));
-    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(6, null));
-    try testing.expectEqual(@as(c_int, 7), naxMinMForBitsFrom(8, null));
-    try testing.expectEqual(@as(c_int, 8), naxMinMForBitsFrom(8, "8"));
-    try testing.expectEqual(@as(c_int, 6), naxMinMForBitsFrom(8, "6"));
-    try testing.expectEqual(@as(c_int, 7), naxMinMForBitsFrom(8, "garbage"));
+test "naxMinMForBits: q8 takes over at the measured M7, packed widths at M8" {
+    try testing.expectEqual(@as(c_int, 8), naxMinMForBits(4));
+    try testing.expectEqual(@as(c_int, 8), naxMinMForBits(6));
+    try testing.expectEqual(@as(c_int, 7), naxMinMForBits(8));
 }
 
 test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off-M5)" {
@@ -57068,12 +56882,7 @@ test "streamed expert composite arm keeps the pre-change bytes" {
     }
 }
 
-test "the streamed expert kernel arm is switched off by SUSHI_EXPERT_BF16_KERNELS=0" {
-    try std.testing.expect(expertBf16KernelsEnabledFor(null));
-    try std.testing.expect(expertBf16KernelsEnabledFor("1"));
-    try std.testing.expect(expertBf16KernelsEnabledFor(""));
-    try std.testing.expect(!expertBf16KernelsEnabledFor("0"));
-
+test "the streamed expert composite and kernel arms both produce finite rows" {
     const alloc = std.testing.allocator;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
@@ -57123,8 +56932,8 @@ test "the streamed expert kernel arm is switched off by SUSHI_EXPERT_BF16_KERNEL
         .slots = slots,
         .weights = w,
     };
-    for ([_]?[*:0]const u8{ "0", null }) |raw| {
-        const out = try streamedExpertCompute(s, op, rows, expertBf16KernelsEnabledFor(raw));
+    for ([_]bool{ false, true }) |use_kernels| {
+        const out = try streamedExpertCompute(s, op, rows, use_kernels);
         defer _ = mlx.mlx_array_free(out);
         try std.testing.expectEqualSlices(c_int, &[_]c_int{ rows, hidden }, mlx.getShape(out));
         try mlx.check(mlx.mlx_array_eval(out));

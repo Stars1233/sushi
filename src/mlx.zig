@@ -809,15 +809,8 @@ fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
     log.err("[mlx] {s}\n", .{span});
 }
 
-/// Install the latching handler. Called once from `main()`. `SUSHI_MLX_ERROR_LATCH=0`
-/// restores mlx-c's `exit(-1)` handler.
+/// Install the latching handler (mlx-c's default exits the process). Called once from `main()`.
 pub fn installErrorHandler() void {
-    if (std.c.getenv("SUSHI_MLX_ERROR_LATCH")) |p| {
-        if (std.mem.eql(u8, std.mem.span(p), "0")) {
-            log.info("[mlx] error latch disabled — an MLX error will exit the process\n", .{});
-            return;
-        }
-    }
     mlx_set_error_handler(latchMlxError, null, null);
 }
 
