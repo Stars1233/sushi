@@ -173,6 +173,8 @@ owner-approved card; the README pack line follows once the repo is live.
 - **Env vars** ([envvar](docs/envvar.md)): a temporary A/B knob is fine while developing, tuning, fixing or bisecting;
   once the answer is known it goes with its losing arm. Only diagnostics (incl. correctness-test knobs) and live dev
   levers stay, read once via `diagEnvOn`. A user tradeoff or machine-fit setting is a flag, never an env twin.
+- **Flags** ([flags](docs/flags.md)): every flag the binary parses is in `--help`, none hidden; a bad value or unknown
+  argument exits with an error before anything runs. Adding, cutting or changing a flag is the owner's decision.
 - **Diffs are read by a human. Keep them small.** A comment says what the code cannot (a non-obvious WHY, a contract,
   a unit) in one to three lines. Never bug history, measurements, review items, dates, PR numbers or a restatement of
   the code.
