@@ -4,13 +4,6 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
-
-- **OpenCode**: `sushi launch opencode --think <effort>` checks the effort against what the model advertises, and
-  `--persist` merges it into your OpenCode config with a backup. Thanks @felk-dev.
-- **GLM-5.3-Flash**: on a slower GPU, a DFlash2 commit no longer copies the whole reserved cache when it should append
-  in place.
-
 ## v1.2.2 — GLM on 96 GB, faster loads, built-in file editing
 
 - **GLM-5.3-Flash on 96 GB Macs**: the new Sushi-2bpw pack serves GLM-5.3-Flash with DFlash2 and images on a 96 GB
@@ -25,10 +18,12 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Agents and APIs**: Claude Code no longer counts cached context twice and compacts at half its real size;
   `/v1/messages` streams thinking live when tools are on; `tool_choice: "none"` stops stray tool calls; structured
   output follows `$ref`, so nested Pydantic and Zod models are enforced; a repetition loop inside a thought now ends
-  the thought and lets the model answer; chat responses report their reasoning tokens and `sushi launch opencode`
-  works with OpenCode builds without `--standalone`. Thanks @felk-dev.
+  the thought and lets the model answer; chat responses report their reasoning tokens; `sushi launch opencode` works
+  with OpenCode builds without `--standalone`, and its `--think <effort>` is checked against what the model advertises,
+  with `--persist` merging it into your OpenCode config behind a backup. Thanks @felk-dev.
 - **Speed**: GLM-5.3-Flash drafts about 6% faster per DFlash2 round, EXL3 prefill no longer waits on the GPU to build
   host-side expert tables, and expert rates from 1.5 bits per weight take the fast kernels, all with identical output.
+  On a slower GPU, a GLM DFlash2 commit no longer copies its whole reserved cache when it should append in place.
   Thanks @davidtai.
 - **Memory and reliability**: the load check bills what each model really allocates plus 1 GiB instead of a flat
   7 GiB, and the available-memory figure no longer counts a resident model twice, so loads that fit are no longer
