@@ -323,7 +323,9 @@ pub const Verified = struct {
         }
         if (owner) |held| {
             errdefer held.failed = true;
-            // The pending appends now hold the only references, so MLX donates the buffers.
+            // A command buffer keeps its inputs past `mlx_eval` until it completes; drain it so the
+            // pending appends hold the only references and MLX donates the buffers.
+            try mlx.check(mlx.mlx_synchronize(s));
             for (held.layers) |*layer| for ([_]*Arr{ &layer.attention.latent, &layer.attention.latent_scales, &layer.attention.latent_biases, &layer.attention.pooled }) |buffer| if (buffer.ctx != null) {
                 _ = mlx.mlx_array_free(buffer.*);
                 buffer.* = .{ .ctx = null };
@@ -623,14 +625,39 @@ fn verifierCommitCase(latent_bits: u8, prompt: usize) !void {
 }
 
 test "GLM consuming commit appends MLA rows in place with the copying commit's bits" {
-    try consumingCommitCase(0);
+    try consumingCommitCase(0, false);
 }
 
 test "GLM consuming commit appends kv8 MLA rows in place with the copying commit's bits" {
-    try consumingCommitCase(8);
+    try consumingCommitCase(8, false);
 }
 
-fn consumingCommitCase(latent_bits: u8) !void {
+test "GLM consuming commit appends in place while a command buffer still reads the old rows" {
+    try consumingCommitCase(0, true);
+    try consumingCommitCase(8, true);
+}
+
+/// Queues one long GPU job that reads every MLA buffer: its command buffer holds them until it completes.
+fn readInFlight(request: *const forward.Request, s: mlx.mlx_stream) !void {
+    var ops = Ops{ .s = s };
+    defer ops.deinit();
+    var total = try ops.own(mlx.mlx_array_new_float(0));
+    for (request.layers) |layer| for ([_]Arr{ layer.attention.latent, layer.attention.latent_scales, layer.attention.latent_biases }) |buffer| if (buffer.ctx != null) {
+        const sum = try ops.slot();
+        try mlx.check(mlx.mlx_sum(sum, buffer, false, s));
+        total = try ops.binary(.add, total, try ops.cast(sum.*, .float32));
+    };
+    const wide = try ops.slot();
+    try mlx.check(mlx.mlx_broadcast_to(wide, total, &[_]c_int{ 1024, 65536 }, 2, s));
+    const ones = try ops.slot();
+    try mlx.check(mlx.mlx_ones(ones, &[_]c_int{ 65536, 1024 }, 2, .float32, s));
+    const evals = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(evals);
+    try mlx.check(mlx.mlx_vector_array_append_value(evals, try ops.binary(.mm, wide.*, ones.*)));
+    try mlx.check(mlx.mlx_async_eval(evals));
+}
+
+fn consumingCommitCase(latent_bits: u8, in_flight: bool) !void {
     const a = std.testing.allocator;
     const s = mlx.gpuStream();
     var weights = @import("model.zig").Weights.init(a);
@@ -673,6 +700,7 @@ fn consumingCommitCase(latent_bits: u8) !void {
         mla_layers += 1;
     };
     try std.testing.expect(mla_layers > 0);
+    if (in_flight) try readInFlight(&request, s);
     var actual = try computed.prepareCommitConsuming(&request, 3, &.{}, s);
     defer actual.deinit();
     const accepted = try tree.accept(&tokens, &parents, computed.targets[0..computed.count], 3, &.{});

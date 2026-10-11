@@ -172,7 +172,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kernels](engine-ke
 - **Commit**: the commit hands the request's latent (kv8: codes, scales, biases) and pooled buffers to the accepted
   state before evaluating, so MLX appends in place; a buffer the committed request still shares is copied whole,
   reservation included (BF16, 200K-row reservation: replay 10.3 → 1.3–2.1 ms per round, decode 26.7 → 30.15 tok/s,
-  `194351a3`). A failure after the hand-over leaves the request failed.
+  `194351a3`). It drains the stream first: the verify's command buffer still holds the old buffers after `mlx_eval`
+  returns, so on a slow GPU (CI's VM) the commit found them shared and copied them. A failure after the hand-over
+  leaves the request failed.
 - **Projections**: affine row tiles reuse each weight group across up to four rows in serial qmv order. The A5/A6
   three/four-row specialization uses complete row tiles and two outputs per SIMD subgroup, reducing per-thread
   accumulators. Combined with batched FP32 attention, verification takes about 11% less time on M5 Max with
