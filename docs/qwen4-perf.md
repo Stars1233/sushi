@@ -305,8 +305,8 @@ load check refuses with apps open), `taskpolicy -a`, the lock held per run, NOT 
   (9.2x, 8.8x per pair); first token at 16.3k 45.8 / 418.5 / 418.8 / 47.7 s; decode 32.7 / 34.1 / 33.8 / 32.5 tok/s
   (the change cannot reach decode: rows <= 16 take the decode chain; MTP 2.9-3.9 tokens per step across cells).
 - Quality, teacher-forced against f42cd8e's own capture (16 doc paragraphs x 256 tokens, kv8): the body scores KLD
-  0.0406 / top-1 91.0% / NLL 0.7830; a rounding-only control (f42cd8e with `SUSHI_FUSED_256=0`) 0.0347 / 90.8% /
-  0.7831; f42cd8e itself 0.0000. On this pack any bit-different kernel reads about 0.04 against another.
+  0.0406 / top-1 91.0% / NLL 0.7830; a rounding-only control (f42cd8e with `SUSHI_FUSED_256=0`, a switch since
+  removed: a past control, not a current lever) 0.0347 / 90.8% / 0.7831; f42cd8e itself 0.0000. On this pack any bit-different kernel reads about 0.04 against another.
 - `QWEN4_PLE_PREFETCH_PREFILL=1` (pool) vs the default serial walk on f22a383 + the body, A B B A, a distinct 3.5-4.3k
   prompt per run: 165.2 / 378.7 / 353.1 / 224.9 tok/s, the pool 2.29x and 1.57x per pair. (On f42cd8e, with the
   scalar GEMM dominating, the same screen read 14-24%.)

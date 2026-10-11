@@ -5989,7 +5989,7 @@ fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
 ///   - scores: the composed-SDPA scratch [heads, chunk, seq] — materialized
 ///     only for head_dims no fused kernel covers (transformer.
 ///     prefillHeadDimFused: <= 128 via MLX, 256 via sushi_attn_p256 — unfused
-///     only under the SUSHI_FUSED_256=0 kill switch or an exotic dim).
+///     only for an exotic dim).
 ///     Bounded to ~one layer by the adaptive eval cadence
 ///     (transformer.prefillEvalCadence).
 ///   - dequant: dense-fp16 rebuild of the FULL quantized cache each layer

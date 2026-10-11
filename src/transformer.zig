@@ -1941,9 +1941,8 @@ fn runVerifyQmmNax(
 // bottom-right alignment (query row r sits at absolute KV position
 // kL - qL + r, matching MLX "causal" and createSlidingWindowMask semantics).
 // K/V may be non-contiguous cache views (strides used; innermost dim must be
-// contiguous — guaranteed for slices along T). Kill switch:
-// SUSHI_FUSED_256=0 restores the composed path AND the old guard
-// budgeting (one shared predicate, so guards and dispatch cannot drift).
+// contiguous — guaranteed for slices along T). The OOM guards and the
+// dispatch share one predicate, so they cannot drift.
 const ATTN_PD_KERNEL_HEADER =
     \\#include <metal_simdgroup_matrix>
     \\
@@ -2420,20 +2419,13 @@ fn attnPdNaxProbeCase(s: mlx.mlx_stream, banded: bool, had_error: bool) bool {
     return err_nax <= @max(1.5 * err_simd, ATTN_PD_NAX_PROBE_FLOOR);
 }
 
-/// Kill switch (SUSHI_FUSED_256=0 disables the kernel entirely). Test
-/// seam: `fused256_override` forces BOTH arms on/off without the environment.
+/// Test seam: `fused256_override = false` forces the composed path on both arms (the parity oracle).
 pub var fused256_override: ?bool = null;
 /// Test seam: true = the NAX arm wherever the hardware and its probe allow it, false = SIMD.
 pub var attn_pd_nax_override: ?bool = null;
-var fused256_env_cached: ?bool = null;
 
 pub fn fused256Enabled() bool {
-    if (fused256_override) |v| return v;
-    if (fused256_env_cached) |v| return v;
-    const raw = std.c.getenv("SUSHI_FUSED_256");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    fused256_env_cached = enabled;
-    return enabled;
+    return fused256_override orelse true;
 }
 
 /// Plain-CAUSAL dispatch mode. Default `.all` since the kv-chunk dispatch
@@ -2446,8 +2438,6 @@ pub fn fused256Enabled() bool {
 /// key axis split into budget-sized dispatches (see
 /// FUSED256_DEFAULT_DISPATCH_BUDGET) the causal arm WINS the same
 /// same-session A/B on the 27B: +2.9%/+2.3%/+4.6% at 8K/16K/32K.
-/// SUSHI_FUSED_256=0 restores composed causal (and the old
-/// OOM-guard score billing via prefillHeadDimFused).
 /// The SLIDING-BAND arm (window > 0) has no such competition — composed
 /// computes full-width scores + a GB-scale mask while the kernel
 /// block-skips outside the band (gemma-26B 99K: 317 -> 712 tok/s) — so it
@@ -2520,9 +2510,8 @@ pub fn fusedPdDims(qk_dim: c_int, v_dim: c_int) bool {
 /// the composed [heads, chunk, total_kv] score tensor — either MLX's own
 /// fused kernel covers it (<= 128) or `sushi_attn_pd` does for EVERY arm.
 /// Keyed on causal mode: at `.all` (the default since the budgeted-dispatch
-/// flip) no score tensor materializes; SUSHI_FUSED_256=0
-/// restores composed causal AND the guards' score billing together. Guards
-/// and dispatch must never drift (the effectivePrefillChunk rule).
+/// flip) no score tensor materializes. Guards and dispatch must never drift
+/// (the effectivePrefillChunk rule).
 ///
 /// A width listed here owes a dispatch at EVERY prefill site that scores at
 /// it: 192 covers mimo_v2's global layers and MLA. mimo_v2's SLIDING layers
@@ -2637,7 +2626,7 @@ pub fn slidingPrefillAttn(
     const out = try fusedSdpaPrefillKv(s, q, view, scale, @intCast(cfg.sliding_window), sinks);
     if (out != null and !sliding_prefill_engaged_logged) {
         sliding_prefill_engaged_logged = true;
-        log.info("[attn-pd] sliding band engaged: {s} window={d} sinks={} qL={d} kL={d} (SUSHI_FUSED_256=0 restores composed)\n", .{ attnPdKernelName(attn_pd_last_arm), cfg.sliding_window, sinks.ctx != null, q_len, mlx.getShape(view.k)[2] });
+        log.info("[attn-pd] sliding band engaged: {s} window={d} sinks={} qL={d} kL={d}\n", .{ attnPdKernelName(attn_pd_last_arm), cfg.sliding_window, sinks.ctx != null, q_len, mlx.getShape(view.k)[2] });
     }
     return out;
 }
@@ -2655,7 +2644,7 @@ fn logAttnPdEngaged(arm: AttnPdArm, qk_dim: c_int, v_dim: c_int, q_len: c_int, k
     const slot = &attn_pd_engaged_logged[@intFromEnum(arm)][if (qk_dim == 256) 0 else 1];
     if (slot.*) return;
     slot.* = true;
-    log.info("[attn-pd] engaged: {s} qk={d} v={d} qL={d} kL={d} dispatches={d} (SUSHI_FUSED_256=0 restores composed)\n", .{ attnPdKernelName(arm), qk_dim, v_dim, q_len, kv_len, dispatches });
+    log.info("[attn-pd] engaged: {s} qk={d} v={d} qL={d} kL={d} dispatches={d}\n", .{ attnPdKernelName(arm), qk_dim, v_dim, q_len, kv_len, dispatches });
 }
 
 /// True when a bf16 view's bound address is 16-byte aligned, which every `uint4` K/V staging load needs. A lazy
@@ -44002,7 +43991,6 @@ test "fusedSdpaPrefill: both arms FUSED off NAX, causal yields to stock ON NAX" 
     // preemption class — with the kv-chunk dispatch budget it wins live
     // (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6% at 8K/16K/32K on the
     // 27B), so causal is default-on now.
-    // SUSHI_FUSED_256=0 restores composed causal.
     std.debug.assert(fused256_override == null);
     const q_shape = [_]c_int{ 1, 6, 64, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
