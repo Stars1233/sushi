@@ -169,8 +169,9 @@ owner-approved card; the README pack line follows once the repo is live.
 - Minimal DRY Zig; tests at the bottom of each source file; shell integration tests in `tests/`.
 - No tracked file names a box's own directories: packs are `${SUSHI_MODELS_DIR:-$HOME/.sushi/models}/<pack>`, run
   outputs `~/.sushi/runs/` (guard: `tests/test_no_local_paths.sh`).
-- Env levers only for paths with two arms worth comparing (lossy/tradeoff), never for an obvious win/fix. A
-  diagnostic env is read through `diagEnvOn` (absent or `0` = off), never `getenv != null`.
+- **Env vars** ([envvar](docs/envvar.md)): only a lossy/tradeoff lever or a diagnostic (incl. a knob a correctness
+  test needs), read once via `diagEnvOn` (absent or `0` = off). Never a flag's twin, never promoted to a flag; an arm
+  that lost is deleted with its knob.
 - **Diffs are read by a human. Keep them small.** A comment says what the code cannot (a non-obvious WHY, a contract,
   a unit) in one to three lines. Never bug history, measurements, review items, dates, PR numbers or a restatement of
   the code.
