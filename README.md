@@ -39,23 +39,23 @@ Update with `brew upgrade sushi`.
 GPU memory in GiB to serve one prompt that fills the whole context (8-bit KV, MTP on with `--mtp-head-kv-quant`; GLM
 with its DFlash2 assistant and vision tower). The prompt cache and the n-gram table stay on the SSD and are not counted.
 
-| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2.4bpw |
-|---|---:|---:|---:|---:|---:|
-| weights only | 35.0 | 44.0 | 63.7 | 83.6 | 90.0 |
-| 128k | 40.7 | 49.7 | 69.4 | 87.3 | 93.2 |
-| 256k | 43.6 | 52.6 | 72.3 | 89.2 | 94.3 |
-| 512k | 48.7 | 57.6 | 77.4 | 92.9 | 96.5 |
-| 1M | 58.8 | 67.8 | 87.5 | 100.4 | 101.0 |
+| context | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
+|---|---:|---:|---:|---:|---:|---:|
+| weights only | 35.0 | 44.0 | 63.7 | 83.6 | 78.6 | 90.0 |
+| 128k | 40.7 | 49.7 | 69.4 | 87.3 | 81.8 | 93.2 |
+| 256k | 43.6 | 52.6 | 72.3 | 89.2 | 82.9 | 94.3 |
+| 512k | 48.7 | 57.6 | 77.4 | 92.9 | 85.1 | 96.5 |
+| 1M | 58.8 | 67.8 | 87.5 | 100.4 | 89.6 | 101.0 |
 
 A context fits when its number is below the GPU limit you set with `sudo sysctl iogpu.wired_limit_mb`. Max context is
 the largest one that fits, at 8-bit / 4-bit KV, with 256 MiB spare and capped at 1M (GLM has no 4-bit KV):
 
-| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2.4bpw |
-|---|---|---|---|---|---|---|
-| 48 GB | 43,000 MB (42.0 GiB) | 128k / 192k | — | — | — | — |
-| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | — | — | — |
-| 96 GB | 88,000 MB (85.9 GiB) | 1M / 1M | 1M / 1M | 880k / 1M | — | — |
-| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — |
+| Mac | GPU limit | Sushi-2bpw | Sushi-2.6bpw | Sushi-4bpw | MiMo-2.3bpw | GLM-2bpw | GLM-2.4bpw |
+|---|---|---|---|---|---|---|---|
+| 48 GB | 43,000 MB (42.0 GiB) | 128k / 192k | — | — | — | — | — |
+| 64 GB | 59,000 MB (57.6 GiB) | 896k / 1M | 440k / 744k | — | — | — | — |
+| 96 GB | 90,000 MB (87.9 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | — | 512k / — | — |
+| 128 GB | 120,000 MB (117.2 GiB) | 1M / 1M | 1M / 1M | 1M / 1M | 1M / 1M | 1M / — | 1M / — |
 
 A Mac with less memory than a Sushi pack can still serve it: `--ssd-budget-gb N` keeps N GiB resident and streams
 the routed experts from the SSD, with the same replies as a resident load, at a speed set by the SSD. A streamed load

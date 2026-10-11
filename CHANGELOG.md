@@ -4,79 +4,30 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.2.2 — GLM on 96 GB, file tools, a stricter CLI
 
-- **Cleanup**: `SUSHI_QSA_ATTN_BALANCED` and its balanced split-K kernel arm are removed; default output is unchanged.
-- **Cleanup**: `SUSHI_GDN_PIPELINED` is removed; the software-pipelined GDN prefill kernel is always the route of Flash-Next on NAX GPUs.
-- **Cleanup**: `SUSHI_SSD_WRITE_THROUGH` is removed; the prefill write-through to the SSD prefix cache is always on when its gates pass, and behaviour is unchanged.
-- **Cleanup**: `SUSHI_FUSED_256` is removed; the fused head-dim-256 prefill attention is always on, and output is unchanged.
-- **Flags**: a bad value for `--prefix-cache-entries`, `--max-concurrent`, `--max-resident-models`, `--idle-evict-secs`, `--log-level`, `--prefill-chunk`, `--ssm-checkpoint-max`, `--port`, `--temp` and the other numeric flags exits with an error naming the flag, instead of falling back to a default.
-- **Flags**: `--tool` outside `sushi run`, and `--stream` without `--prompt`, are errors instead of being ignored.
-- **Flags**: `--help` lists every flag, including `--drafter`, `--no-drafter`, `--max-concurrent` and `sushi kld --no-mtp`.
-- **Flags**: `--fast` is removed; pass the flags it set (`--mtp`, `--mtp-typical`, `--mtp-greedy-tail`, `--kv-quant 8`) yourself.
-- **Flags**: standalone prompt lookup decoding is removed with `--pld`, `--no-pld`, `--pld-draft-len` and `--pld-key-len`, the request field `enable_pld` and `/props settings.pld`; the prompt lookups inside MTP rounds and GLM DFlash2 stay (`--no-mtp-lookup`).
-- **Flags**: `--ssm-checkpoint-stride` is removed; the stride is fixed at the 256 tokens the help always named (a bad value used to become 128).
-- **Flags**: `--expert-cache-gb` is removed (also on `sushi kld`); `--ssd-budget-gb` sizes the expert cache.
-- **Flags**: `--embedding-max-length` is removed; `/v1/embeddings` accepts inputs up to the model's window.
-- **Flags**: `--logit-bias-file` is removed; requests carry `logit_bias`, and the `logit_bias_file` model setting stays.
-- **Models**: `sushi pull` and `sushi run` download only Sushi packs from the Hugging Face org `beamster` (a short name or `beamster/<repo>`); any other `org/repo` is refused before anything downloads.
-- **Models**: `sushi list` shows each published pack with its size, whether it is downloaded and whether this Mac meets its memory tier, marks the recommended pack, and falls back to the local models when Hugging Face is unreachable.
-- **Models**: `sushi pull` warns when this Mac has less memory than the pack's documented tier (it may still run with `--ssd-budget-gb`), then pulls anyway; `sushi pull` and `sushi list` reject extra arguments.
-- **Models**: `glm-5.3-flash:2bpw` is added for 96 GB Macs; `sushi pull` and `sushi list` say so while its repo is not published yet.
-- **Flags**: `--no-safety` is removed (it had no effect).
-- **Flags**: `--warmup-eager` and `--no-warmup-eager` are removed; the boot warmup always runs.
-- **Flags**: `--kv-attn-mode` is removed; `auto` is always the server default and a request's `kv_attn_mode` field still forces `dense` or `fused`.
-- **Flags**: `--decode-attn-quant` and `--no-decode-attn-quant` are removed with the decode-time int8 requantization of dense attention, which only engaged on the BF16 source checkpoint and made that teacher lossy.
-- **Flags**: `--mtp-depth` (already rejected with a message naming `--mtp-min-depth` and `--mtp-max-depth`) is removed; it now fails as an unknown flag.
-- **Flags**: `--mtp-history-window` is removed; the MTP head always sees the full prompt history.
-- **Flags**: `--draft-block-size` is removed; the DFlash assistant's block is always capped by the machine automatically.
-- **Flags**: `--tokenize-cache-entries` is removed; the per-model prompt render cache is fixed at 4 entries.
-- **Flags**: `--prefill-trace` is removed; `--log-level debug` writes the `[prefill-trace]` lines to the log.
-- **Flags**: `sushi launch --no-start` is removed (it did nothing).
-- **Flags**: `--hf-overrides` is removed; it was another name for `--config-overrides`.
-- **Flags**: `--mtp-cascade` is removed; it was another name for `--mtp-tokenv3`.
-- **Flags**: `--no-prefix-cache-ram` is now `--prefix-cache-mem off`.
-- **Cleanup**: `SUSHI_NO_UPDATE_CHECK` is removed; use `--no-update-check`.
-- **Cleanup**: `SUSHI_CACHE_LIMIT`, `SUSHI_WIRED` and `SUSHI_WIRED_SLACK_MB` are removed; the MLX buffer-pool cap is always RAM/16 clamped to 2..8 GB and the wired limit is always the recommended working set.
-- **Cleanup**: opt-in experiments that never shipped are removed with their environment switches: the DFlash width chooser and draft-only head, sampled DFlash drafts, periodic MTP re-entry, batched Qwen4 MTP rounds, fused QKV, the pruned lm_head, batched MoE decode, the paired gate/up and crossrow verify kernels, the fused add+RMSNorm lever and the compiled whole-forward.
-- **Cleanup**: the `--dspark` flag is removed; it only set an environment variable that nothing read.
-- **Cleanup**: the speculation env switches and sweep knobs (MTP planner, drafting and DFlash gates) are removed; default behaviour is unchanged.
-- **Cleanup**: the env switches for adopted MoE, verify-qmm, prefix-cache, prefill-chunk and load behaviour are removed; default arms are unchanged.
-- **Cleanup**: the attention, QSA, KV-growth, GDN, hyper-connection and PLE kill-switch env vars are removed; the shipped paths are unchanged, and the memory bill reflects the single QSA history copy.
-- **Cleanup**: `SUSHI_DFLASH_MARKOV` is removed; a DSpark sidecar's Markov chain always runs.
-- **Cleanup**: the launch flags now are the only control for settings that also had an environment twin:
-  `SUSHI_DFLASH` (use `--no-drafter`), `SUSHI_MTP_TYPICAL` and `SUSHI_MTP_TOKENV3` (`--mtp-typical`,
-  `--mtp-tokenv3`), `SUSHI_PREFILL_CHUNK` (`--prefill-chunk`, which now also keeps the memory safety cap),
-  `SUSHI_PREFILL_DECODE_SHARE`, `SUSHI_PREFILL_TRACE` and `SUSHI_DECODE_ATTN_QUANT` no longer read the environment.
-- **Cleanup**: code for architectures sushi does not serve is removed, including the dormant ANE prefill path and its
-  `--ane-prefill` flag, the `sushi:ane_*` metrics and the `ane` object in `/props`; unsupported models are still
-  refused by name.
-- **Memory**: the load check bills what each model allocates plus a 1 GiB safety net instead of a flat 7 GiB, the
-  auto context keeps 93% of the memory ceiling on every model, and `--wired-margin-gib` defaults to 1 GiB.
-- **GLM-5.3-Flash**: DFlash2 drafting is about 6% faster per round and verification about 1% faster, with identical
-  output.
-- **EXL3 packs**: prefill paths that build their expert window tables on the host no longer wait for the GPU twice
-  per table, with identical output. Thanks @davidtai.
-- **EXL3 packs**: expert rates from 1.5 bits per weight take the fast decode and prefill kernels on every served
-  architecture, including GLM-5.3-Flash's, with output identical to the reference readers.
-- **Structured output**: a `response_format` schema property that names no type (a bare `description`, `true` or `{}`) now accepts any JSON object instead of only `{}`.
-- **Structured output**: `response_format` schemas may use `$ref` to `#`, `#/$defs/Name` or `#/definitions/Name`, recursive refs included, so nested Pydantic or Zod models are enforced instead of collapsing to `{}`.
-- **Tool calls**: a `<function=name` whose closing `>` the model dropped is recovered with its parameters instead of the call being lost as plain text.
-- **File tools**: the chat page and `sushi run` can let the model add and edit files (`write_file`, `edit_file`) in the folder you choose for the chat; the Edit chip (shown while Tools is on) or `/edit on|off` switches it per conversation, off unless the server was launched with `--edit on`, and every write stays inside that folder.
-- **Tool calls**: `tool_choice: "none"` on chat completions now stops the model from writing a tool call as plain text after earlier calls in the conversation; the chat page and `sushi run` send it on their final, tool-less round, which no longer shows raw `<tool_call>` markup.
-- **Anthropic API**: with tools in the request, `/v1/messages` streams thinking as the model writes it instead of in one piece when the thought ends.
-- **Anthropic API**: `usage.input_tokens` no longer includes the cached tokens reported in `cache_read_input_tokens`, so Claude Code stops counting the context twice and compacting at half its real size.
-- **Anthropic API**: a thought that starts after visible text gets its own content block index instead of the still-open text block's, and carries only its own text instead of repeating the answer that streamed before it.
-- **Reasoning**: a `<think>` or `</think>` the model writes inside a backtick code span, while explaining the format, stays text instead of splitting the thought or the answer, on every endpoint.
-- **Completions**: `/v1/completions` reads `prompt` given as token ids (`[1,2,3]`, `[[1,2,3]]`), refuses a batch of prompts and `echo: true` with a named 400 instead of a misleading "prompt is required" or a silent drop.
-- **Qwen3.8-Flash-Next**: `--qwen-gdn fp32` keeps the recurrent state in f32 between tokens, for measuring what the
-  default bf16 state costs.
-- **Server**: a client that stops sending its request is dropped after 30 seconds instead of holding a connection thread forever, and a `Content-Length` near 2^64 is refused with a 413.
-- **Prompt cache**: an SSD entry whose chunk fails to load is dropped instead of failing again on every later request that matches it.
-- **Model loading**: a model another load evicts the instant its own load finishes, and a failed model load leaving its error to fail the next request, are fixed.
-- **Model loading**: a load request refused for lack of memory no longer unlocks the model registry twice, which could release a lock another request held.
-- **Reasoning**: a repetition loop inside a thought now closes the thought and lets the model answer or call a tool, instead of ending the turn with a stop and no answer.
-- **Memory**: the available-memory figure behind the load check and request admission no longer charges a resident model's wired pages twice, so a loaded server reports the room the system can actually grant instead of a figure several GiB too low.
+- **GLM-5.3-Flash on 96 GB Macs**: the new Sushi-2bpw pack serves GLM-5.3-Flash with DFlash2 and images on a 96 GB
+  Mac, with a 512K context at 8-bit KV (300K at BF16). `sushi list` shows every Sushi pack with its size, whether this Mac fits it
+  and which one to pick; `sushi pull` warns before pulling a pack that will need `--ssd-budget-gb`.
+- **File tools**: the chat page and `sushi run` can let the model create and edit files inside the folder you choose,
+  switched per conversation with the Edit chip or `/edit on|off`; every write stays inside that folder.
+- **Agents and APIs**: Claude Code no longer counts cached context twice and compacts at half its real size;
+  `/v1/messages` streams thinking live when tools are on; `tool_choice: "none"` stops stray tool calls; structured
+  output follows `$ref`, so nested Pydantic and Zod models are enforced; chat responses report their reasoning tokens
+  and `sushi launch opencode` works with OpenCode builds without `--standalone`. Thanks @felk-dev.
+- **Speed**: GLM-5.3-Flash drafts about 6% faster per DFlash2 round, EXL3 prefill no longer waits on the GPU to build
+  host-side expert tables, and expert rates from 1.5 bits per weight take the fast kernels, all with identical output.
+  Thanks @davidtai.
+- **Memory**: the load check bills what each model really allocates plus 1 GiB instead of a flat 7 GiB, and the
+  available-memory figure no longer counts a resident model twice, so loads that fit are no longer refused.
+- **Reliability**: a repetition loop inside a thought now ends the thought and lets the model answer; a stalled
+  client is dropped after 30 seconds; model-load races and a double registry unlock are fixed; a broken SSD cache entry
+  is dropped instead of failing every later match.
+- **Leaner CLI**: `--help` lists every flag, and a bad value or stray argument stops before anything loads. `--fast`,
+  prompt lookup decoding (`--pld*`), `--expert-cache-gb` (use `--ssd-budget-gb`), `--logit-bias-file`,
+  `--embedding-max-length`, `--kv-attn-mode`, `--decode-attn-quant` and other flags with no real choice are gone;
+  `--no-prefix-cache-ram` is now `--prefix-cache-mem off`. `sushi pull` downloads only from the `beamster` org, and
+  over a hundred internal environment switches are removed. New: `--qwen-gdn fp32` keeps Qwen's recurrent state in f32.
 
 ---
 

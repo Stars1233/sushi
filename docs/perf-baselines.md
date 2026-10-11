@@ -202,3 +202,11 @@ A6 trunk), same ladder: [v1.2.0 release bench](bench/v1.2.0/summary.md), decode 
 ## v1.2.1 release context ladder
 
 [Version summary and per-model reports](bench/v1.2.1/summary.md), 2026-10-08, Apple M5 Max 128 GB. llmprobe 0.6.15, `--bench-only` 2K–128K, 2 runs. `taskpolicy -a`, per-model GPU lock, fans max, 3 minutes idle before each server. All four on `975a7694`.
+
+## v1.2.2 release context ladder
+
+[Version summary and per-model reports](bench/v1.2.2/summary.md), 2026-10-11, Apple M5 Max 128 GB. llmprobe 0.6.15,
+`--bench-only` 2K–128K, 2 runs, all on AC power. `taskpolicy -a`, per-model GPU lock, fans max, at least 60 s idle
+before each server. One binary built from `bb9adb6a`.
+- Qwen 2.6bpw and 4bpw come from the first pass.
+- MiMo 2.3bpw and GLM 2.4bpw come from fresh AC reruns: their first-pass runs crossed onto battery, which slowed GLM 8–18%.

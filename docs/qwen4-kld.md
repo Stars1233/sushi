@@ -62,6 +62,18 @@ all-position KLD 0.1183 (bf16 table) and 0.1229 (4-bit table). Same-binary contr
 with the bf16 table and 0.104698517 with the 4-bit table, the b64c5a0e figures to nine digits. M5 Max 128 GB,
 `taskpolicy -a`, GPU lock `k26-kld` per run, 2026-09-27.
 
+Release 1.2.2 check, 2026-10-11, published Sushi-2.6bpw (4-bit g32 table), kv8, no MTP, 7186 positions to first EOS:
+
+| | KLD | top-1 | NLL |
+|---|---|---|---|
+| 1.2.2 check (`bb9adb6a`) | 0.137095 | 89.23% | 0.455440 |
+| `ad5e6be8` row above | 0.135508 | 89.08% | 0.454090 |
+| change | +1.17% | +0.15 pp | +0.30% |
+
+The pipelined GDN prefill landed in between, and its output is not bit-identical. The owner accepted the drift as
+noise. Run: ReleaseFast, binary SHA-256 `d8c741577e52dfc2301554fc96642a3df4f289405e302fe4444e605c91fc11e9`,
+`taskpolicy -a`, GPU lock `v122-validate`.
+
 Sushi-2bpw row: sushi v1.0.4 ReleaseFast, binary SHA-256
 `1c2c952090f2642c5119061fc94a552a131b30ca698779bd9593d1c60f9db934` (mtime 2026-09-26 19:51:49 +0700),
 `mlx-serve-bf16-16x512-raw`, `--kv-quant off` (bf16 KV, unlike every other row), no MTP, 7186 positions to first EOS:

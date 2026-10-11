@@ -24,6 +24,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - The preflight's available figure is free RAM CAPPED at Metal's working-set limit (`effectiveAvailableBytes`): a
   lowered `iogpu.wired_limit_mb` binds below free RAM, and a load past it failed warmup, then every request.
 - **`status.getAvailableMemBytes` is the reclaimable page-class sum, never total minus used**: free (less speculative) plus file-backed pages, capped by the RAM outside wired and compressor. Mach's classes overlap (a resident model's wired pages are also in the anonymous set), so subtracting `wired + compressor + internal` charged them twice and read 4.5 GiB where 19 GiB was grantable (`computeAvailableBytes` tests carry the live counters).
+- **The file-backed share is grantable slowly, not at once.**
+  - **Slow climb, clean:** MiMo's BF16 KV filled to 550K with no swap while the file cache drained to 3 GiB.
+  - **Fast large load, swap:** a 24 GB streamed load beside an idle resident GLM read 32 GiB available, then swapped
+    17 GB as macOS compressed the idle model.
+  - Both runs: `e8c9c47e`, 2026-10-11.
+  - Kept as is: under a declared `iogpu.wired_limit_mb` the wired-limit floor, not this figure, sets the request ceiling.
 - Preflight refusals → `InsufficientMemory` → 503 + entry reset to `.unloaded`. A refusal quotes the number it
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`).
