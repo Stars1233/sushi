@@ -6,18 +6,13 @@ native MTP and affine8 KV by default. GLM batches up to four requests over an af
 (`--kv-quant 16` = BF16) and FP32 KDA state, with DFlash2, image/video input and prefix reuse; its MTP
 stays off. OpenAI/Anthropic-compatible HTTP, no Python at serve time. Fork of ddalcu's mlx-serve.
 
-- **sushi** is this engine's new name (runtime, to be opened to the public): a scripted rename changes the binary
-  name, the env prefix and the home dir everywhere; until it lands, write today's names. Treat every change as future
-  public code (license, NOTICE, docs); sushi is not scoped to EXL3 or to these two models forever.
-- **sashimi** is the PRIVATE quant-creation stack (its own private repo): every converter, allocator, imatrix driver
-  and repacker. This repo keeps only the CONSUMER contract — `docs/pack-format.md`, the Zig shard-stamp check, the
-  committed `src/fixtures/`, and `sushi kld`. The oracle fixture dumpers (`tests/dump_*_fixtures.py`) stay: they
-  verify the engine, they do not make packs. Converter knowledge (recipes, calibration data, research notes) never
-  goes into a committed file: it goes to `docs/private/`, and committed files say only that it lives in the private
-  repo.
-- `src/` holds only the three served architectures (and their shared machinery): inherited forwards, loaders and the
-  ANE driver for other architectures were removed. The loader refuses any other `model_type` by name (`model.served_model_types`, `ArchitectureUnsupported` → 503); an unsupported file
-  format is refused by name (`ModelFormatUnsupported` → 503; `--model` exits).
+- **sushi** is public code: every change ships with its license, NOTICE and docs story; it is not scoped to EXL3 or
+  to these three models forever.
+- **sashimi** is the PRIVATE quant-creation stack (converters, allocators, imatrix, repackers). This repo keeps only
+  the CONSUMER contract (`docs/pack-format.md`, the shard-stamp check, `src/fixtures/`, `sushi kld`) and the oracle
+  fixture dumpers (`tests/dump_*_fixtures.py`). Converter knowledge goes to `docs/private/`, never a committed file.
+- `src/` holds only the three served architectures and their shared machinery. Any other `model_type` is refused by
+  name (`ArchitectureUnsupported` → 503), as is an unsupported file format (`ModelFormatUnsupported` → 503).
 
 <a id="docs-index"></a>
 ## Docs index
@@ -28,90 +23,89 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`); `engine-`, `serve
 
 | doc | what it holds |
 |---|---|
-| [docs/qwen4-arch.md](docs/qwen4-arch.md) | Flash-Next trunk, hyper-connections, n-gram PLE table, oracle and ties, packs on this box |
-| [docs/qwen4-perf.md](docs/qwen4-perf.md) | Flash-Next recorded tok/s: decode and MTP ladders, GDN/QSA/HC kernel A/Bs, M1/M2 Max boxes |
+| [docs/qwen4-arch.md](docs/qwen4-arch.md) | Flash-Next trunk, hyper-connections, n-gram PLE, oracle and ties, packs |
+| [docs/qwen4-perf.md](docs/qwen4-perf.md) | Flash-Next tok/s: decode/MTP ladders, GDN/QSA/HC kernel A/Bs, M1/M2 Max |
 | [docs/qwen4-kld.md](docs/qwen4-kld.md) | Flash-Next KLD of every served pack, the KV-width reading |
-| [docs/qwen4-qsa-long-context.md](docs/qwen4-qsa-long-context.md) | QSA arms per query width, indexer and its history, long-context admission and bills |
-| [docs/mimo2-arch.md](docs/mimo2-arch.md) | MiMo checkpoint, FP8 trunk, rank-local QKV, routing/sinks, sliding ring, bills, product policy |
-| [docs/mimo2-perf.md](docs/mimo2-perf.md) | MiMo recorded tok/s: context ladders, verify rows, prefill, attention kernels, TTFT |
+| [docs/qwen4-qsa-long-context.md](docs/qwen4-qsa-long-context.md) | QSA arms per query width, indexer, long-context admission and bills |
+| [docs/mimo2-arch.md](docs/mimo2-arch.md) | MiMo checkpoint, FP8 trunk, rank-local QKV, routing/sinks, sliding ring, bills |
+| [docs/mimo2-perf.md](docs/mimo2-perf.md) | MiMo tok/s: context ladders, verify rows, prefill, attention kernels, TTFT |
 | [docs/mimo2-kld.md](docs/mimo2-kld.md) | MiMo KLD of the served packs |
 | [docs/mimo2-mtp.md](docs/mimo2-mtp.md) | MiMo's three MTP heads, chain and acceptance |
 | [docs/glm5-arch.md](docs/glm5-arch.md) | GLM geometry, serving, DFlash2, bills, speed, KLD, lessons |
 | [docs/glm5-kernels.md](docs/glm5-kernels.md) | GLM kernels, exactness rules, drift screen, ruled-out list |
-| [docs/glm5-perf.md](docs/glm5-perf.md) | GLM recorded tok/s: DFlash2 round levers, three/four-row verify, prefill chunk, long-context profile |
+| [docs/glm5-perf.md](docs/glm5-perf.md) | GLM tok/s: DFlash2 round levers, three/four-row verify, prefill chunk, long context |
 | [docs/glm5-kld.md](docs/glm5-kld.md) | GLM KLD against the native BF16 teacher |
 | [docs/glm5-prefix-cache.md](docs/glm5-prefix-cache.md) | GLM cache keys, latent and KDA state, restore, spec state |
 | [docs/glm5-clamped-experts.md](docs/glm5-clamped-experts.md) | GLM clamped EXL3 experts |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/mlx-serve-integration.md](docs/mlx-serve-integration.md) | mlx-serve's pin of `sushi_exl3`, the API it calls, handoff |
-| [docs/mlx-serve-sync.md](docs/mlx-serve-sync.md) | ledger of upstream mlx-serve reviews: cursor, speed and bug-fix verdicts, how to run the next pass |
+| [docs/mlx-serve-sync.md](docs/mlx-serve-sync.md) | upstream mlx-serve review ledger: cursor, verdicts, how to run the next pass |
 | [docs/engine-expert-streaming.md](docs/engine-expert-streaming.md) | SSD budget ledger, per-layer LRU, slab I/O, imatrix capture, discovery |
-| [docs/engine-mtp.md](docs/engine-mtp.md) | native MTP head, verify invariant, draft re-scoring, round-cost table, head KV/norms |
+| [docs/engine-mtp.md](docs/engine-mtp.md) | MTP head, verify invariant, draft re-scoring, round-cost table |
 | [docs/engine-kv-cache.md](docs/engine-kv-cache.md) | kv8 default, kv-quant contract, growth, GDN step, byte-stability settings |
 | [docs/engine-prefix-cache.md](docs/engine-prefix-cache.md) | hot cache, hybrid restore, trimming, SSD tier, SSD-first, checkouts, spec state |
-| [docs/engine-kernels.md](docs/engine-kernels.md) | decode/MoE/prefill/verify kernels, NAX/MPP pitfalls, how to prove and time a kernel |
-| [docs/engine-mlx-gotchas.md](docs/engine-mlx-gotchas.md) | MLX errors, dtype promotion, barriers, views vs copies, allocator pool, Zig and tokenizer traps |
+| [docs/engine-kernels.md](docs/engine-kernels.md) | decode/MoE/prefill/verify kernels, NAX/MPP pitfalls, proving and timing a kernel |
+| [docs/engine-mlx-gotchas.md](docs/engine-mlx-gotchas.md) | MLX errors, dtype promotion, barriers, views vs copies, allocator, Zig/tokenizer traps |
 | [docs/engine-memory-admission.md](docs/engine-memory-admission.md) | Metal OOM, preflight, auto-context, prefill chunk, admission |
-| [docs/server-http-apis.md](docs/server-http-apis.md) | API contracts, streaming, logprobs/seeds/sampling, reasoning budget, constrained JSON, launcher |
+| [docs/server-http-apis.md](docs/server-http-apis.md) | API contracts, streaming, sampling, reasoning budget, constrained JSON, launcher |
 | [docs/server-tool-calling.md](docs/server-tool-calling.md) | templates, tool-call parse chain and invariants, think tags, loop stops |
-| [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, ownership, media |
-| [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, `__metadata__` stamp, window, g-scale in `suh`, loader rules |
-| [docs/perf-baselines.md](docs/perf-baselines.md) | method, roofline, shared EXL3 kernel timings, release ladders; per-arch numbers are in the three `*-perf` docs |
-| [docs/bench/v1.2.1/summary.md](docs/bench/v1.2.1/summary.md) | version-pinned release context ladder and individual model benchmark reports |
-| [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule, lossy expert pick; per-arch results in the `*-kld` docs |
+| [docs/server-lifecycle.md](docs/server-lifecycle.md) | arch gate, weight loader, settings precedence, scheduler/batching, threads, media |
+| [docs/pack-format.md](docs/pack-format.md) | what a pack owes the engine: tensors, `expert_quant`, metadata stamp, window, loader rules |
+| [docs/perf-baselines.md](docs/perf-baselines.md) | method, roofline, shared EXL3 kernel timings, release ladders |
+| [docs/bench/v1.2.1/summary.md](docs/bench/v1.2.1/summary.md) | release context ladder and per-model benchmark reports |
+| [docs/quality-kld.md](docs/quality-kld.md) | `kld` tool, teacher fixtures, the 16x512 reading, lossless teacher rule |
 | [docs/process-measurement.md](docs/process-measurement.md) | GPU lock, binary stamp, QoS, waiting, baseline lookup, recording a number |
 | [tests/CLAUDE.md](tests/CLAUDE.md) | the integration-test matrix (auto-loads in `tests/`) |
 
-**Private, local-only** (`docs/private/`, gitignored): they exist only in the main checkout, so a git worktree does
-not contain them; a worker in a worktree reads them from the main checkout's `docs/private/`. Never link to or
-quote them from a committed file.
+**Private, local-only** (`docs/private/`, gitignored, main checkout only: a worktree reads them from there). Never
+link to or quote them from a committed file.
 
 | doc | what it holds |
 |---|---|
-| `docs/private/sashimi-workflow.md` | how to convert with sashimi: venv, subcommands, served-pack recipes, imatrix files and hashes, stamps, window speeds, wall times, speed work, lessons |
+| `docs/private/sashimi-workflow.md` | converting with sashimi: venv, subcommands, served-pack recipes, imatrix files, stamps, lessons |
 | `docs/private/sashimi-codebooks.md` | MCG decision, decoder dead ends, fractional-rate trellis |
 | `docs/private/quality-kld-research.md` | KLD of every intermediate and experimental pack, sweeps, how packs were made |
 | `docs/private/measurement-raw.md` | the raw-file path behind every committed measurement, keyed by doc and section |
-| `docs/private/future.md` | strictly work still to continue or explore; an entry leaves when it starts or lands |
+| `docs/private/future.md` | work still to explore; an entry leaves when it starts or lands |
 | `docs/private/fail/` | one file per failed experiment: the numbers that killed it, where its code lives |
-| `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging script, card, upload, verification, past hiccups |
+| `docs/private/hf-upload.md` | publishing a pack to Hugging Face: staging, card, upload, verification |
 
 Skills: `/release` (SemVer, CHANGELOG), `/bench` (llmprobe methodology, comparison traps).
 
 ## Stack
 
-Zig 0.17.0 (pinned release via `scripts/fetch-zig.sh`; 0.16 does not build); mlx + mlx-c PINNED SUBMODULES
-(`lib/mlx-src` 64ea011c / v0.32.3, `lib/mlxc-src` 56b2d39: mlx-serve's pins) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/`
-(FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0) as `lib/jinja_cpp/libjinja.a`; safetensors; BPE; `stb_image`
-+ libwebp decode image INPUT. Min macOS 26.2; NAX kernels need the 26.2 deployment target (asserted by
-`tests/test_mlx_staged_nax.sh`). The served binary's only non-system dylibs are `libmlxc` and Homebrew's `libwebp`
-(`tests/test_serving_deps.sh`). Box: M5 Max 128 GB, macOS 27.
+Zig 0.17.0 (`scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39,
+mlx-serve's pins) built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp as
+`lib/jinja_cpp/libjinja.a`; `stb_image` + libwebp for image INPUT. Min macOS 26.2, which NAX needs
+(`tests/test_mlx_staged_nax.sh`); only non-system dylibs: `libmlxc`, `libwebp` (`tests/test_serving_deps.sh`).
+Box: M5 Max 128 GB, macOS 27.
 
 ## Navigating `src/` (served path only)
 
 | File | Role | Doc |
 |---|---|---|
 | `main.zig` / `cli.zig` | entry, flags, subcommands (`run/pull/list/serve/launch/kld`); pull, `run` REPL | server-lifecycle |
-| `repl_tools.zig` | `run` REPL's client-side tools (web search/fetch, confined files, images; write needs `/edit`) | server-http-apis |
+| `repl_tools.zig` | `run` REPL client-side tools (web, confined files, images; write needs `/edit`) | server-http-apis |
 | `server.zig` / `responses.zig` / `ws.zig` / `stop_sequences.zig` | all HTTP: `/v1/*`, `/metrics(.json)`, WS, `--api-key`; Responses store | server-http-apis |
 | `chat.zig` | chat templates (Jinja2 + fallback), thinking tags, tool-call parse/repair/coercion | server-tool-calling |
 | `reasoning_protocol.zig` / `json_schema.zig` / `json_grammar.zig` / `token_mask.zig` / `regex.zig` | constrained decoding | server-http-apis |
 | `launch.zig` | `sushi launch <agent>` configs | server-http-apis |
 | `scheduler.zig` / `generate.zig` | slots, inference thread, batching, admission; generation, sampling, MTP orchestration | server-lifecycle |
 | `model.zig` / `model_settings.zig` / `model_discovery.zig` / `model_registry.zig` | config + weights, per-model settings, discovery, registry | server-lifecycle |
-| `transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch, quant resolution, custom kernels | arch-*, engine-* |
-| `qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, attention, GDN, MTP, verify rows / hyper-connections + PLE / QSA | qwen4-arch, engine-mtp |
+| `transformer.zig` | shared `Transformer`, `KVCache`, `ForwardCtx`, arch dispatch, quant resolution | arch-*, engine-* |
+| `qwen4_forward.zig` / `qwen4_hc.zig` / `qwen4_qsa.zig` | Flash-Next forward, GDN, MTP, verify / hyper-connections + PLE / QSA | qwen4-arch, engine-mtp |
 | `mimo_forward.zig` | MiMo forward, sliding/global attention arms, MoE dispatch, batched decode | mimo2-arch |
+| `glm5_*.zig` | GLM forward, MLA/KDA attention, router, DFlash2 verify, decode kernels, prefix state, vision | glm5-* |
 | `qwen4_exp.zig` / `hc_prefill.zig` | Flash-Next n-gram host side; fused HC prefill | qwen4-arch |
 | `gdn_decode.zig` | fused GDN decode/verify step (prework + recurrence, one dispatch) | engine-kernels |
-| `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk kept as stored + its GEMV, rank-local QKV, stored-affine trunk, shard-stamp check | mimo2-arch |
+| `mimo_source.zig` / `fp8_block.zig` | MiMo source headers, FP8 trunk + GEMV, rank-local QKV, shard-stamp check | mimo2-arch |
 | `expert_quant.zig` / `exl3/` (`sushi_exl3` module) | expert layout, EXL3 decoders and kernels | engine-exl3-experts |
 | `expert_stream.zig` / `expert_io.zig` / `expert_bf16_kernels.zig` / `imatrix.zig` | SSD expert streaming | engine-expert-streaming |
 | `mtp*.zig` / `round_cost.zig` | MTP head, acceptance, planner, round-cost table | engine-mtp |
 | `kv_quant.zig` | quantized KV contract (`--kv-quant 4|8`) | engine-kv-cache |
 | `prefix_cache.zig` / `kv_disk_cache.zig` / `kv_disk_writer.zig` / `restore_dump.zig` | prefix cache, SSD tier | engine-prefix-cache |
 | `tokenizer.zig` / `tokenize_cache.zig` | BPE, special tokens, per-model `digit_group`; prompt LRU | engine-mlx-gotchas |
-| `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT (shared preprocessing, Qwen3-VL tower + M-RoPE, MiMo-ViT, GLM tower) | server-lifecycle, mimo2-arch |
+| `vision.zig` / `vision_common.zig` / `qwen_vision.zig` / `mimo_vision.zig` / `glm5_vision.zig` / `mrope.zig` | media INPUT: shared preprocessing, Qwen3-VL + M-RoPE, MiMo-ViT, GLM towers | server-lifecycle, mimo2-arch |
 | `kld.zig` | `sushi kld capture|compare` | quality-kld |
 | `metrics.zig` / `status.zig` / `log.zig` | metrics, status bar, logging | server-http-apis |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` | hermetic format corpus, real-traffic replay | server-tool-calling |
@@ -236,11 +230,13 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Rebuild ReleaseFast from the head under test right before any live number; stamp commit + binary mtime beside it.
 - Run every CPU-heavy agent-launched job (builds, tests, conversions, timings) under `taskpolicy -a`: inherited QoS never
   reaches the Super cores. State the QoS, lock and baseline beside every number.
-- Bench thermal protocol: under heavy GPU workload AND with a die sensor over 90 °C, fans to max and 3 min idle before
-  the bench starts; otherwise fans to max and a 10 s wait. Fans back to auto when the bench ends. Nothing else runs meanwhile.
-  Under it one A then one B suffices; A B B A only when the expected difference is within a few percent.
+- Quiet window: a timed run first touches `~/.sushi/runs/QUIET` and waits until no `zig`/`clang` runs; no worker
+  starts a build or test while that file exists. The GPU lock does not stop compiles.
+- Measure only what the diff touches: no arm whose code path is unchanged, no metric the change cannot move.
+- Bench thermal: fans to max; 3 min idle first if the die is over 90 °C after heavy GPU work, else 10 s; fans back to
+  auto after. One A then one B suffices; A B B A only when the expected difference is within a few percent.
 - Never wait on `pgrep -f <string>` (the waiting shell matches itself): wait on END markers, PIDs, or `pgrep -x`.
-- Launch flags outrank `model-settings.json`; confirm the load lines (`[kv-cache]`, `[mtp]`) show the intended arm.
+- Confirm the load lines (`[kv-cache]`, `[mtp]`, engagement lines) show the intended arm.
 - KLD is 16 prompts x 512 tokens scored to the first EOS (GLM: the 4x512 native teacher, code 2x512 reported apart);
   the teacher carries no lossy step of its own.
 
@@ -254,7 +250,7 @@ bit-identical lands whatever its size. A change that alters output lands only th
 - Report progress and blockers to the coordinator; commit per step; don't push or merge unless told.
 - State the QoS, lock and baseline used beside every number; put new knowledge in the matching doc in the branch.
 
-**Growth policy (ENFORCED).** This file holds rules and links only and stays well under 20 KB; every rule bullet is
+**Growth policy (ENFORCED).** This file holds rules and links only and stays under 25 KB; every rule bullet is
 ≤ 3 lines. Knowledge, measurements and war stories go to `docs/` (converter knowledge to `docs/private/`); commit
 messages carry the story of a change.
 
