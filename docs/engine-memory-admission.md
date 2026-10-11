@@ -34,8 +34,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
   COMPARED (`loadRequirementBytes`) and the flag that would admit (`--wired-margin-gib`, `--skip-mem-preflight`,
   `iogpu.wired_limit_mb`).
 - **One bill, `loadRequirementBytes`**: the weights the loader bills (enabled tensors only: MTP head, vision tower,
-  DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient and the requested
-  context's admission bill (the warmup ends before any request allocates) + a fixed 1 GiB net. No proportional term,
+  DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient plus a fixed 1 GiB net
+  and the requested context's admission bill (the warmup ends before any request allocates). No proportional term,
   no flat headroom. The cold-load registry gates (`residentColdLoadBillBytes`, `glmColdLoadBillBytes`) call the same
   function, so gate and preflight read one number.
 - **The warmup transient is measured per arch** (`loadWarmupBytes`, [Load warmup](#load-warmup)): Flash-Next 0.125 GiB
@@ -46,7 +46,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 - An explicit launch or model-settings context is checked before loading resident Sushi Qwen and MiMo EXL3 packs.
   `loadServingBill` uses `prefillNeededAtChunk`, including KV, rings, recurrent/history state, MTP and prefill scratch.
   It prices an explicit prefill width at that width after the architecture's cap; otherwise it proves the per-request
-  floor. A refusal reports the largest context that fits the same bill (net included) and available memory, capped at
+  floor. A refusal reports the largest context that fits the same bill and available memory, capped at
   the model's context limit. Existing active MLX buffers are subtracted from the GPU working-set limit before this
   check. Cold-load HTTP 503 responses retain the numeric maximum through the transient unloaded reset; retry and
   successful load clear it.
@@ -100,20 +100,22 @@ Flash-Next's transient is its MTP head load: peak less resident bytes is 1.11 Gi
 is its KDA state, rings and latent rows (0.15) plus 0.25 of activations.
 
 The bill against the same peaks (this change; `--mtp` where the arch has it; the context row is the request-time
-admission bill at 1248 tokens, which replaces the warmup once it is larger):
+admission bill at 1248 tokens, which replaces warmup and net once it is larger):
 
 | pack, settings | weights | warmup or context | net | bill | peak | slack |
 |---|---:|---:|---:|---:|---:|---:|
 | Flash-Next 2.6bpw, auto or `--ctx-size 1248` | 44.20 | 1.25 | 1.00 | 46.45 | 44.53 | 1.93 |
 | Flash-Next 2.6bpw, `--no-vision` | 43.37 | 1.25 | 1.00 | 45.62 | 44.53 | 1.09 |
 | MiMo 2.3bpw, auto | 89.65 | 0.25 | 1.00 | 90.90 | 89.88 | 1.02 |
-| MiMo 2.3bpw, `--ctx-size 1248` | 89.65 | 1.79 | 1.00 | 92.44 | 89.88 | 2.56 |
+| MiMo 2.3bpw, `--ctx-size 1248` | 89.65 | 1.79 | — | 91.44 | 89.88 | 1.56 |
 | GLM 2.4bpw, auto or `--ctx-size 1248` | 89.76 | 0.52 | 1.00 | 91.28 | 90.16 | 1.12 |
 | Flash-Next 2bpw streamed, `--ssd-budget-gb 18 --ctx-size 66000` | 5.57 | 13.69 | 1.00 | 20.27 | 19.07 | 1.20 |
 
 Flash-Next's extra slack is the vision tower: it is billed at load for the first image and not resident until then.
 MiMo at 1248 tokens bills a request's prefill scratch (1.79) above its warmup. The streamed warmup is its cache, fill
 union and bounce buffers. Every bill is above its peak; the 1 GiB net is what separates them where nothing else does.
+The net does not stack on a context bill: no request allocates during the warmup, and the 64 GB recipe (2.6bpw, kv8,
+250000) has about 2 GiB of slack under its ceiling for both terms.
 Previous bills for the same boots: 46.20, 91.65, 91.91 and 7.27 GiB (the streamed one was 12 GiB under its peak).
 
 Other expert layouts of these archs bill the same terms; their warmup is not measured on this box.

@@ -3782,11 +3782,11 @@ fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak
     return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES;
 }
 
-/// Free memory a load demands: its billed weights, then the larger of the warmup transient and the requested
-/// context's admission bill (the warmup ends before any request allocates), then the safety net.
+/// Free memory a load demands: its billed weights, then the larger of the warmup transient plus the safety net and
+/// the requested context's admission bill (the warmup ends before any request allocates).
 pub fn loadRequirementBytes(config: *const ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
     if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, config.expert_fill_peak_bytes, config.expert_bounce_bytes);
-    return weights_bytes +| @max(loadWarmupBytes(config, mtp_on), context_bill) +| LOAD_SAFETY_NET_BYTES;
+    return weights_bytes +| @max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill);
 }
 
 /// Unknown figures (a failed memory query, an unmeasurable size) never block a load.
@@ -3859,7 +3859,7 @@ const LoadBillFixtures = struct {
     }
 };
 
-test "a load bills weights, the measured warmup or the context bill, and a 1 GiB net" {
+test "a load bills weights, then the larger of the measured warmup plus a 1 GiB net and the context bill" {
     const gib: u64 = 1 << 30;
     var f = try LoadBillFixtures.init();
     defer f.deinit();
@@ -3870,9 +3870,11 @@ test "a load bills weights, the measured warmup or the context bill, and a 1 GiB
     const glm_state = f.glm.ssmCheckpointBytes() + f.glm.qsaRingBytes() + (f.glm.kvBytesPerToken() + f.glm.qsaHistoryBytesPerToken()) * 1024;
     try testing.expect(glm_state > 0);
     try testing.expectEqual(90 * gib + glm_state + gib * 3 / 8 + gib, loadRequirementBytes(&f.glm, 90 * gib, false, 0));
-    // A requested context's admission bill replaces the warmup once it is the larger; the net rides on either.
-    try testing.expectEqual(44 * gib + 6 * gib + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
+    // A requested context's admission bill replaces warmup and net once it is the larger: no request has allocated
+    // during the warmup, and request admission bills that context again.
+    try testing.expectEqual(44 * gib + 6 * gib, loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
     try testing.expectEqual(44 * gib + gib * 5 / 4 + gib, loadRequirementBytes(&f.qwen, 44 * gib, true, gib));
+    try testing.expectEqual(44 * gib + gib * 9 / 4, loadRequirementBytes(&f.qwen, 44 * gib, true, gib * 9 / 4));
 }
 
 test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net" {
@@ -4041,7 +4043,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         var reader = Reader{ .io = sch.io, .gpu_limit = gpu_limit, .sushi = model_mod.usesSushiQuantMemoryBill(params.config) };
         var avail_bytes = reader.read();
         const mtp_on = mtpChoiceFor(params.mtp_enabled, params.mtp_explicit, params.config).on;
-        var serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes -| LOAD_SAFETY_NET_BYTES) else null;
+        var serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
         var needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         if (memInsufficientForLoad(weights_bytes, avail_bytes, needed)) {
             log.info("[preflight] {d:.2} GB available of {d:.2} GB needed; waiting while memory is still being released\n", .{
@@ -4049,17 +4051,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             });
             avail_bytes = settleAvailableBytes(avail_bytes, needed, &reader);
-            serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes -| LOAD_SAFETY_NET_BYTES) else null;
+            serving = if (load_serving_bill) |bill| bill(params.config, avail_bytes -| weights_bytes) else null;
             needed = loadRequirementBytes(params.config, weights_bytes, mtp_on, if (serving) |b| b.needed else 0);
         }
         var active: usize = 0;
         if (reader.sushi) _ = mlx.mlx_get_active_memory(&active);
-        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup/context ~{d:.2} GB + {d:.2} GB net)\n", .{
+        log.info("[preflight] weights ~{d:.2} GB, needs ~{d:.2} GB, available {d:.2} GB (warmup + net or context ~{d:.2} GB)\n", .{
             @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(needed)) / (1024.0 * 1024.0 * 1024.0),
             @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(needed -| weights_bytes -| LOAD_SAFETY_NET_BYTES)) / (1024.0 * 1024.0 * 1024.0),
-            @as(f64, @floatFromInt(LOAD_SAFETY_NET_BYTES)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(needed -| weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
         });
         const gpu_exhausted = model_mod.usesSushiQuantMemoryBill(params.config) and gpu_limit > 0 and active >= gpu_limit;
         if (weights_bytes > 0 and (memInsufficientForLoad(weights_bytes, avail_bytes, needed) or gpu_exhausted)) {

@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **64 GB Macs boot the recommended context again**: the load check no longer asks for 1 GB more than the requested
+  context needs, which could refuse the documented 64 GB launch (`--ctx-size 250000`) in v1.2.2.
 - **GLM keeps its speed in `sushi run`**: DFlash2 now stays on for requests that carry `logit_bias` or
   `tool_choice: "none"`, which every `sushi run` turn sends, so thinking answers there decode about 40% faster.
 

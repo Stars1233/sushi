@@ -75,7 +75,7 @@ try:
         assert len(matches) == 1, matches
         weights, needed = map(float, matches[0])
         assert weights >= 48, "this regression needs a large resident pack"
-        # Billed weights + the larger of the measured warmup and the context bill + the 1 GiB net.
+        # Billed weights + the larger of the measured warmup plus the 1 GiB net and the context bill.
         warmup = 0.25 if "mimo" in model.name.lower() else (1.25 if mtp == "--mtp" else 0.125)
         assert needed - weights >= 1.0 + warmup - 0.01, (weights, needed, warmup)
         assert 0 < props["memory"]["active_bytes"] <= props["memory"]["peak_bytes"]
