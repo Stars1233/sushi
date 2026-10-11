@@ -715,6 +715,7 @@ pub fn cmdUpdate(allocator: Allocator, io: std.Io, args: []const []const u8) !vo
         } else if (eql(u8, a, "--rollback")) {
             opts.rollback = true;
         } else if (eql(u8, a, "--relaunch") and i + 1 < args.len and eql(u8, args[i + 1], "--")) {
+            // Internal and absent from the usage on purpose: the updater re-executes itself with this to restart the server.
             opts.relaunch = args[i + 2 ..];
             break;
         } else if (eql(u8, a, "--help") or eql(u8, a, "-h")) {

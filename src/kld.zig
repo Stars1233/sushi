@@ -92,8 +92,7 @@ const ValueFlag = enum {
     pause_file,
 };
 
-fn valueFlag(name: []const u8) ?ValueFlag {
-    const table = [_]struct { []const u8, ValueFlag }{
+const value_flags = [_]struct { []const u8, ValueFlag }{
         .{ "--model", .model },
         .{ "--prompts", .prompts },
         .{ "--out", .out },
@@ -107,14 +106,15 @@ fn valueFlag(name: []const u8) ?ValueFlag {
         .{ "--kv-quant", .kv_quant },
         .{ "--qwen-gdn", .qwen_gdn },
         .{ "--ssd-budget-gb", .ssd_budget_gb },
-        .{ "--expert-cache-gb", .expert_cache_gb },
         .{ "--expert-pick-tolerance", .expert_pick_tolerance },
         .{ "--wired-margin-gib", .wired_margin_gib },
         .{ "--batch-windows", .batch_windows },
         .{ "--imatrix-windows", .imatrix_windows },
         .{ "--pause-file", .pause_file },
-    };
-    for (table) |row| if (std.mem.eql(u8, name, row[0])) return row[1];
+};
+
+fn valueFlag(name: []const u8) ?ValueFlag {
+    for (value_flags) |row| if (std.mem.eql(u8, name, row[0])) return row[1];
     return null;
 }
 
@@ -207,6 +207,10 @@ pub const USAGE =
     \\  residual at every block boundary to <dir> (boundary-XX.bin, tokens.bin).
     \\
     \\options:
+    \\  --model <dir>         pack or checkpoint to capture from / score
+    \\  --prompts <src>       capture: the prompt source (see above)
+    \\  --out <dir>           capture: fixture output directory
+    \\  --fixture <dir>       compare: teacher fixture directory
     \\  --tokens <n>          greedy tokens per prompt to capture (default 64)
     \\  --top-k <n>           top_k recorded in baseline.json (default 10)
     \\  --label <s>           label/run recorded in the output (default sushi)
@@ -224,6 +228,7 @@ pub const USAGE =
     \\                      flag; a GLM pack has no GDN arm.
     \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
     \\  --mtp                 keep the MTP head resident (refused under streaming)
+    \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
     \\  --layer-major         native GLM BF16 teacher, --tokens 1: batches of windows run layer by layer,
@@ -1565,6 +1570,12 @@ fn teacherFixture(buf: []u8, io: std.Io) ?[]const u8 {
     defer dir.close(io);
     _ = dir.statFile(io, "baseline.json", .{}) catch return null;
     return path;
+}
+
+test "kld: --help lists every flag the parser accepts" {
+    for (value_flags) |row| try testing.expect(std.mem.indexOf(u8, USAGE, row[0]) != null);
+    for ([_][]const u8{ "--no-template", "--mtp", "--no-mtp", "--layer-major" }) |name|
+        try testing.expect(std.mem.indexOf(u8, USAGE, name) != null);
 }
 
 test "kld: compare memory report serializes aggregate MLX byte counters" {

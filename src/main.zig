@@ -103,7 +103,7 @@ fn printUsage(io: std.Io) void {
         \\                      (every pulled model loads on demand by name)
         \\  launch <agent>      Configure + launch a coding agent CLI against the
         \\                      local server (claude, pi, omp, opencode, codex,
-        \\                      hermes, aider, zcode). `sushi launch <agent> -h`
+        \\                      hermes, aider, zcode, grok). `sushi launch <agent> -h`
         \\                      for options
         \\  kld capture|compare Write a teacher fixture (full-vocab logits at
         \\                      every greedy position), or teacher-force one
@@ -168,17 +168,15 @@ fn printUsage(io: std.Io) void {
         \\                        is being refused. A genuine over-commit can
         \\                        hard-crash the server.
         \\  --no-mtp-lookup     Turn off the prompt-lookup drafts inside MTP
-        \\                        rounds and GLM DFlash2 (default: ON); standalone
-        \\                        PLD (--pld/--no-pld) is unaffected.
-        \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
-        \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
-        \\  --fast              MTP with typical acceptance and greedy tail, plus kv8: lossy
-        \\                        for sampled requests, greedy requests unchanged.
-        \\  --no-mtp            Disable the native MTP head. Both served models
-        \\                        load it and run it by default.
-        \\  --mtp               Force the MTP head ON. Both served models run it
-        \\                        by default; an SSD-streamed pack loads with it
-        \\                        off and refuses --mtp.
+        \\                        rounds and GLM DFlash2 (default: ON).
+        \\  --no-mtp            Disable the native MTP head. Qwen and MiMo load it
+        \\                        and run it by default; GLM's stays off.
+        \\  --mtp               Force the MTP head ON. Qwen and MiMo run it by
+        \\                        default, GLM does not; an SSD-streamed pack
+        \\                        that cannot stream its head refuses --mtp.
+        \\  --drafter <dir>     GLM only: use the DFlash2 assistant stored in
+        \\                        <dir> (default: the pack's own dflash2/ folder).
+        \\  --no-drafter        Never load the DFlash2 assistant (saves its memory).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV). No effect on MiMo, whose
@@ -237,6 +235,9 @@ fn printUsage(io: std.Io) void {
         \\                        When a request does not fit at <n>, it runs
         \\                        at the widest narrower width that fits (down
         \\                        to 512) instead of being refused.
+        \\  --max-concurrent <n>  Sizes the submit queue (n + 32) and floors the
+        \\                        prefix-cache entry count. Requests batch at
+        \\                        any value (default: 1).
         \\  --prefill-decode-share <s>
         \\                      Target decode wall-time share during another
         \\                        request's prefill (0..0.9); narrows chunks too.
@@ -332,7 +333,7 @@ fn printUsage(io: std.Io) void {
         \\  --version           Print version and exit
         \\  --guest-manifest    Print the JSON a host checks before running this
         \\                        build as its engine (guest.json), and exit
-        \\  --help              Show this help
+        \\  --help, -h          Show this help
         \\
     ) catch {};
     stdout_w.interface.flush() catch {};
