@@ -13,6 +13,7 @@ Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 * [Qwen3.8-Flash-Next-Sushi-3bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-3bpw) (requires 64 GB+)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+)
 * [MiMo-V2.6-Flash-Sushi-2.3bpw](https://huggingface.co/beamster/MiMo-V2.6-Flash-Sushi-2.3bpw) (requires 128 GB, text and image input)
+* [GLM-5.3-Flash-Sushi-2bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2bpw) (requires 96 GB+, text, image and video input)
 * [GLM-5.3-Flash-Sushi-2.4bpw](https://huggingface.co/beamster/GLM-5.3-Flash-Sushi-2.4bpw) (requires 128 GB, text, image and video input)
 
 ## Quality
@@ -21,6 +22,7 @@ Usage see [recommended launch commands and coding agent usage](docs/usage.md).
 
 * MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%)
 * GLM-5.3-Flash-Sushi-2.4bpw scores KLD 0.0742 (top-1 agreement 90.33%)
+* GLM-5.3-Flash-Sushi-2bpw scores KLD 0.1037 (top-1 agreement 88.18%)
 
 ## Install
 
@@ -79,20 +81,23 @@ identical to a resident load. The plan may come within 1 GiB of the GPU limit
 
 ## Benchmarks
 
-| Sushi 🍣 1.2.1 | M5 Max | 2k | 4k | 8k | 16k | 32k | 64k | 128k |
+| Sushi 🍣 1.2.2 | M5 Max | 2k | 4k | 8k | 16k | 32k | 64k | 128k |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| **GLM 5.3 Flash-2.4bpw** | Prefill | 922 | 822 | 809 | 805 | 807 | 756 | 673 |
-| | Decode | 48.0 | 46.2 | 46.9 | 45.9 | 45.7 | 47.2 | 45.5 |
-| | TTFT (s) | 2.26 | 4.98 | 10.2 | 20.3 | 40.6 | 86.9 | 194.8 |
-| **MiMo V2.6 Flash-2.3bpw** | Prefill | 1,221 | 1,209 | 1,205 | 1,143 | 1,037 | 901 | 712 |
-| | Decode | 49.1 | 54.4 | 59.3 | 62.4 | 64.9 | 56.2 | 51.5 |
-| | TTFT (s) | 1.72 | 3.38 | 6.87 | 14.3 | 31.6 | 72.9 | 184.1 |
-| **Qwen 3.8 Flash-Next-2.6bpw** | Prefill | 1,932 | 2,116 | 2,180 | 2,165 | 2,149 | 2,123 | 2,003 |
-| | Decode | 92.1 | 95.5 | 91.9 | 90.4 | 85.3 | 85.7 | 70.5 |
-| | TTFT (s) | 1.09 | 1.93 | 3.80 | 7.52 | 15.3 | 30.8 | 65.5 |
-| **Qwen 3.8 Flash-Next-4bpw** | Prefill | 1,954 | 2,312 | 2,305 | 2,340 | 2,395 | 2,275 | 2,115 |
-| | Decode | 78.5 | 89.4 | 84.3 | 86.1 | 82.1 | 81.0 | 73.4 |
-| | TTFT (s) | 1.08 | 1.77 | 3.59 | 6.96 | 13.7 | 28.8 | 62.0 |
+| **GLM 5.3 Flash-2bpw** | Prefill | 883 | 780 | 739 | 724 | 713 | 649 | 570 |
+| | Decode | 47.5 | 48.8 | 47.7 | 47.1 | 43.8 | 44.8 | 44.5 |
+| | TTFT (s) | 2.35 | 5.24 | 11.2 | 22.5 | 46.0 | 101.1 | 229.9 |
+| **GLM 5.3 Flash-2.4bpw** | Prefill | 859 | 833 | 821 | 816 | 805 | 737 | 645 |
+| | Decode | 50.1 | 51.8 | 48.7 | 46.4 | 47.4 | 46.6 | 44.2 |
+| | TTFT (s) | 2.42 | 4.91 | 10.1 | 20.0 | 40.7 | 89.1 | 203.3 |
+| **MiMo V2.6 Flash-2.3bpw** | Prefill | 1,308 | 1,227 | 1,225 | 1,144 | 994 | 891 | 679 |
+| | Decode | 56.7 | 55.4 | 56.2 | 65.5 | 54.9 | 57.2 | 50.2 |
+| | TTFT (s) | 1.61 | 3.33 | 6.75 | 14.3 | 33.0 | 73.7 | 193.0 |
+| **Qwen 3.8 Flash-Next-2.6bpw** | Prefill | 2,144 | 2,355 | 2,413 | 2,414 | 2,399 | 2,348 | 2,255 |
+| | Decode | 92.3 | 86.1 | 88.8 | 89.2 | 90.9 | 83.1 | 79.6 |
+| | TTFT (s) | 0.98 | 1.73 | 3.43 | 6.74 | 13.7 | 27.9 | 58.2 |
+| **Qwen 3.8 Flash-Next-4bpw** | Prefill | 1,871 | 2,113 | 2,192 | 2,187 | 2,262 | 2,225 | 2,178 |
+| | Decode | 77.9 | 72.8 | 85.2 | 90.3 | 82.6 | 78.3 | 71.3 |
+| | TTFT (s) | 1.13 | 1.93 | 3.77 | 7.44 | 14.5 | 29.4 | 60.2 |
 
 Community reports, using llmprobe `--bench-only`:
 

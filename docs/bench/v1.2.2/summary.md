@@ -14,6 +14,8 @@ Hardware: **Apple M5 Max, 128 GB unified memory**, AC power for every run. Relea
 |  | Decode | 77.9 | 72.8 | 85.2 | 90.3 | 82.6 | 78.3 | 71.3 |
 | **MiMo V2.6 Flash-2.3bpw** | Prefill | 1,308 | 1,227 | 1,225 | 1,144 | 994 | 891 | 679 |
 |  | Decode | 56.7 | 55.4 | 56.2 | 65.5 | 54.9 | 57.2 | 50.2 |
+| **GLM 5.3 Flash-2bpw** | Prefill | 883 | 780 | 739 | 724 | 713 | 649 | 570 |
+|  | Decode | 47.5 | 48.8 | 47.7 | 47.1 | 43.8 | 44.8 | 44.5 |
 | **GLM 5.3 Flash-2.4bpw** | Prefill | 859 | 833 | 821 | 816 | 805 | 737 | 645 |
 |  | Decode | 50.1 | 51.8 | 48.7 | 46.4 | 47.4 | 46.6 | 44.2 |
 
@@ -22,6 +24,7 @@ Hardware: **Apple M5 Max, 128 GB unified memory**, AC power for every run. Relea
 | [Qwen3.8-Flash-Next-Sushi-2.6bpw](Qwen3.8-Flash-Next-Sushi-2.6bpw.md) | 2 | mtp | `bb9adb6a` | `d8c741577e52dfc2` |
 | [Qwen3.8-Flash-Next-Sushi-4bpw](Qwen3.8-Flash-Next-Sushi-4bpw.md) | 2 | mtp | `bb9adb6a` | `d8c741577e52dfc2` |
 | [MiMo-V2.6-Flash-Sushi-2.3bpw](MiMo-V2.6-Flash-Sushi-2.3bpw.md) | 2 | mtp | `bb9adb6a` | `d8c741577e52dfc2` |
+| [GLM-5.3-Flash-Sushi-2bpw](GLM-5.3-Flash-Sushi-2bpw.md) | 2 | dflash | `29107ce9` | `98d1760b19713221` |
 | [GLM-5.3-Flash-Sushi-2.4bpw](GLM-5.3-Flash-Sushi-2.4bpw.md) | 2 | dflash | `29107ce9` | `98d1760b19713221` |
 
-Qwen 2.6bpw and 4bpw ran in the first pass. That pass's MiMo and GLM runs crossed onto battery, which slowed GLM 8–18%. Both were rerun on AC in fresh servers. The MiMo row is that rerun. GLM was run once more on the release binary, after the in-place commit fix, and that run is the row above. These throughput measurements do not establish long-context answer quality. Raw reports and server logs are indexed in the private measurement ledger.
+Qwen 2.6bpw and 4bpw ran in the first pass. That pass's MiMo and GLM runs crossed onto battery, which slowed GLM 8–18%. Both were rerun on AC in fresh servers. The MiMo row is that rerun. GLM 2.4bpw was run once more on the release binary, after the in-place commit fix; that run is its row above. GLM 2bpw, the new 96 GB pack, was run once on the release binary. These throughput measurements do not establish long-context answer quality. Raw reports and server logs are indexed in the private measurement ledger.

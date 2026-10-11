@@ -49,19 +49,19 @@ On a 64 GB Mac:
 $ sushi list
 This Mac: 64 GB
 
-PACK                               SIZE  DOWNLOADED  THIS MAC
-qwen3.8-flash-next:2bpw         36.4 GB  no          fits
-qwen3.8-flash-next:2.6bpw       45.8 GB  yes         fits  <- recommended
-qwen3.8-flash-next:3bpw         51.2 GB  no          fits
-qwen3.8-flash-next:4bpw         65.1 GB  no          may stream (--ssd-budget-gb)
-glm-5.3-flash:2bpw              81.0 GB  no          may stream (--ssd-budget-gb)
-glm-5.3-flash:2.4bpw            93.6 GB  no          may stream (--ssd-budget-gb)
-mimo-v2.6-flash:2.3bpw          97.9 GB  no          may stream (--ssd-budget-gb)
+PACK                                SIZE  DOWNLOADED  THIS MAC
+qwen3.8-flash-next:2bpw          64.8 GB  no          fits
+qwen3.8-flash-next:2.6bpw        73.7 GB  yes         fits  <- recommended
+qwen3.8-flash-next:3bpw          79.1 GB  no          fits
+qwen3.8-flash-next:4bpw         159.0 GB  no          may stream (--ssd-budget-gb)
+mimo-v2.6-flash:2.3bpw          100.7 GB  no          may stream (--ssd-budget-gb)
+glm-5.3-flash:2bpw               81.5 GB  no          may stream (--ssd-budget-gb)
+glm-5.3-flash:2.4bpw             93.2 GB  no          may stream (--ssd-budget-gb)
 ```
 
-Sizes are the Hugging Face blob sizes and differ per release. With Hugging Face unreachable (no network, or no answer
-within a few seconds) `sushi list` prints one line saying so and lists only the models on disk, without sizes or
-recommendations.
+Sizes are the whole Hugging Face download and differ per release. A Qwen pack's size includes its n-gram table, which
+stays on the SSD and is not loaded into memory. With Hugging Face unreachable (no network, or no answer within a few
+seconds), `sushi list` prints one line saying so and lists only the models on disk, without sizes or recommendations.
 
 ## Recommended launch
 
@@ -171,10 +171,11 @@ MTP and the 8-bit KV cache are on by default for MiMo, and thinking is on by def
 
 ```bash
 sudo sysctl iogpu.wired_limit_mb=90000
-sushi pull glm-5.3-flash:2bpw   # lands in ~/.sushi/models/beamster/GLM-5.3-Flash-Sushi-2bpw
+hf download beamster/GLM-5.3-Flash-Sushi-2bpw --local-dir ~/.sushi/models/GLM-5.3-Flash-Sushi-2bpw
+# or: sushi pull glm-5.3-flash:2bpw   (lands in ~/.sushi/models/beamster/GLM-5.3-Flash-Sushi-2bpw)
 
 # images and video, 8-bit KV, DFlash2 when present
-./sushi-macos-arm64/sushi serve --model ~/.sushi/models/beamster/GLM-5.3-Flash-Sushi-2bpw
+./sushi-macos-arm64/sushi serve --model ~/.sushi/models/GLM-5.3-Flash-Sushi-2bpw
 ```
 
 - The auto context is 512K at 8-bit KV and 300K with `--kv-quant 16` (BF16 latent).
