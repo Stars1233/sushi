@@ -416,28 +416,11 @@ test "sustained speculation ends a recovery burst and restarts the idle requirem
     try testing.expectEqual(@as(u8, 1), recovery.rounds);
 }
 
-pub const DEFAULT_ENABLED = true;
+/// Test seam: `false` runs the solo-slot path the planner does not own.
 pub var enabled_override: ?bool = null;
-var enabled_cache: ?bool = null;
-
-pub fn enabledFromEnv(raw: ?[*:0]const u8) bool {
-    const value = raw orelse return DEFAULT_ENABLED;
-    return value[0] != '0';
-}
 
 pub fn enabled() bool {
-    if (enabled_override) |value| return value;
-    if (enabled_cache) |value| return value;
-    const value = enabledFromEnv(std.c.getenv("SUSHI_MTP_GROUP_PLANNER"));
-    enabled_cache = value;
-    return value;
-}
-
-test "group planner defaults on and explicit zero disables it" {
-    try testing.expect(enabledFromEnv(null));
-    try testing.expect(!enabledFromEnv("0"));
-    try testing.expect(enabledFromEnv("1"));
-    try testing.expect(enabledFromEnv("on"));
+    return enabled_override orelse true;
 }
 
 pub const LATENCY_MS: f32 = 100;

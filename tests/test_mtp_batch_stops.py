@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live EOS/cancellation parity against a running server.
 
-Start it with native MTP, SUSHI_MTP_GROUP_PLANNER=1, and
+Start it with native MTP and
 `--mtp-min-depth 4 --mtp-max-depth 4` so both arms use the same verify width.
 The caller owns model loading and GPU/thermal controls.
 """

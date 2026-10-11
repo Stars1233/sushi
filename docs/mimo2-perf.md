@@ -177,7 +177,7 @@ they beat it.
 
 <a id="mimo-crowded-mtp"></a>
 **Crowded MTP (7bc8e280, 2026-10-01).** Two consecutive boots of the same ReleaseFast binary, with
-`SUSHI_MTP_BATCHED=0` then `1`, `SUSHI_ROUND_COST_PERSIST=0`, `--mtp --no-pld --kv-quant 8 --prefill-chunk 2048
+the crowd policy off then on, `SUSHI_ROUND_COST_PERSIST=0`, `--mtp --no-pld --kv-quant 8 --prefill-chunk 2048
 --ctx-size 8192 --prefix-cache-entries 0 --max-concurrent 4 --metrics`. Greedy, thinking off, 256 output tokens,
 identical prompts and warmup, `taskpolicy -a`, exclusive GPU lock per arm, fans max. The arm-boundary maximum sensor
 reading was 75.6 C. Warm serial rates were 46.8 and 46.7 tok/s. All 14 response pairs were byte-identical; metrics

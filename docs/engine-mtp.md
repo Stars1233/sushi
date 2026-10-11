@@ -63,7 +63,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   `enable_mtp:false` turn it off; an SSD-streamed pack loads with the head off (`[mtp] off (streaming; default)`,
   `scheduler.mtpDefaultOffUnderStreaming`) unless it is a Sushi EXL3 Qwen pack, which keeps it. The load-time bill prices the
   head's KV whenever it runs by default (`server.mtpHeadDefaultOn`).
-- **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default, `SUSHI_MTP_GROUP_PLANNER`;
+- **Concurrent qwen4 MTP streams can share a verify**: the group planner (on by default;
   a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis
   verify) when it prices one cheaper, and `mtpRoundsStaySolo` does not gate it. Only when the planner declines the
   tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`;
@@ -78,8 +78,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   outside the top-32 changes the token; `SUSHI_LMHEAD_SHORTLIST_AUDIT=1` counts such rows, `SUSHI_LMHEAD_FULL=1`
   reads the full head ([perf-baselines](mimo2-perf.md#mimo-lmhead-shortlist)).
 - **Drafts shortlist on a coarse lm_head copy and re-score exactly** from the MIXER output
-  (`buildRerankCoarse`/`rerankShortlist`/`fullReadoutArgmax`, `StepWant.mixed`; `SUSHI_MTP_DRAFT_RERANK=0`
-  restores the full readout). A greedy target drafts the argmax (byte-identity contract); a sampled target draws
+  (`buildRerankCoarse`/`rerankShortlist`/`fullReadoutArgmax`, `StepWant.mixed`). A greedy target drafts the argmax (byte-identity contract); a sampled target draws
   from the re-scored top-32 (`mtpDraftStepPath`); draft temperature is per family.
 
 <a id="depth-range"></a>
@@ -165,7 +164,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   `=0` on BOTH arms. A round's wall is between round ENDS, so an interleaved prefill chunk drops the round clock too.
 - **The EV seed lives on `Qwen4Mtp`** (`ev_seed_accept`/`ev_seed_m_lo`), per loaded model; publish AND consume
   decline under a pinned depth. `MtpCostProfile` comes from the runtime fingerprint
-  (`g17_nax_qwen4_q4_gs64`; `SUSHI_MTP_QWEN4_PROFILE=0` revokes it); unmeasured = generic/cap-6.
+  (`g17_nax_qwen4_q4_gs64`); unmeasured = generic/cap-6.
 - EXL3 packs take the chip's generic depth row (6 on M5 Max). A deeper round pays only on predictable text: at the
   MCG K3 round costs (31.2 / 36.0 / 42.4 ms at depth 1 / 2 / 3, ~5 ms per row after) and a ~20 ms serial token,
   depth 2 breaks even at ~0.53 per-draft acceptance, depth 3 at ~0.60, depth 4 at ~0.63; depth 4-6 wins only above

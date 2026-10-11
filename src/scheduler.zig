@@ -3368,7 +3368,7 @@ fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: [
     const split = try model_mod.qwenResidentWeightBytes(io, allocator, model_dir, load_vision, mtp_on);
     const head_bytes = split.mtp +| mtpSidecarBytes(io, allocator, config, model_dir, mtp_on);
     const coarse_bits = mtp_mod.rerankCoarseBits();
-    const coarse = if (mtp_on and head_bytes > 0 and coarse_bits > 0 and mtp_mod.MtpModel.draftRerankMode() != .off)
+    const coarse = if (mtp_on and head_bytes > 0 and coarse_bits > 0)
         mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), coarse_bits)
     else
         0;
@@ -8312,7 +8312,6 @@ fn batchedTickAction(cancelled: bool) BatchedTickAction {
 /// A MiMo MTP slot that may drop to plain batched ticks when crowded (`mtpCrowdThresholdFor`);
 /// its rounds otherwise stay solo, and no grouped verify ever takes it.
 fn slotMimoMtpCrowdable(slot: *const Slot) bool {
-    if (!mtpGroupEnabled()) return false;
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
@@ -8371,7 +8370,6 @@ fn slotGlmRowable(slot: *const Slot) bool {
 }
 
 fn slotMtpGroupable(slot: *const Slot) bool {
-    if (!mtpGroupEnabled()) return false;
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.mtp.?.moduleOwned()) return false;
@@ -8768,14 +8766,6 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     }
     if (zn > 0) try runBatchedDecodeTick(sch, plains[0..zn]);
     return true;
-}
-
-var mtp_group_env: ?bool = null;
-fn mtpGroupEnabled() bool {
-    if (mtp_group_env) |v| return v;
-    const on = if (std.c.getenv("SUSHI_MTP_BATCHED")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
-    mtp_group_env = on;
-    return on;
 }
 
 /// qwen4_exp verify rows are expert bytes, so a batched verify measured no better than
@@ -11006,9 +10996,7 @@ test "retained position: a padded row can never take the full-accept arm" {
     try testing.expectEqual(@as(u32, 1), generate_mod.Generator.mtpRetained(0));
 }
 
-test "MiMo crowded MTP respects the batching kill switch" {
-    const saved = mtp_group_env;
-    defer mtp_group_env = saved;
+test "MiMo crowded MTP takes an eligible slot" {
     var xfm: Transformer = undefined;
     xfm.config = .{ .model_type = "mimo_v2" };
     xfm.moe_layers = &.{};
@@ -11032,10 +11020,7 @@ test "MiMo crowded MTP respects the batching kill switch" {
     slot.enable_pld = false;
     slot.sampling = .{};
     slot.logprobs_n = 0;
-    mtp_group_env = true;
     try testing.expect(slotMimoMtpCrowdable(&slot));
-    mtp_group_env = false;
-    try testing.expect(!slotMimoMtpCrowdable(&slot));
 }
 
 test "single MTP slot reaches the round entry through runDecodeTick" {

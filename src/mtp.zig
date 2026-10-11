@@ -292,7 +292,6 @@ test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" 
 
 var qwen4_g17_profile_logged: bool = false;
 var qwen4_mixed_profile_logged: bool = false;
-var qwen4_g17_env_cache: ?bool = null;
 
 fn qwen4MixedHcMatches(hc: anytype) bool {
     return qwen4MixedPackMatches(hc.down_w, hc.down_s, hc.down_b, &.{ 320, 10240 }, 8) and
@@ -350,21 +349,6 @@ fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
     return true;
 }
 
-/// Profile-only revocation (SUSHI_MTP_QWEN4_PROFILE=0): planning falls
-/// back to `generic` while every compute lane stays exactly as shipped —
-/// the isolation arm for cost-surface A/Bs, where killing the vqmm NAX lane
-/// would change the very costs under test.
-fn qwen4G17EnvEnabled() bool {
-    if (qwen4_g17_env_cache) |v| return v;
-    var on = true;
-    if (std.c.getenv("SUSHI_MTP_QWEN4_PROFILE")) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    qwen4_g17_env_cache = on;
-    return on;
-}
-
 /// Live resolver for the qwen4_exp head: validates the runtime fingerprint
 /// the G17 surface was measured on — uniform affine-4/gs-64 config and both
 /// head fc packs at that width (K derived from the scales, so no input-dim
@@ -378,7 +362,6 @@ pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
 /// Mixed-pack prices use the request's actual KV format, including a slot
 /// override. The original all-4-bit classifier retains its existing scope.
 pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.KVQuantConfig) MtpCostProfile {
-    if (!qwen4G17EnvEnabled()) return .generic;
     if (target.config.expert_layout == .exl3_k4) return .generic;
     const head = if (target.qwen4_mtp) |*h| h else return .generic;
     const cfg = &target.config;
@@ -641,7 +624,7 @@ pub const MtpModel = struct {
     draft_head_bits: u32 = 0,
     draft_head_group: u32 = 0,
 
-    /// Draft-rerank scheme (SUSHI_MTP_DRAFT_RERANK): a coarse 2-bit/gs64
+    /// Draft-rerank scheme: a coarse 2-bit/gs64
     /// requant of the trunk lm_head; greedy drafts shortlist its top-32 and
     /// re-score them through the trunk head's own rows (`draftSelect`). When
     /// built, the 3-bit draft head is dropped — non-greedy draft paths fall
@@ -655,8 +638,7 @@ pub const MtpModel = struct {
     /// first `nextMtp` round of the next request. A fresh controller burns
     /// ~10 legacy-warmup rounds plus a +1/round base climb per request —
     /// a third of a short protocol-style generation; seeding restores the
-    /// learned surface from round 1. Never written by disabled/short runs;
-    /// set SUSHI_MTP_EV_SEED=0 to opt into request isolation.
+    /// learned surface from round 1. Never written by disabled/short runs.
     ev_seed_accept: ?[MAX_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
 
@@ -883,24 +865,12 @@ pub const MtpModel = struct {
         log.info("[mtp] draft-only lm_head requantized to {d}-bit/gs{d}\n", .{ bits, group });
     }
 
-    /// SUSHI_MTP_DRAFT_RERANK: "0" off, "1" force-on, absent/other →
-    /// auto (on where the cost surface is generic; the calibrated G17 NAX
-    /// surfaces keep the 3-bit draft head they were measured with).
-    pub fn draftRerankMode() enum { auto, on, off } {
-        const p = std.c.getenv("SUSHI_MTP_DRAFT_RERANK") orelse return .auto;
-        const raw = std.mem.span(p);
-        if (std.mem.eql(u8, raw, "0")) return .off;
-        if (std.mem.eql(u8, raw, "1")) return .on;
-        return .auto;
-    }
-
     /// Build the coarse 2-bit rerank head (see the draft-rerank section
     /// below). Infallible by design: any refusal keeps the draft-head path.
     fn maybeBuildDraftRerank(self: *MtpModel, target: *Transformer) void {
-        const mode = draftRerankMode();
-        if (mode == .off) return;
         if (target.lm_head_s.ctx == null) return; // dense bf16 head — row-gather rerank unbuilt/unmeasured
-        if (mode == .auto and self.m5NaxCostProfile(target) != .generic) return;
+        // The calibrated G17 NAX surfaces keep the 3-bit draft head they were measured with.
+        if (self.m5NaxCostProfile(target) != .generic) return;
         const w_shape = mlx.getShape(target.lm_head_w);
         if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return;
         const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
@@ -2871,21 +2841,13 @@ pub fn forward(
 /// to the target's M-RoPE positions. Image-prompt positions use the explicit
 /// three-axis table. Once decoding moves past that table, generated text uses
 /// the scalar `absolute + delta` fast-RoPE path.
-pub var mtp_kv_only_override: ?bool = null; // test seam
-var mtp_kv_only_env: ?bool = null;
+/// Test seam: `false` forces the full-forward history path, the parity oracle of the K/V-only one.
+pub var mtp_kv_only_override: ?bool = null;
 
-/// KV-only history rows ship ON (mlxfast-challenge lastHiddenWithKVOnlyHistory
-/// class): a committed-history row's layer OUTPUT has no consumer — only its
-/// K/V entries matter — so the q(+gate) projection, the attention, and the
-/// whole post-attention half are dead work for every row but the last.
-/// SUSHI_MTP_KV_ONLY=0 restores the full-forward history path.
+/// A committed-history row's layer OUTPUT has no consumer, only its K/V entries: the q(+gate)
+/// projection, the attention and the post-attention half are dead work for every row but the last.
 fn mtpKvOnlyEnabled() bool {
-    if (mtp_kv_only_override) |v| return v;
-    if (mtp_kv_only_env) |v| return v;
-    const raw = std.c.getenv("SUSHI_MTP_KV_ONLY");
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    mtp_kv_only_env = enabled;
-    return enabled;
+    return mtp_kv_only_override orelse true;
 }
 
 /// Append `hidden`/`id_arr` rows to the head's cache through the K/V-only

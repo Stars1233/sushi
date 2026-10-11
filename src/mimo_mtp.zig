@@ -741,7 +741,6 @@ pub const Head = struct {
     /// the first ask when the trunk has none yet.
     pub fn canRerankDrafts(self: *Head) bool {
         const t = self.target orelse return false;
-        if (mtp_mod.MtpModel.draftRerankMode() == .off) return false;
         if (!self.rerank_tried) {
             self.rerank_tried = true;
             if (t.lm_head_coarse == null) t.lm_head_coarse = mtp_mod.buildRerankCoarse(self.s, t, rerankBits());

@@ -38,8 +38,7 @@ def main():
     packs = args.pack or list(PACKS)
     for name in packs:
         assert (args.models / name / "config.json").is_file(), name
-    # Keep the native rerank defaults used by the audited reference bills.
-    env = {**os.environ, "SUSHI_MTP_DRAFT_RERANK": "1"}
+    env = dict(os.environ)
     env.pop("SUSHI_MTP_DRAFT_HEAD_BITS", None)  # Native defaults: Qwen 3 bits, MiMo 2 bits.
     owner = f"sushi-memory-live-{os.getpid()}"
     lock = root / "scripts/gpu-lock.sh"
